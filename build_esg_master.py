@@ -4,7 +4,7 @@ ESG Master Database Builder
 Pipeline: CONSOLIDATED Excel → Wide Master CSV/Excel
 
 Run:  python build_esg_master.py
-Output saved to: data/storage/raw/
+Output saved to: data_storage/raw/
 """
 
 import os
@@ -152,4 +152,31 @@ for f in sorted(os.listdir(RAW_OUT)):
     print(f"    {f:<55} {size:>7.1f} KB")
 
 print("\n✅ Master database ready. Load it in Streamlit with:")
-print('   df = pd.read_csv("data_storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")')
+print('   df = pd.read_csv("data/storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")')
+
+# ── Step 6: Clean any dirty CSV (removes snake_case duplicate columns from old saves) ──
+print("[6/6] Cleaning up any duplicate snake_case columns from old app saves...")
+MASTER_COLS = [
+    "Company","Year","Total no. of sites","ISO 14001 sites","% certified sites",
+    "Production","Water intake","Water intake - KPI","Total Electricity",
+    "Renewable Electricity Purchased","Non-Renewable Electricity Purchased",
+    "Self-generated AND consumed electricity on-site","Purchased Steam",
+    "Sold Electricity","Sold Steam","Natural Gas","Coal","Propane","Fuel Oil",
+    "Diesel","Petrol","Biomass","Waste tires","LPG","Other",
+    "Total energy","Total energy - KPI","Total CO2 - Scope 1",
+    "Total CO2 - Scope 2","Total CO2","Total CO2 - KPI",
+    "Renewable_Electricity_Share_%","Scope1_Share_%","Scope2_Share_%",
+    "Fossil_Energy_Share_%","Water_per_ton","CO2_per_ton",
+    "Energy_per_ton","ISO_Certification_%",
+]
+_dirty_path = Path(os.path.join(RAW_OUT, "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"))
+if _dirty_path.exists():
+    _dirty = pd.read_csv(_dirty_path)
+    _before = len(_dirty.columns)
+    _clean_cols = [c for c in MASTER_COLS if c in _dirty.columns]
+    _dirty[_clean_cols].to_csv(_dirty_path, index=False)
+    _dropped = _before - len(_clean_cols)
+    if _dropped > 0:
+        print(f"    Removed {_dropped} duplicate/legacy columns. CSV now has {len(_clean_cols)} clean columns.")
+    else:
+        print("    CSV already clean.")

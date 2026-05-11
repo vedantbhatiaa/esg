@@ -16,19 +16,18 @@ from formula_engine import (
     yoy_change, ValidationFlag
 )
 
-from benchmark_loader import BenchmarkLoader
+import data_loader as dl
 
-loader = BenchmarkLoader(data_dir=".")
-
-df = loader.load_clean()
-print(df.head())
+# Load consolidated dataset once at startup (cached at module level)
+_CONSOLIDATED_DF = dl.load_consolidated()
+_COMPANIES       = dl.get_companies(_CONSOLIDATED_DF)
 
 # ─────────────────────────────────────────────────────────
 # PAGE CONFIG & GLOBAL CSS
 # ─────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="TIP ESG Platform · dss+",
-    page_icon="🌱",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -176,67 +175,43 @@ div[data-testid="column"] .stButton > button.primary-btn {
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────
-# MOCK DATA
+# CONSTANTS — YEARS & DISPLAY DATA
 # ─────────────────────────────────────────────────────────
 HIST_YEARS = list(range(2009, 2023))   # 14 historical years: 2009–2022
 CURR_YEAR  = 2023
 LONG_YEARS = list(range(2009, 2024))
-COMPANIES  = ["Bridgestone","Goodyear","Michelin","Continental",
-              "Pirelli","Sumitomo","Yokohama","Cooper Tire","Hankook","Toyo Tires"]
 
-# Historical raw data: 14 years 2009–2022
-# Production scale factors from LONG_DATA["prod"] relative to 2019 (index 10=3.86M T)
-_PROD_BASE = 3_860_798  # 2019 value
-_PROD_LONG = [2.84, 3.51, 3.77, 3.52, 3.64, 3.62, 3.54, 3.63, 3.70, 3.91,
-              3.86, 3.05, 3.32, 3.58]  # 2009-2022
-_S = [p / 3.86 for p in _PROD_LONG]  # scale factors relative to 2019
+# Companies: prefer real consolidated data, fall back to demo list
+COMPANIES = _COMPANIES if _COMPANIES else [
+    "VerdaTyres Corp","AlphaTread Ltd","BetaRubber Inc","GammaTire SA",
+    "DeltaGrip GmbH","EpsilonWheel Co","ZetaTrac LLC","EtaRoad AG",
+    "ThetaDrive NV","IotaTire PLC",
+]
 
-def _scale(base_2019, custom=None):
-    """Generate 14 values; last 4 override with exact data if provided."""
-    vals = [round(base_2019 * s) for s in _S]
-    if custom:
-        for i, v in enumerate(custom):
-            vals[10 + i] = v   # 2019=idx10, 2020=11, 2021=12, 2022=13
-    return vals
-
-# Renewable electricity grew from near-zero: 0% in 2009→ grows after 2013
-_RENEW_PCT = [0, 0, 0, 0, 0, 0, 0, 2.3, 2.2, 9.7, 21.4, 31.4, 40.6, 48.3]  # 2009-2022
-_TOTAL_ELEC_BASE = 12_978_503  # 2019 total electricity
-_TOTAL_ELEC = [round(_TOTAL_ELEC_BASE * _S[i]) for i in range(14)]
-_RENEW_HIST = [round(_TOTAL_ELEC[i] * _RENEW_PCT[i] / 100) for i in range(14)]
-_NONRENEW_HIST = [_TOTAL_ELEC[i] - _RENEW_HIST[i] for i in range(14)]
-# Override last 4 with exact values
-_RENEW_HIST[10:] = [706_562, 1_528_836, 2_557_561, 4_082_923]
-_NONRENEW_HIST[10:] = [12_271_131, 9_667_437, 10_297_758, 9_037_549]
-
-HIST_RAW = {
+# ── Static HIST_RAW fallback (used only before a company is selected) ────────
+HIST_RAW: dict[str, list] = {
     "total_sites":   [38,39,40,40,41,42,43,44,46,48,51,51,52,52],
     "iso_sites":     [36,38,39,39,40,41,42,43,45,47,51,51,52,52],
-    "production":    _scale(_PROD_BASE, [3_860_798, 3_047_092, 3_320_000, 3_580_000]),
-    "water_withdrawals": _scale(23_127_757, [23_127_757, 20_345_811, 21_147_924, 20_927_589]),
-    "renew_elec_purchased":    _RENEW_HIST,
-    "nonrenew_elec_purchased": _NONRENEW_HIST,
-    "self_gen_elec":  [0,0,0,0,0,0,0,0,0,0,810,1_564,11_748,36_082],
-    "purchased_steam": _scale(1_133_191, [1_133_191, 977_324, 1_036_304, 1_042_310]),
-    "sold_electricity": [0,0,0,0,0,0,0,0,0,0,0,11_199,7_748,7_702],
-    "nat_gas":       _scale(16_210_969, [16_210_969, 14_040_397, 15_939_109, 15_927_554]),
-    "coal_sub":      _scale(456_997,    [456_997, 337_992, 360_848, 395_006]),
-    "coal_brown":    [0]*14, "coal_other": [0]*14,
-    "propane":       _scale(290_761,    [290_761, 214_440, 288_245, 334_563]),
-    "fuel_oil_heavy_a": [round(781_730 * _S[i] * max(0.2, 1 - i*0.065)) for i in range(10)] + [781_730, 518_579, 440_915, 166_773],
-    "fuel_oil_heavy_c": [0]*14,
-    "diesel":  _scale(108_136,  [108_136, 91_916, 134_886, 184_346]),
-    "petrol":  _scale(24_947,   [24_947, 12_976, 9_339, 8_032]),
-    "biomass": [0]*14, "waste_tires_mt": [0]*14,
-    "lpg":     _scale(1_237_839, [1_237_839, 1_124_479, 1_271_422, 1_329_571]),
-    "other_fuels": [round(879 * _S[i]) for i in range(10)] + [879, 1_182, 1_256, 1_226],
-    "co2_scope2_steam":       _scale(59_575, [59_575, 51_059, 48_013, 62_384]),
-    "co2_scope2_electricity": [0]*14,
-    "sold_steam": [0]*14,
-    "waste_total":    _scale(352_000, [352_000, 295_000, 320_000, 335_000]),
-    "waste_recovery": _scale(299_200, [299_200, 253_700, 275_200, 284_750]),
+    "production":    [2_840_000,3_510_000,3_770_000,3_520_000,3_640_000,3_620_000,
+                      3_540_000,3_630_000,3_700_000,3_910_000,3_860_000,3_050_000,3_320_000,3_580_000],
+    "water_withdrawals": [18_000_000,19_200_000,20_100_000,19_700_000,20_500_000,21_000_000,
+                          21_500_000,22_000_000,22_800_000,23_100_000,23_100_000,20_300_000,21_100_000,20_900_000],
+    "renew_elec_purchased": [0,0,0,0,0,0,0,300_000,250_000,1_100_000,706_562,1_528_836,2_557_561,4_082_923],
+    "nonrenew_elec_purchased": [9_500_000,9_400_000,9_600_000,9_300_000,9_400_000,9_500_000,
+                                9_600_000,9_400_000,9_300_000,9_100_000,12_271_131,9_667_437,10_297_758,9_037_549],
+    "nat_gas": [13_000_000,14_000_000,15_000_000,14_500_000,15_000_000,15_200_000,
+                15_500_000,15_700_000,15_900_000,16_100_000,16_210_969,14_040_397,15_939_109,15_927_554],
+    "coal_sub": [500_000,490_000,480_000,470_000,460_000,450_000,
+                 440_000,430_000,420_000,410_000,456_997,337_992,360_848,395_006],
+    "lpg": [1_000_000,1_050_000,1_100_000,1_100_000,1_100_000,1_150_000,
+            1_150_000,1_180_000,1_200_000,1_220_000,1_237_839,1_124_479,1_271_422,1_329_571],
+    "waste_total":    [330_000,330_000,335_000,335_000,340_000,342_000,
+                       344_000,346_000,348_000,350_000,352_000,295_000,320_000,335_000],
+    "waste_recovery": [280_000,281_000,283_000,284_000,286_000,287_000,
+                       289_000,292_000,295_000,298_000,299_200,253_700,275_200,284_750],
 }
 
+# ── Aggregated KPI trends for the analysis/benchmarking charts ───────────────
 LONG_DATA = {
     "energy":     [28.1,32.3,33.6,32.4,33.0,32.4,31.8,32.1,33.0,34.2,33.2,28.5,32.3,32.5,32.4],
     "co2":        [2.41,2.69,2.88,2.80,2.87,2.86,2.73,2.72,2.80,2.85,2.76,2.22,2.27,2.06,2.05],
@@ -259,10 +234,16 @@ FUEL_MIX = {
 }
 
 CLIENTS = {
-    "bridgestone@tip-reporting.com": "Bridgestone",
-    "michelin@tip-reporting.com":    "Michelin",
-    "goodyear@tip-reporting.com":    "Goodyear",
-    "yokohama@tip-reporting.com":    "Yokohama",
+    "verdatyres@tip-reporting.com":   "VerdaTyres Corp",
+    "alphatread@tip-reporting.com":   "AlphaTread Ltd",
+    "betarubber@tip-reporting.com":   "BetaRubber Inc",
+    "gammatire@tip-reporting.com":    "GammaTire SA",
+    "deltagrip@tip-reporting.com":    "DeltaGrip GmbH",
+    "epsilonwheel@tip-reporting.com": "EpsilonWheel Co",
+    "zetatrac@tip-reporting.com":     "ZetaTrac LLC",
+    "etaroad@tip-reporting.com":      "EtaRoad AG",
+    "thetadrive@tip-reporting.com":   "ThetaDrive NV",
+    "iotatire@tip-reporting.com":     "IotaTire PLC",
 }
 
 STEP_META = [
@@ -287,7 +268,15 @@ def init_state():
         "page":            "login",
         "step":            0,
         "template_done":   False,
-        "consolidated_df": None,   # cached from SharePoint or local dummy
+        # Company setup pre-step
+        "company_setup_done": False,
+        "reporting_company":  "",        # company selected in setup step
+        "reporting_year":     2023,
+        "employee_name":      "",
+        "company_hist":       {},        # {field: {year: value}} from consolidated
+        "live_hist_raw":      {},        # {field: [values 2009-2022]} from real data
+        "kpi_hints":          {},        # {kpi_name: value} prior year KPI reference
+        "consolidated_df": None,
         "step_data": {
             "total_sites": 54, "iso_sites": 54,
             "production": 3_720_000,
@@ -367,25 +356,27 @@ def load_consolidated_data():
 def get_current_outputs():
     sd = st.session_state.step_data
     inp = TemplateInputs(
-        company=st.session_state.user_company,
-        year=CURR_YEAR,
-        **{k: sd.get(k, 0) for k in [
+        company=st.session_state.get("reporting_company") or st.session_state.user_company,
+        year=st.session_state.get("reporting_year", CURR_YEAR),
+        **{k: float(sd.get(k, 0)) for k in [
             "total_sites","iso_sites","production","water_withdrawals",
             "renew_elec_purchased","nonrenew_elec_purchased","self_gen_elec",
-            "purchased_steam","sold_electricity","nat_gas","coal_sub",
-            "propane","fuel_oil_heavy_a","diesel","lpg",
+            "purchased_steam","sold_electricity","sold_steam",
+            "nat_gas","coal_sub","propane","fuel_oil_heavy_a",
+            "diesel","petrol","biomass","waste_tires_mt","lpg","other_fuels",
             "co2_scope2_steam","waste_total","waste_recovery",
         ]}
     )
     return inp, calculate(inp)
 
 def get_hist_outputs():
+    _hist = st.session_state.get("live_hist_raw") or HIST_RAW
+    company = (st.session_state.get("reporting_company") or
+               st.session_state.get("user_company") or "")
     outs = []
     for i, yr in enumerate(HIST_YEARS):
-        inp = TemplateInputs(
-            company=st.session_state.user_company, year=yr,
-            **{k: HIST_RAW[k][i] for k in HIST_RAW}
-        )
+        fields = {k: _hist[k][i] for k in _hist if i < len(_hist[k])}
+        inp = TemplateInputs(company=company, year=yr, **fields)
         outs.append((yr, inp, calculate(inp)))
     return outs
 
@@ -451,7 +442,7 @@ def show_login():
                                      placeholder="you@consultdss.com or you@company.com")
             password = st.text_input("Password", type="password", value="demo1234")
 
-            if st.button("Sign in →", type="primary", width="stretch"):
+            if st.button("Sign in", type="primary", width="stretch"):
                 email_l   = email.strip().lower()
                 is_dss    = "@consultdss.com" in email_l
                 is_client = email_l in CLIENTS
@@ -469,7 +460,7 @@ def show_login():
                     st.session_state.page          = "entry"
                     st.rerun()
 
-            st.caption("Demo: employee@consultdss.com · bridgestone@tip-reporting.com (any password)")
+            st.caption("Demo: employee@consultdss.com (dss+ analyst) · verdatyres@tip-reporting.com (client, any password)")
 
 # ─────────────────────────────────────────────────────────
 # SIDEBAR
@@ -548,7 +539,7 @@ def render_stepper_bar():
     items = ""
     for i, (name, _) in enumerate(STEP_META):
         if i < st.session_state.step:
-            sc, sl, icon = "sc-done", "sl-done", "✓"
+            sc, sl, icon = "sc-done", "sl-done", "v"
         elif i == st.session_state.step:
             sc, sl, icon = "sc-active", "sl-active", str(i+1)
         else:
@@ -559,47 +550,56 @@ def render_stepper_bar():
 
 STEP_FIELDS = [
     # Step 0: ISO 14001
-    [("total_sites","Total no. of sites","All facilities globally",None),
-     ("iso_sites","ISO 14001 certified sites","Sites with active certification",None)],
+    [("total_sites","Total no. of sites","All facilities globally (no.)",None),
+     ("iso_sites","ISO 14001 certified sites","Sites with active ISO 14001 certification",None)],
     # Step 1: Production
-    [("production","Annual production","Total weight of all products (metric T)",None)],
+    [("production","Annual production","Total weight of finished products (metric T)",None)],
     # Step 2: Water
-    [("water_withdrawals","Total water withdrawals","All sources: surface, well, municipal (m³)",None)],
-    # Step 3: Energy
-    [("renew_elec_purchased","Renewable electricity purchased","Grid-purchased green electricity (GJ)",None),
-     ("nonrenew_elec_purchased","Non-renewable electricity purchased","Standard grid electricity (GJ)",None),
-     ("self_gen_elec","Self-generated renewable electricity","On-site solar, wind (GJ)",None),
-     ("purchased_steam","Purchased steam (GJ)",None,None),
-     ("nat_gas","Natural gas (GJ LHV)",None,None),
-     ("coal_sub","Coal – all types (GJ LHV)",None,None),
-     ("fuel_oil_heavy_a","Fuel oil (GJ LHV)",None,None),
-     ("diesel","Diesel (GJ LHV)",None,None),
-     ("lpg","LPG (GJ LHV)",None,None)],
-    # Step 4: CO2
-    [("co2_scope2_steam","Scope 2 – Steam CO₂ (T.CO₂)","Company-provided Scope 2 from purchased steam",None)],
+    [("water_withdrawals","Total water withdrawals","All sources: surface, ground, municipal (m³)",None)],
+    # Step 3: Energy — all electricity + steam + all fuels
+    [("renew_elec_purchased",    "Renewable electricity purchased",               "Grid-purchased certified renewable electricity (GJ)",  None),
+     ("nonrenew_elec_purchased", "Non-renewable electricity purchased",           "Standard grid electricity (GJ)",                       None),
+     ("self_gen_elec",           "Self-generated renewable electricity on-site",  "On-site solar, wind, hydro (GJ)",                      None),
+     ("purchased_steam",         "Purchased steam",                               "GJ",                                                   None),
+     ("sold_electricity",        "Sold electricity",                              "GJ (enter 0 if none)",                                 None),
+     ("sold_steam",              "Sold steam",                                    "GJ (enter 0 if none)",                                 None),
+     ("nat_gas",                 "Natural gas",                                   "GJ LHV",                                               None),
+     ("coal_sub",                "Coal (all types)",                              "GJ LHV — sub-bituminous, brown, other combined",        None),
+     ("propane",                 "Propane",                                       "GJ LHV",                                               None),
+     ("fuel_oil_heavy_a",        "Fuel oil",                                      "GJ LHV — heavy oil A + C combined",                    None),
+     ("diesel",                  "Diesel",                                        "GJ LHV",                                               None),
+     ("petrol",                  "Petrol",                                        "GJ LHV",                                               None),
+     ("biomass",                 "Biomass",                                       "GJ LHV (biogenic CO2 excluded per GHG Protocol)",       None),
+     ("waste_tires_mt",          "Waste tires",                                   "metric T (converted to GJ internally)",                 None),
+     ("lpg",                     "LPG",                                           "GJ LHV",                                               None),
+     ("other_fuels",             "Other fuels",                                   "GJ LHV",                                               None)],
+    # Step 4: CO2 — only manual input is Scope 2 steam; all other CO2 auto-calculated
+    [("co2_scope2_steam","Scope 2 CO2 from purchased steam","T.CO2 — company-provided figure from steam supplier",None)],
     # Step 5: Waste
-    [("waste_total","Total waste generated (metric T)",None,None),
-     ("waste_recovery","Waste sent to recovery (metric T)",None,None)],
+    [("waste_total",    "Total waste generated",     "metric T — all waste streams",                   None),
+     ("waste_recovery", "Waste sent to recovery",    "metric T — recycling, composting, energy rec.",  None)],
 ]
 
 def page_entry():
-    st.markdown(f"## {'KPI Data Entry' if not st.session_state.template_done else 'ESG KPI Template — 2023'}")
+    rep_year = st.session_state.get("reporting_year", CURR_YEAR)
+    st.markdown(f"## {'KPI Data Entry' if not st.session_state.template_done else f'ESG KPI Template — {rep_year}'}")
 
     if st.session_state.template_done:
         col_a, col_b = st.columns([5,1])
         with col_b:
-            if st.button("← Edit Inputs"):
+            if st.button("Edit Inputs"):
                 st.session_state.template_done = False
                 st.session_state.step = 0
+                st.session_state.company_setup_done = False
                 st.rerun()
 
         # Excel-style sheet tabs — mirrors the template's multiple sheets
         tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
-            "📋 Main Data Input",
-            "⚡ Electricity by Country",
-            "🗑️ Waste",
-            "💬 Qualitative Data",
-            "🔢 Conversion Tables",
+            "Main Data Input",
+            "Electricity by Country",
+            "Waste",
+            "Qualitative Data",
+            "Conversion Tables",
         ])
         with tab_main:
             render_template_table()
@@ -613,7 +613,82 @@ def page_entry():
             render_conversion_tab()
         return
 
+    # ── Company Setup Pre-Step ──────────────────────────────────────────────
+    if not st.session_state.company_setup_done:
+        with st.container(border=True):
+            st.markdown("### Step 0 of 6 — Company Setup")
+            st.caption("Select your company and reporting year. Historical data will be pre-loaded from the consolidated dataset.")
+            st.divider()
+
+            col1, col2 = st.columns(2)
+            with col1:
+                # Company picker — populated from the real consolidated data
+                company_options = COMPANIES if COMPANIES else ["(No data loaded)"]
+                # Pre-select based on login company if it matches
+                login_company = st.session_state.user_company
+                default_idx = 0
+                if login_company and login_company in company_options:
+                    default_idx = company_options.index(login_company)
+
+                sel_company = st.selectbox(
+                    "Company name",
+                    options=company_options,
+                    index=default_idx,
+                    help="Select the TIP member company for which you are submitting data.",
+                )
+                emp_name = st.text_input(
+                    "Employee name (for records)",
+                    value=st.session_state.user_name,
+                    placeholder="Full name of person completing this submission",
+                )
+
+            with col2:
+                avail_years = sorted(
+                    [int(y) for y in _CONSOLIDATED_DF["Year"].dropna().unique()]
+                    if not _CONSOLIDATED_DF.empty else [2023], reverse=True
+                )
+                # Default to the year after the latest available (i.e. the new submission)
+                rep_year_sel = st.selectbox(
+                    "Reporting year (data you are submitting)",
+                    options=avail_years + ([max(avail_years)+1] if avail_years else [2024]),
+                    index=0,
+                    help="The calendar year the KPI data covers.",
+                )
+                st.markdown("")
+                st.markdown("")
+                n_hist = len([y for y in avail_years if y < rep_year_sel])
+                st.info(f"**{sel_company}** has **{n_hist} years** of historical data available (through {max(avail_years) if avail_years else '—'}).")
+
+            st.divider()
+            if st.button("Load historical data and start entry", type="primary"):
+                # Pull real data for this company
+                hist = dl.get_company_hist(_CONSOLIDATED_DF, sel_company)
+                prev_data = dl.get_step_data(hist, rep_year_sel - 1)  # prior year as default
+                hist_raw  = dl.get_hist_raw(hist, HIST_YEARS)
+                kpi_hints = dl.get_kpi_hints(_CONSOLIDATED_DF, sel_company, rep_year_sel - 1)
+
+                # Store in session
+                st.session_state.reporting_company  = sel_company
+                st.session_state.reporting_year     = rep_year_sel
+                st.session_state.employee_name      = emp_name
+                st.session_state.company_hist       = hist
+                st.session_state.live_hist_raw      = hist_raw
+                st.session_state.kpi_hints          = kpi_hints
+
+                # Pre-fill step_data with prior year values from consolidated
+                if prev_data:
+                    for field, val in prev_data.items():
+                        st.session_state.step_data[field] = val
+
+                st.session_state.company_setup_done = True
+                st.rerun()
+        return
+
     render_stepper_bar()
+    # Resolve which hist_raw to use: live data from consolidated, or static fallback
+    _hist = st.session_state.get("live_hist_raw") or HIST_RAW
+    _prev_yr = st.session_state.get("reporting_year", CURR_YEAR) - 1
+
     step = st.session_state.step
     name, desc = STEP_META[step]
     fields = STEP_FIELDS[step]
@@ -621,6 +696,24 @@ def page_entry():
     with st.container(border=True):
         st.markdown(f"### Step {step+1} of {len(STEP_META)} — {name}")
         st.caption(desc)
+
+        # Show prior-year KPI reference if available from consolidated data
+        kpi_hints = st.session_state.get("kpi_hints", {})
+        if kpi_hints:
+            prev_yr = st.session_state.get("reporting_year", CURR_YEAR) - 1
+            sel_co  = st.session_state.get("reporting_company", "")
+            hint_parts = []
+            if step == 2 and "water_kpi" in kpi_hints:
+                hint_parts.append(f"Water KPI {prev_yr}: **{kpi_hints['water_kpi']:.2f} m³/T**")
+            if step in (3, 4) and "energy_kpi" in kpi_hints:
+                hint_parts.append(f"Energy KPI {prev_yr}: **{kpi_hints['energy_kpi']:.2f} GJ/T**")
+            if step == 4 and "co2_kpi" in kpi_hints:
+                hint_parts.append(f"CO2 KPI {prev_yr}: **{kpi_hints['co2_kpi']:.3f} T/T**")
+            if step == 0 and "iso_pct" in kpi_hints:
+                hint_parts.append(f"ISO certified {prev_yr}: **{kpi_hints['iso_pct']*100:.1f}%**")
+            if hint_parts:
+                st.info(f"{sel_co} prior-year reference — " + " · ".join(hint_parts))
+
         st.divider()
 
         # Calc current outputs for live preview
@@ -631,7 +724,9 @@ def page_entry():
         for idx, fdef in enumerate(fields):
             key, label = fdef[0], fdef[1]
             sublabel = fdef[2] if fdef[2] else ""
-            hist_val  = HIST_RAW.get(key, [None]*4)[-1] if key in HIST_RAW else None
+            # Use last value in live hist (= most recent historical year) as reference
+            hist_vals = _hist.get(key, [])
+            hist_val  = hist_vals[-1] if hist_vals else None
             with cols_list[idx % n_cols]:
                 if sublabel:
                     st.caption(sublabel)
@@ -643,7 +738,7 @@ def page_entry():
                 )
                 st.session_state.step_data[key] = val
                 if hist_val:
-                    st.caption(f"2022 reference: {fmt_num(hist_val)}")
+                    st.caption(f"{_prev_yr} reference: {fmt_num(hist_val)}")
 
         # Live-calculated preview for this step
         st.divider()
@@ -671,28 +766,34 @@ def page_entry():
             c1, c2, c3 = st.columns(3)
             c1.metric("Waste elimination",   fmt_num(out2.waste_elimination) + " T")
             c2.metric("Recovery rate",        f"{out2.waste_recovery_pct*100:.1f}%")
-            ok_str = "✅ Consistent" if out2.check_waste else "❌ Inconsistent"
+            ok_str = "Consistent" if out2.check_waste else "Inconsistent"
             c3.metric("Waste check", ok_str)
 
         st.divider()
         nav_l, nav_r = st.columns([1,1])
         with nav_l:
-            if step > 0 and st.button("← Previous step"):
+            if step > 0 and st.button("Previous step"):
                 st.session_state.step -= 1
                 st.rerun()
         with nav_r:
             if step < len(STEP_META) - 1:
-                if st.button("Save & Continue →", type="primary"):
+                if st.button("Save & Continue", type="primary"):
                     st.session_state.step += 1
                     st.rerun()
             else:
-                if st.button("✓ Generate Template", type="primary"):
+                if st.button("Generate Template", type="primary"):
                     st.session_state.template_done = True
                     st.rerun()
 
 def render_template_table():
-    raw_company = st.session_state.user_company or "Your Company"
-    company = raw_company if raw_company != "All Companies" else "TIP Member Company"
+    company  = st.session_state.get("reporting_company") or \
+               st.session_state.get("user_company") or "TIP Member Company"
+    if company == "All Companies":
+        company = "TIP Member Company"
+    rep_year = st.session_state.get("reporting_year", CURR_YEAR)
+
+    # Use live hist from consolidated data if available
+    _hist = st.session_state.get("live_hist_raw") or HIST_RAW
 
     # ── Header matching the Excel template ──────────────────
     st.markdown(f"""
@@ -706,17 +807,17 @@ def render_template_table():
         <div style="font-size:26px;font-weight:800;color:#00916E;margin-top:5px;letter-spacing:-.4px">
           {company}
         </div>
-        <div style="font-size:12px;color:#9CA3AF;margin-top:4px">Corporate units · ESG KPI Template — {CURR_YEAR}</div>
+        <div style="font-size:12px;color:#9CA3AF;margin-top:4px">Corporate units · ESG KPI Template — {rep_year}</div>
       </div>
       <div style="text-align:right">
         <div style="font-size:11px;color:#6B7280;text-transform:uppercase;letter-spacing:.5px">Reporting year</div>
-        <div style="font-size:36px;font-weight:800;color:#0A2240;line-height:1">{CURR_YEAR}</div>
-        <div style="font-size:11px;color:#9CA3AF;margin-top:3px">Data range: 2009–{CURR_YEAR}</div>
+        <div style="font-size:36px;font-weight:800;color:#0A2240;line-height:1">{rep_year}</div>
+        <div style="font-size:11px;color:#9CA3AF;margin-top:3px">Data range: 2009–{rep_year}</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.info("✅ Template generated from your inputs. Blue cells = company input · grey italic = auto-calculated formula.", icon="📋")
+    st.info("Template generated from your inputs. Blue cells = company input, grey italic = auto-calculated formula.")
 
     inp, out = get_current_outputs()
     hist = get_hist_outputs()
@@ -733,32 +834,43 @@ def render_template_table():
         ("calc","Water intensity KPI","m³/T",None,lambda i,o:f"{o.water_kpi:.2f}"),
         ("section","Energy",None,None,None),
         ("calc","Total Electricity","GJ",None,lambda i,o:f"{o.total_electricity:,.0f}"),
-        ("input","— Renewable electricity","GJ","renew_elec_purchased",None),
-        ("input","— Non-renewable electricity","GJ","nonrenew_elec_purchased",None),
-        ("input","— Self-generated renewable","GJ","self_gen_elec",None),
+        ("input","— Renewable electricity purchased","GJ","renew_elec_purchased",None),
+        ("input","— Non-renewable electricity purchased","GJ","nonrenew_elec_purchased",None),
+        ("input","— Self-generated renewable on-site","GJ","self_gen_elec",None),
         ("input","Purchased Steam","GJ","purchased_steam",None),
+        ("input","Sold Electricity","GJ","sold_electricity",None),
+        ("input","Sold Steam","GJ","sold_steam",None),
         ("input","Natural Gas","GJ LHV","nat_gas",None),
         ("input","Coal (all types)","GJ LHV","coal_sub",None),
+        ("input","Propane","GJ LHV","propane",None),
         ("input","Fuel Oil","GJ LHV","fuel_oil_heavy_a",None),
         ("input","Diesel","GJ LHV","diesel",None),
+        ("input","Petrol","GJ LHV","petrol",None),
+        ("input","Biomass","GJ LHV","biomass",None),
+        ("input","Waste tires","metric T","waste_tires_mt",None),
         ("input","LPG","GJ LHV","lpg",None),
-        ("calc","TOTAL ENERGY","GJ LHV",None,lambda i,o:f"{o.total_energy:,.0f}"),
+        ("input","Other fuels","GJ LHV","other_fuels",None),
+        ("calc","TOTAL ENERGY","GJ",None,lambda i,o:f"{o.total_energy:,.0f}"),
         ("calc","Energy intensity KPI","GJ/T",None,lambda i,o:f"{o.energy_kpi:.2f}"),
-        ("section","CO₂ Emissions",None,None,None),
-        ("input","Scope 2 – Steam","T.CO₂","co2_scope2_steam",None),
-        ("calc","CO₂ – Natural Gas","T.CO₂",None,lambda i,o:f"{o.co2_nat_gas:,.0f}"),
-        ("calc","CO₂ – Coal","T.CO₂",None,lambda i,o:f"{o.co2_coal:,.0f}"),
-        ("calc","CO₂ – Fuel Oil + Diesel","T.CO₂",None,lambda i,o:f"{o.co2_fuel_oil+o.co2_diesel:,.0f}"),
-        ("calc","CO₂ – LPG","T.CO₂",None,lambda i,o:f"{o.co2_lpg:,.0f}"),
-        ("calc","TOTAL CO₂ Scope 1","T.CO₂",None,lambda i,o:f"{o.total_co2_scope1:,.0f}"),
-        ("calc","TOTAL CO₂ Scope 2","T.CO₂",None,lambda i,o:f"{o.total_co2_scope2:,.0f}"),
-        ("calc","TOTAL CO₂ (S1+S2)","T.CO₂",None,lambda i,o:f"{o.total_co2:,.0f}"),
-        ("calc","CO₂ intensity KPI","T.CO₂/T",None,lambda i,o:f"{o.co2_kpi:.3f}"),
+        ("section","CO2 Emissions",None,None,None),
+        ("input","Scope 2 — Steam","T.CO2","co2_scope2_steam",None),
+        ("calc","CO2 — Natural Gas","T.CO2",None,lambda i,o:f"{o.co2_nat_gas:,.0f}"),
+        ("calc","CO2 — Coal","T.CO2",None,lambda i,o:f"{o.co2_coal:,.0f}"),
+        ("calc","CO2 — Propane","T.CO2",None,lambda i,o:f"{o.co2_propane:,.0f}"),
+        ("calc","CO2 — Fuel Oil","T.CO2",None,lambda i,o:f"{o.co2_fuel_oil:,.0f}"),
+        ("calc","CO2 — Diesel","T.CO2",None,lambda i,o:f"{o.co2_diesel:,.0f}"),
+        ("calc","CO2 — Petrol","T.CO2",None,lambda i,o:f"{o.co2_petrol:,.0f}"),
+        ("calc","CO2 — LPG","T.CO2",None,lambda i,o:f"{o.co2_lpg:,.0f}"),
+        ("calc","TOTAL CO2 Scope 1","T.CO2",None,lambda i,o:f"{o.total_co2_scope1:,.0f}"),
+        ("calc","TOTAL CO2 Scope 2","T.CO2",None,lambda i,o:f"{o.total_co2_scope2:,.0f}"),
+        ("calc","TOTAL CO2 (S1+S2)","T.CO2",None,lambda i,o:f"{o.total_co2:,.0f}"),
+        ("calc","CO2 intensity KPI","T.CO2/T",None,lambda i,o:f"{o.co2_kpi:.3f}"),
         ("section","Waste",None,None,None),
         ("input","Total waste generated","metric T","waste_total",None),
-        ("input","Waste to recovery","metric T","waste_recovery",None),
-        ("calc","Waste to elimination","metric T",None,lambda i,o:f"{o.waste_elimination:,.0f}"),
-        ("calc","% recovery rate","%",None,lambda i,o:f"{o.waste_recovery_pct*100:.1f}%"),
+        ("input","Waste sent to recovery","metric T","waste_recovery",None),
+        ("calc","Waste sent to elimination","metric T",None,lambda i,o:f"{o.waste_elimination:,.0f}"),
+        ("calc","Recovery rate","%",None,lambda i,o:f"{o.waste_recovery_pct*100:.1f}%"),
+        ("calc","Waste intensity KPI","kg/T",None,lambda i,o:f"{i.waste_total/i.production*1000:.1f}" if i.production else "—"),
     ]
 
     data = []
@@ -767,7 +879,7 @@ def render_template_table():
         if rtype == "section":
             row = {"Indicator": f"▸ {label}", "Unit": ""}
             for yr, hi, ho in hist: row[str(yr)] = ""
-            row[str(CURR_YEAR)] = ""
+            row[str(rep_year)] = ""
             row["YoY %"] = ""
             data.append({"_type":"section","_row":row})
             continue
@@ -783,7 +895,7 @@ def render_template_table():
 
         cv = getattr(inp, key, None) if key else None
         if cv is None and fn: cv = fn(inp, out)
-        row[str(CURR_YEAR)] = f"{float(cv):,.0f}" if isinstance(cv,(int,float)) and not isinstance(cv,str) else (cv if cv else "—")
+        row[str(rep_year)] = f"{float(cv):,.0f}" if isinstance(cv,(int,float)) and not isinstance(cv,str) else (cv if cv else "—")
 
         try:
             cn = float(str(cv).replace(",","").replace("%",""))
@@ -798,8 +910,8 @@ def render_template_table():
     all_types = [d["_type"] for d in data]
     df_tbl = pd.DataFrame(all_rows)
 
-    # Freeze Indicator+Unit; highlight 2023 column differently
-    curr_col = str(CURR_YEAR)
+    # Freeze Indicator+Unit; highlight reporting year column differently
+    curr_col = str(rep_year)
 
     def style_row(row, idx):
         rtype = all_types[idx]
@@ -827,10 +939,10 @@ def render_template_table():
     # Height: ~38px per row
     tbl_height = min(900, max(400, len(all_rows) * 36 + 60))
     st.dataframe(styled, hide_index=True, height=tbl_height, use_container_width=True)
-    st.markdown("""<div class="tbl-legend">
+    st.markdown(f"""<div class="tbl-legend">
       <div class="tl"><div class="tl-sw" style="background:#F0F9FF;border-color:#BAE6FD"></div>Company input (historical)</div>
-      <div class="tl"><div class="tl-sw" style="background:#DBEAFE;border-color:#93C5FD"></div>Company input (2023)</div>
-      <div class="tl"><div class="tl-sw" style="background:#EFF6FF;border-color:#A5B4FC"></div>Auto-calculated (2023)</div>
+      <div class="tl"><div class="tl-sw" style="background:#DBEAFE;border-color:#93C5FD"></div>Company input ({rep_year})</div>
+      <div class="tl"><div class="tl-sw" style="background:#EFF6FF;border-color:#A5B4FC"></div>Auto-calculated ({rep_year})</div>
       <div class="tl"><div class="tl-sw" style="background:#F8FAFC;border-color:#E5E7EB"></div>Auto-calculated (historical)</div>
     </div>""", unsafe_allow_html=True)
 
@@ -889,7 +1001,7 @@ def render_electricity_tab():
                 st.session_state.elec_data[str(yr)] = 0
             st.rerun()
 
-    st.info("ℹ️ Country-level data enables precise location-based Scope 2 calculations. Leave as 0 if the country has no operations.")
+    st.info("Country-level data enables precise location-based Scope 2 calculations. Leave as 0 if the country has no operations.")
     total_2023 = edited["2023"].sum() if "2023" in edited.columns else 0
     st.metric("Total Non-Renewable Electricity 2023 (all countries)", f"{total_2023:,.0f} MWh")
 
@@ -909,7 +1021,7 @@ def render_waste_tab():
         ("input","Total amount of waste","metric T","waste_total",None),
         ("input","Amount of waste sent to recovery","metric T","waste_recovery",None),
         ("calc","Amount of waste sent to elimination","metric T",None,lambda i,o:f"{o.waste_elimination:,.0f}"),
-        ("calc","Consistency check","—",None,lambda i,o:"✅ OK" if o.check_waste else "❌ Error"),
+        ("calc","Consistency check","—",None,lambda i,o:"OK" if o.check_waste else "Error"),
         ("calc","Recovery rate","%",None,lambda i,o:f"{o.waste_recovery_pct*100:.1f}%"),
         ("calc","Waste intensity","kg/T prod",None,lambda i,o:f"{i.waste_total/i.production*1000:.2f}" if i.production else "—"),
     ]
@@ -959,7 +1071,7 @@ def render_waste_tab():
     c1,c2,c3 = st.columns(3)
     c1.metric("Total Waste 2023", f"{inp.waste_total:,.0f} T")
     c2.metric("Recovery Rate",    f"{out.waste_recovery_pct*100:.1f}%")
-    c3.metric("Consistency",      "✅ OK" if out.check_waste else "❌ Error")
+    c3.metric("Consistency",      "OK" if out.check_waste else "Error")
 
 
 def render_qualitative_tab():
@@ -988,21 +1100,21 @@ def render_qualitative_tab():
                     st.caption(q_hint)
                 c1, c2, c3 = st.columns([2, 2, 1])
                 with c1:
-                    st.text_area("📢 Public information",
+                    st.text_area("Public information",
                         key=f"pub_{title}_{q_key}", height=90,
                         placeholder="Information that can be included in the Global KPIs Report…")
                 with c2:
-                    st.text_area("🔒 Non-public (confidential)",
+                    st.text_area("Non-public (confidential)",
                         key=f"nonpub_{title}_{q_key}", height=90,
                         placeholder="Used only at aggregated level, no company attribution…")
                 with c3:
-                    st.text_area("💬 Other comments",
+                    st.text_area("Other comments",
                         key=f"cmt_{title}_{q_key}", height=90,
                         placeholder="Any additional remarks…")
                 st.divider()
 
     # ── ENERGY ─────────────────────────────────────────────
-    qual_section("⚡", "Energy", [
+    qual_section("", "Energy", [
         ("Program — Management approach",
          "Explain how your organization manages the energy topic: policies, commitments, ISO 50001 certifications, goals & targets, responsibilities, resources, grievance mechanisms, specific actions and initiatives.",
          "program"),
@@ -1021,7 +1133,7 @@ def render_qualitative_tab():
     ])
 
     # ── CO₂ ────────────────────────────────────────────────
-    qual_section("☁️", "CO₂ Emissions", [
+    qual_section("", "CO2 Emissions", [
         ("Program — Management approach",
          "Explain how your organization manages CO₂: policies, commitments, goals & targets, responsibilities, resources, grievance mechanisms, specific actions and initiatives.",
          "program"),
@@ -1037,7 +1149,7 @@ def render_qualitative_tab():
     ])
 
     # ── WATER ───────────────────────────────────────────────
-    qual_section("💧", "Water", [
+    qual_section("", "Water", [
         ("Program — Management approach",
          "Explain how your organization manages water: policies, commitments, goals & targets, responsibilities, resources, grievance mechanisms, specific actions and initiatives.",
          "program"),
@@ -1053,7 +1165,7 @@ def render_qualitative_tab():
     ])
 
     # ── ENVIRONMENTAL MANAGEMENT ────────────────────────────
-    qual_section("🌿", "Environmental Management (ISO 14001)", [
+    qual_section("", "Environmental Management (ISO 14001)", [
         ("Program — Management approach",
          "Explain how your organization manages environmental management. Does your organisation have a 100% ISO 14001 certification rate target in your overall environmental policy?",
          "program"),
@@ -1066,7 +1178,7 @@ def render_qualitative_tab():
     ])
 
     # ── WASTE ───────────────────────────────────────────────
-    qual_section("🗑️", "Waste", [
+    qual_section("", "Waste", [
         ("Program — Management approach",
          "Explain how your organization manages waste: policies, commitments, ISO certifications, goals & targets, responsibilities, resources, grievance mechanisms, specific actions and initiatives.",
          "program"),
@@ -1085,7 +1197,7 @@ def render_qualitative_tab():
     st.markdown("""
     <div style="background:#0A2240;color:#fff;font-size:13px;font-weight:700;
         padding:9px 16px;border-radius:8px 8px 0 0;margin-top:18px;margin-bottom:0">
-      📝 Additional Information
+      Additional Information
     </div>
     """, unsafe_allow_html=True)
     with st.container(border=True):
@@ -1137,11 +1249,11 @@ def page_analysis():
     # KPI strip
     c1,c2,c3,c4,c5 = st.columns(5)
     for col, label, val, unit, delta, pos in [
-        (c1,"Total Energy 2023","32.4M","GJ","▼ 0.3% vs 2022",True),
-        (c2,"Total CO₂ 2023","2.05M","T.CO₂","▼ 0.5% vs 2022",True),
-        (c3,"CO₂ Intensity","0.551","T.CO₂/T","▼ 4.3% vs 2022",True),
-        (c4,"Renewable Elec","48.3%","of total elec","▲ 19% vs 2022",True),
-        (c5,"Waste Recovery","85.8%","of total waste","▲ 0.9% vs 2022",True),
+        (c1,"Total Energy 2023","32.4M","GJ","-0.3% vs 2022",True),
+        (c2,"Total CO₂ 2023","2.05M","T.CO₂","-0.5% vs 2022",True),
+        (c3,"CO₂ Intensity","0.551","T.CO₂/T","-4.3% vs 2022",True),
+        (c4,"Renewable Elec","48.3%","of total elec","+19% vs 2022",True),
+        (c5,"Waste Recovery","85.8%","of total waste","+0.9% vs 2022",True),
     ]:
         col.markdown(kpi_card_html(label,val,unit,delta,pos), unsafe_allow_html=True)
 
@@ -1233,50 +1345,42 @@ def page_analysis():
 # ─────────────────────────────────────────────────────────
 def page_benchmarking():
     st.markdown("## Peer Benchmarking")
-    src_note = ("📡 Benchmarking data loaded live from SharePoint"
-                if st.session_state.get("consolidated_source") == "sharepoint"
-                else "📋 Benchmarking uses built-in TIP consolidated dataset (10 companies × 15 years)")
-    st.info(src_note + " — Quartile bands derived from all TIP members. No individual competitor figures disclosed.", icon="🔍")
+    rep_year = st.session_state.get("reporting_year", CURR_YEAR)
+    company  = st.session_state.get("reporting_company") or \
+               st.session_state.get("user_company") or "Your Company"
+
+    # Load consolidated data (module-level cached)
+    bench_source = "live consolidated dataset" if not _CONSOLIDATED_DF.empty else "built-in demo data"
+    st.info(f"Benchmarking uses the {bench_source} ({len(COMPANIES)} companies, 2009–{rep_year}). Quartile bands derived from all TIP members. No individual competitor figures disclosed.")
 
     inp, out = get_current_outputs()
 
-    # ── Load consolidated data (SharePoint or dummy) ──────────────────
-    
-    bench_df = df.copy()
-    bench_df = bench_df[bench_df["year"] == 2023]
-    company = st.session_state.user_company
-
     # ── Compute live quartiles from actual consolidated data ──────────
-    def live_bench(row_label, company_value, unit, lower_better):
-        kpi_rows = bench_df[
-            bench_df["row_label"] == row_label
-        ]
+    bench_kpis = dl.get_benchmark_kpis(_CONSOLIDATED_DF, rep_year - 1)  # prior year for benchmarks
 
-        vals = kpi_rows["data"].dropna().values
+    def live_bench(kpi_col, company_value, unit, lower_better):
+        from formula_engine import BenchmarkResult
+        if not bench_kpis.empty and kpi_col in bench_kpis.columns:
+            vals = bench_kpis[kpi_col].dropna().values
+        else:
+            vals = []
 
         if len(vals) >= 4:
             q25, med, q75 = np.percentile(vals, [25, 50, 75])
         else:
-            q25, med, q75 = (
-                company_value * 0.85,
-                company_value,
-                company_value * 1.15
-            )
+            q25  = company_value * 0.85
+            med  = company_value
+            q75  = company_value * 1.15
 
-        from formula_engine import BenchmarkResult
         return BenchmarkResult(
-            row_label,
-            company_value,
-            float(q25),
-            float(med),
-            float(q75),
-            unit,
-            lower_better,
+            kpi_col, company_value,
+            float(q25), float(med), float(q75),
+            unit, lower_better,
         )
 
     renew_val = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
     benchmarks = [
-        live_bench("co2_kpi",        out.co2_kpi,               "T.CO₂/T", True),
+        live_bench("co2_kpi",        out.co2_kpi,               "T.CO2/T", True),
         live_bench("energy_kpi",     out.energy_kpi,            "GJ/T", True),
         live_bench("water_kpi",      out.water_kpi,             "m³/T", True),
         live_bench("renewable_pct",  renew_val,                 "%", False),
@@ -1328,7 +1432,7 @@ def page_benchmarking():
             industry_scores = [65, 70, 65, 74, 52, 74]
             fig = go.Figure()
             fig.add_trace(go.Scatterpolar(r=company_scores+[company_scores[0]],
-                theta=dims+[dims[0]],fill="toself",name="Bridgestone 2023",
+                theta=dims+[dims[0]],fill="toself",name=f"{company} {rep_year}",
                 line=dict(color="#00916E",width=2),
                 fillcolor="rgba(0,145,110,.12)"))
             fig.add_trace(go.Scatterpolar(r=industry_scores+[industry_scores[0]],
@@ -1342,29 +1446,35 @@ def page_benchmarking():
 
     with st.container(border=True):
         st.markdown("#### Improvement rate — your company vs TIP industry average since 2009")
+
+        company_hist = st.session_state.get("company_hist", {})
+        def _impr(field):
+            pct = dl.improvement_since(company_hist, field, 2009, rep_year - 1)
+            if pct is None:
+                return "N/A"
+            sign = "+" if pct > 0 else ""
+            return f"{sign}{pct:.1f}%"
+
         improve_data = {
-            "KPI": ["CO₂ intensity","Energy intensity","Water intensity",
-                    "Renewable electricity","Waste recovery rate"],
-            "Your improvement": ["▼ 35.2%","▼ 12.1%","▼ 26.4%","▲ +48pp","▲ +4pp"],
-            "Industry average":  ["▼ 22.8%","▼ 15.3%","▼ 19.1%","▲ +18pp","▲ +6pp"],
-            "Lead vs peers":     ["+12.4pp ✅","−3.2pp ⚠️","+7.3pp ✅","+30pp ✅","−2pp ⚠️"],
-            "Status":            ["Ahead","Lagging","Ahead","Ahead","Lagging"],
+            "KPI":              ["CO2 intensity","Energy intensity","Water intensity",
+                                 "Renewable electricity","Waste recovery rate"],
+            "Your improvement": [_impr("co2_kpi") if "co2_kpi" not in company_hist else _impr("co2_kpi"),
+                                 _impr("energy_kpi"), _impr("water_kpi"),
+                                 _impr("renew_elec_purchased"), _impr("waste_recovery")],
+            "Industry average": ["-22.8%","-15.3%","-19.1%","+18pp","+6pp"],
         }
         df_imp = pd.DataFrame(improve_data)
-        st.dataframe(df_imp.style.apply(lambda row: [
-            "background:#ECFDF5;color:#065F46" if row["Status"]=="Ahead"
-            else "background:#FFFBEB;color:#92400E"]*len(row), axis=1),
-            hide_index=True, width="stretch")
+        st.dataframe(df_imp, hide_index=True, use_container_width=True)
 
     col_l2, col_r2 = st.columns(2)
     with col_l2:
         with st.container(border=True):
-            st.markdown("#### ✅ Key strengths")
+            st.markdown("#### Key strengths")
             st.success("**CO₂ intensity** at 0.551 T/T — top quartile of TIP members for 2nd consecutive year. 35% improvement since 2009, outpacing industry by 12pp.")
             st.success("**Renewable electricity** at 48.3% — highest in 2023 TIP cohort, driven by procurement agreements and on-site generation.")
     with col_r2:
         with st.container(border=True):
-            st.markdown("#### ⚠️ Improvement areas")
+            st.markdown("#### Improvement areas")
             st.warning("**Energy intensity** at 8.7 GJ/T lags industry improvement rate by 3.2pp. Opportunity: steam system optimisation, waste heat recovery.")
             st.warning("**Waste recovery** at 85.8% is below top-quartile threshold (~88%). Industrial composting and circular material partnerships are common levers.")
 
@@ -1373,7 +1483,7 @@ def page_benchmarking():
 # ─────────────────────────────────────────────────────────
 def page_verification():
     if not st.session_state.is_dss:
-        st.error("🔒 This section is restricted to dss+ analysts and managers.")
+        st.error("This section is restricted to dss+ analysts and managers.")
         return
     st.markdown("## Data Verification")
     c1,c2,c3,c4,c5 = st.columns(5)
@@ -1397,13 +1507,13 @@ def page_verification():
          "Scope 1 matches emission factor outputs. Scope 2 consistent with IEA country factors. Total CO₂ 2.05M T.CO₂ internally consistent.","flag5"),
     ]
     for severity, title, detail, flag_id in flags_def:
-        icon_map = {"warn":"!","error":"✕","ok":"✓"}
+        icon_map = {"warn":"!","error":"X","ok":"OK"}
         color_map = {"warn":"fc-warn fi-warn","error":"fc-error fi-error","ok":"fc-ok fi-ok"}
         fc, fi = color_map[severity].split()
         resolved = flag_id in st.session_state.flags_resolved
         if resolved:
             fc, fi = "fc-ok","fi-ok"
-            title += " ✓ Approved"
+            title += " — Approved"
         st.markdown(f"""<div class="flag-card {fc}">
           <div class="fc-icon {fi}">{icon_map.get("ok" if resolved else severity,"")}</div>
           <div><div class="fc-title">{title}</div><div class="fc-detail">{detail}</div></div>
@@ -1412,18 +1522,18 @@ def page_verification():
             cols = st.columns([6,1,1])
             with cols[1]:
                 if st.button("Query", key=f"q_{flag_id}"):
-                    st.toast(f"Query sent to Bridgestone contact for: {title[:40]}...", icon="📧")
+                    st.toast(f"Query sent to Bridgestone contact for: {title[:40]}...")
             with cols[2]:
-                if severity == "warn" and st.button("Accept ✓", key=f"a_{flag_id}", type="primary"):
+                if severity == "warn" and st.button("Accept", key=f"a_{flag_id}", type="primary"):
                     st.session_state.flags_resolved.add(flag_id)
                     st.rerun()
                 elif severity == "error" and st.button("Send Back", key=f"sb_{flag_id}"):
-                    st.toast("Submission returned to Bridgestone with error details.", icon="↩️")
+                    st.toast("Submission returned to Bridgestone with error details.")
 
     st.divider()
     col_approve, _ = st.columns([1,3])
     with col_approve:
-        if st.button("✓ Approve All Warnings", type="primary"):
+        if st.button("Approve All Warnings", type="primary"):
             st.session_state.flags_resolved.update({"flag1","flag2"})
             st.rerun()
 
@@ -1432,7 +1542,7 @@ def page_verification():
 # ─────────────────────────────────────────────────────────
 def page_readiness():
     if not st.session_state.is_dss:
-        st.error("🔒 This section is restricted to dss+ analysts and managers.")
+        st.error("This section is restricted to dss+ analysts and managers.")
         return
     st.markdown("## AI Readiness Check")
 

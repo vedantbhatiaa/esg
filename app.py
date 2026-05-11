@@ -1452,39 +1452,96 @@ def _compute_industry_scores(df, year):
     return scores
 
 
+def _load_company_year_outputs(company: str, year: int):
+    """
+    Load inputs and compute outputs for any company+year from the consolidated DB.
+    Returns (TemplateInputs, TemplateOutputs) or falls back to session state.
+    """
+    hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    if hist:
+        sd = dl.get_step_data(hist, year)
+        sd_clean = {k: v for k, v in sd.items() if k in _VALID_TEMPLATE_FIELDS}
+        if sd_clean:
+            inp = TemplateInputs(company=company, year=year, **sd_clean)
+            return inp, calculate(inp)
+    # fallback to session state
+    return get_current_outputs()
+
+
+def _compute_kpi_improvement(company: str, base_year: int, end_year: int) -> dict:
+    """
+    Compute improvement % for each KPI between base_year and end_year.
+    Returns {kpi_attr: pct_change_string} for CO2, energy, water KPIs + raw fields.
+    """
+    base_inp, base_out = _load_company_year_outputs(company, base_year)
+    end_inp,  end_out  = _load_company_year_outputs(company, end_year)
+
+    def _pct(b, e):
+        if b and b != 0 and e:
+            return f"{(e - b) / abs(b) * 100:+.1f}%"
+        return "N/A"
+
+    renew_base = (base_inp.renew_elec_purchased + base_inp.self_gen_elec) / max(base_out.total_electricity, 1) * 100
+    renew_end  = (end_inp.renew_elec_purchased  + end_inp.self_gen_elec)  / max(end_out.total_electricity,  1) * 100
+    wrec_base  = base_out.waste_recovery_pct * 100
+    wrec_end   = end_out.waste_recovery_pct  * 100
+
+    return {
+        "CO₂ intensity":        _pct(base_out.co2_kpi,    end_out.co2_kpi),
+        "Energy intensity":     _pct(base_out.energy_kpi, end_out.energy_kpi),
+        "Water intensity":      _pct(base_out.water_kpi,  end_out.water_kpi),
+        "Renewable electricity":_pct(renew_base,           renew_end),
+        "Waste recovery rate":  _pct(wrec_base,            wrec_end),
+    }
+
+
 def page_benchmarking():
     st.markdown("## Peer Benchmarking")
-    rep_year = st.session_state.get("reporting_year", CURR_YEAR)
-    company  = (st.session_state.get("reporting_company") or
-                st.session_state.get("user_company") or "Your Company")
+
+    # ── Company + year selector ──────────────────────────────────────────────
+    companies_in_db = dl.get_companies(_CONSOLIDATED_DF) or COMPANIES
+    default_co = (st.session_state.get("reporting_company") or
+                  st.session_state.get("user_company") or companies_in_db[0])
+    if default_co not in companies_in_db:
+        default_co = companies_in_db[0]
+
+    sel_col, yr_col, _ = st.columns([2, 1, 3])
+    with sel_col:
+        company = st.selectbox("Company", options=companies_in_db,
+                               index=companies_in_db.index(default_co),
+                               key="bench_company_sel")
+    with yr_col:
+        avail_yrs = dl.get_years(_CONSOLIDATED_DF, company) or [CURR_YEAR]
+        rep_year  = st.selectbox("Year", options=sorted(avail_yrs, reverse=True),
+                                 key="bench_year_sel")
+
+    # ── Load real data for selected company+year from consolidated DB ─────────
+    inp, out = _load_company_year_outputs(company, rep_year)
+    renew_val = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
 
     bench_source = "live consolidated dataset" if not _CONSOLIDATED_DF.empty else "built-in demo data"
-    st.info(f"Benchmarking uses the {bench_source} ({len(COMPANIES)} companies, 2009–{rep_year}). Quartile bands computed from all TIP members.")
+    st.caption(f"Benchmarking uses the {bench_source} · {len(companies_in_db)} companies · quartiles from all TIP members.")
+    st.divider()
 
-    inp, out = get_current_outputs()
-
-    # -- Live quartiles from ALL companies for the reporting year ----------------
-    bench_kpis = dl.get_benchmark_kpis(_CONSOLIDATED_DF, rep_year - 1)
+    # ── Live quartiles from ALL companies for the reporting year ──────────────
+    bench_kpis = dl.get_benchmark_kpis(_CONSOLIDATED_DF, rep_year)
 
     def live_bench(kpi_col, company_value, unit, lower_better):
-        if not bench_kpis.empty and kpi_col in bench_kpis.columns:
-            vals = bench_kpis[kpi_col].dropna().values
-        else:
-            vals = []
+        vals = bench_kpis[kpi_col].dropna().values if (not bench_kpis.empty and kpi_col in bench_kpis.columns) else []
         if len(vals) >= 3:
-            q25, med, q75 = float(np.percentile(vals,25)), float(np.percentile(vals,50)), float(np.percentile(vals,75))
+            q25 = float(np.percentile(vals, 25))
+            med = float(np.percentile(vals, 50))
+            q75 = float(np.percentile(vals, 75))
         else:
-            # Fallback: bracket the company value
             q25 = company_value * 0.85; med = company_value; q75 = company_value * 1.15
         return BenchmarkResult(kpi_col, company_value, q25, med, q75, unit, lower_better)
 
-    renew_val  = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
     benchmarks = [
-        live_bench("Total CO2 - KPI",   out.co2_kpi,                "T.CO2/T", True),
-        live_bench("Total energy - KPI", out.energy_kpi,             "GJ/T",    True),
-        live_bench("Water intake - KPI", out.water_kpi,              "m³/T",    True),
-        live_bench("Renewable_Electricity_Share_%", renew_val,        "%",       False),
-        live_bench("waste_recovery_pct", out.waste_recovery_pct*100, "%",       False),
+        live_bench("Total CO2 - KPI",             out.co2_kpi,                "T.CO2/T", True),
+        live_bench("Total energy - KPI",           out.energy_kpi,             "GJ/T",    True),
+        live_bench("Water intake - KPI",           out.water_kpi,              "m³/T",    True),
+        live_bench("Renewable_Electricity_Share_%",renew_val,                  "%",       False),
+        live_bench("waste_recovery_pct",           out.waste_recovery_pct*100, "%",       False),
     ]
     kpi_labels = ["CO₂ intensity","Energy intensity","Water intensity","Renewable electricity","Waste recovery rate"]
     for b, lbl in zip(benchmarks, kpi_labels): b.kpi_name = lbl
@@ -1493,7 +1550,7 @@ def page_benchmarking():
     with col_l:
         with st.container(border=True):
             st.markdown("#### Industry band positioning")
-            st.caption(f"Your KPI vs all {len(COMPANIES)} TIP member quartile ranges — {rep_year-1} actuals.")
+            st.caption(f"{company} {rep_year} KPI vs all TIP member quartile ranges.")
             st.markdown("""
             <div style="display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap">
               <span style="font-size:11px;display:flex;align-items:center;gap:4px;color:#6B7280">
@@ -1512,137 +1569,144 @@ def page_benchmarking():
     with col_r:
         with st.container(border=True):
             st.markdown("#### ESG profile — vs TIP industry median")
-            st.caption("Normalised score 0–100 derived from actual quartile positions. Higher = better.")
+            st.caption(f"Normalised 0–100 from actual quartile positions. {company} {rep_year} vs sector median.")
             dims = ["CO₂ intensity","Energy efficiency","Water management","Waste recovery","Renewable energy","H&S performance"]
 
-            # Company scores: position within the quartile range
             company_scores = []
             for b in benchmarks[:5]:
                 rng = max(b.q75 - b.q25, 0.001)
                 raw = (b.company_value - b.q25) / rng
-                company_scores.append(max(0, min(100, (1-raw)*100 if b.lower_is_better else raw*100)))
-            company_scores += [85]   # H&S placeholder
+                company_scores.append(max(0, min(100, (1 - raw) * 100 if b.lower_is_better else raw * 100)))
+            company_scores += [75]   # H&S: not in KPI set, shown as neutral
 
-            # Industry scores: computed from actual median across all companies
-            industry_scores = _compute_industry_scores(_CONSOLIDATED_DF, rep_year - 1)
+            industry_scores = _compute_industry_scores(_CONSOLIDATED_DF, rep_year)
 
             fig = go.Figure()
             fig.add_trace(go.Scatterpolar(
-                r=company_scores+[company_scores[0]], theta=dims+[dims[0]],
+                r=company_scores + [company_scores[0]], theta=dims + [dims[0]],
                 fill="toself", name=f"{company} {rep_year}",
                 line=dict(color="#00916E", width=2), fillcolor="rgba(0,145,110,.15)"))
             fig.add_trace(go.Scatterpolar(
-                r=industry_scores+[industry_scores[0]], theta=dims+[dims[0]],
-                fill="toself", name=f"TIP median ({rep_year-1})",
+                r=industry_scores + [industry_scores[0]], theta=dims + [dims[0]],
+                fill="toself", name=f"TIP median ({rep_year})",
                 line=dict(color="#9CA3AF", width=1.5, dash="dot"), fillcolor="rgba(156,163,175,.08)"))
-            fig.update_layout(polar=dict(radialaxis=dict(range=[0,100], tickfont=dict(size=9))),
-                showlegend=True, height=340, margin=dict(l=40,r=40,t=20,b=20))
+            fig.update_layout(
+                polar=dict(radialaxis=dict(range=[0, 100], tickfont=dict(size=9))),
+                showlegend=True, height=340, margin=dict(l=40, r=40, t=20, b=20))
             st.plotly_chart(fig, use_container_width=True)
 
-    # -- Improvement table: real data ------------------------------------------
+    # ── Improvement table: computed from real data for each year ──────────────
     with st.container(border=True):
-        st.markdown("#### Improvement rate — your company vs TIP industry average since 2009")
-        company_hist = st.session_state.get("company_hist", {})
+        base_yr = min(dl.get_years(_CONSOLIDATED_DF, company) or [2009])
+        st.markdown(f"#### Improvement rate — {company} vs TIP sector average ({base_yr}→{rep_year})")
 
-        def _impr(field):
-            pct = dl.improvement_since(company_hist, field, 2009, rep_year - 1)
-            return f"{pct:+.1f}%" if pct is not None else "N/A"
+        impr = _compute_kpi_improvement(company, base_yr, rep_year)
 
-        # Compute real sector improvement for KPI fields
-        def _sector_impr(col_name, lower_better=True):
+        def _sector_impr(col_name):
             if _CONSOLIDATED_DF.empty or "Row_Label" in _CONSOLIDATED_DF.columns:
                 return "N/A"
             try:
-                base = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"]==2009][col_name].mean()
-                end  = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"]==rep_year-1][col_name].mean()
-                if base and not np.isnan(base) and not np.isnan(end):
-                    pct = (end - base) / abs(base) * 100
-                    return f"{pct:+.1f}%"
+                df_col = _CONSOLIDATED_DF[[c for c in [col_name] if c in _CONSOLIDATED_DF.columns]]
+                if df_col.empty: return "N/A"
+                base = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"] == base_yr][col_name].mean()
+                end  = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"] == rep_year][col_name].mean()
+                if pd.notna(base) and pd.notna(end) and base != 0:
+                    return f"{(end - base) / abs(base) * 100:+.1f}%"
             except Exception:
                 pass
             return "N/A"
 
         impr_df = pd.DataFrame({
-            "KPI":              ["CO₂ intensity","Energy intensity","Water intensity","Renewable electricity","Waste recovery rate"],
-            "Your improvement (2009→latest)": [
-                _impr("co2_kpi") if "co2_kpi" in company_hist else _impr("Total CO2 - KPI"),
-                _impr("energy_kpi") if "energy_kpi" in company_hist else _impr("Total energy - KPI"),
-                _impr("water_kpi") if "water_kpi" in company_hist else _impr("Water intake - KPI"),
-                _impr("renew_elec_purchased"),
-                _impr("waste_recovery"),
-            ],
+            "KPI":                          list(impr.keys()),
+            f"Your improvement ({base_yr}→{rep_year})": list(impr.values()),
             "TIP sector average": [
                 _sector_impr("Total CO2 - KPI"),
                 _sector_impr("Total energy - KPI"),
                 _sector_impr("Water intake - KPI"),
-                _sector_impr("Renewable_Electricity_Share_%", False),
+                _sector_impr("Renewable_Electricity_Share_%"),
                 "N/A",
             ],
         })
-        st.dataframe(impr_df, hide_index=True, use_container_width=True)
 
-    # -- KPI trend chart: company vs sector ------------------------------------
-    with st.container(border=True):
-        st.markdown("#### CO₂ intensity trend — your company vs all peers")
-        if not _CONSOLIDATED_DF.empty and "Row_Label" not in _CONSOLIDATED_DF.columns and "Total CO2 - KPI" in _CONSOLIDATED_DF.columns:
+        def _style_impr(val):
+            if val == "N/A": return "color:#9CA3AF"
+            try:
+                num = float(str(val).replace("+","").replace("%",""))
+                return "color:#059669;font-weight:600" if num < 0 else (
+                       "color:#DC2626;font-weight:600" if num > 10 else "color:#D97706")
+            except: return ""
+
+        styled = impr_df.style.map(_style_impr, subset=[f"Your improvement ({base_yr}→{rep_year})", "TIP sector average"])
+        st.dataframe(styled, hide_index=True, use_container_width=True)
+        st.caption("For intensity KPIs (CO₂, Energy, Water): negative = improvement. "
+                   "For Renewable electricity: positive = improvement.")
+
+    # ── KPI trend charts: company vs sector for ALL 5 KPIs ───────────────────
+    if not _CONSOLIDATED_DF.empty and "Row_Label" not in _CONSOLIDATED_DF.columns:
+        trend_kpis = [
+            ("Total CO2 - KPI",             "CO₂ intensity (T.CO₂/T)", "#EF4444"),
+            ("Total energy - KPI",          "Energy intensity (GJ/T)", "#F59E0B"),
+            ("Water intake - KPI",          "Water intensity (m³/T)",  "#3B82F6"),
+            ("Renewable_Electricity_Share_%","Renewable electricity (%)", "#00916E"),
+        ]
+        available = [(col, lbl, clr) for col, lbl, clr in trend_kpis if col in _CONSOLIDATED_DF.columns]
+
+        if available:
             yrs_all = sorted(_CONSOLIDATED_DF["Year"].dropna().unique().astype(int).tolist())
-            sector_co2 = _CONSOLIDATED_DF.groupby("Year")["Total CO2 - KPI"].mean().reindex(yrs_all)
-            sector_min  = _CONSOLIDATED_DF.groupby("Year")["Total CO2 - KPI"].min().reindex(yrs_all)
-            sector_max  = _CONSOLIDATED_DF.groupby("Year")["Total CO2 - KPI"].max().reindex(yrs_all)
-
             comp_df = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Company"] == company]
-            comp_co2 = comp_df.set_index("Year")["Total CO2 - KPI"].reindex(yrs_all) if not comp_df.empty else None
 
-            fig = go.Figure()
-            # Shaded sector range
-            fig.add_trace(go.Scatter(
-                x=yrs_all, y=sector_max.tolist(), fill=None, mode="lines",
-                line=dict(color="rgba(156,163,175,0.2)", width=0), showlegend=False))
-            fig.add_trace(go.Scatter(
-                x=yrs_all, y=sector_min.tolist(), fill="tonexty", mode="lines",
-                line=dict(color="rgba(156,163,175,0.2)", width=0),
-                fillcolor="rgba(156,163,175,0.15)", name="Sector range"))
-            # Sector average
-            fig.add_trace(go.Scatter(
-                x=yrs_all, y=sector_co2.tolist(), mode="lines",
-                name="TIP sector average", line=dict(color="#9CA3AF", width=2, dash="dot")))
-            # Company line
-            if comp_co2 is not None and comp_co2.notna().any():
-                fig.add_trace(go.Scatter(
-                    x=yrs_all, y=comp_co2.tolist(), mode="lines+markers",
-                    name=company, line=dict(color="#00916E", width=2.5), marker=dict(size=5)))
-            fig.update_layout(
-                height=280, margin=dict(l=10,r=10,t=10,b=10),
-                yaxis_title="CO₂ intensity (T.CO₂/T prod)",
-                plot_bgcolor="#fff", paper_bgcolor="#fff",
-                xaxis=dict(gridcolor="#F3F4F6"), yaxis=dict(gridcolor="#F3F4F6"),
-                legend=dict(font=dict(size=11)))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("CO₂ trend chart requires the wide master CSV. Run build_esg_master.py first.")
+            n_charts = len(available)
+            chart_cols = st.columns(2)
+            for idx, (col, lbl, clr) in enumerate(available):
+                with chart_cols[idx % 2]:
+                    with st.container(border=True):
+                        st.markdown(f"**{lbl} — {company} vs peers**")
+                        s_mean = _CONSOLIDATED_DF.groupby("Year")[col].mean().reindex(yrs_all)
+                        s_min  = _CONSOLIDATED_DF.groupby("Year")[col].min().reindex(yrs_all)
+                        s_max  = _CONSOLIDATED_DF.groupby("Year")[col].max().reindex(yrs_all)
+                        c_vals = comp_df.set_index("Year")[col].reindex(yrs_all) if not comp_df.empty else None
 
-    # -- Strengths / gaps auto-generated from quartile positions ---------------
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=yrs_all, y=s_max.tolist(), fill=None, mode="lines",
+                            line=dict(width=0, color="rgba(200,200,200,0)"), showlegend=False))
+                        fig.add_trace(go.Scatter(x=yrs_all, y=s_min.tolist(), fill="tonexty", mode="lines",
+                            line=dict(width=0), fillcolor="rgba(156,163,175,0.15)", name="Sector range"))
+                        fig.add_trace(go.Scatter(x=yrs_all, y=s_mean.tolist(), mode="lines",
+                            name="Sector avg", line=dict(color="#9CA3AF", width=1.5, dash="dot")))
+                        if c_vals is not None and c_vals.notna().any():
+                            fig.add_trace(go.Scatter(x=yrs_all, y=c_vals.tolist(), mode="lines+markers",
+                                name=company, line=dict(color=clr, width=2.5), marker=dict(size=5)))
+                        fig.update_layout(height=220, margin=dict(l=10,r=10,t=10,b=10),
+                            plot_bgcolor="#fff", paper_bgcolor="#fff",
+                            xaxis=dict(gridcolor="#F3F4F6"),
+                            yaxis=dict(gridcolor="#F3F4F6"),
+                            legend=dict(font=dict(size=10), orientation="h", y=-0.25))
+                        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Trend charts require the wide master CSV. Run build_esg_master.py first.")
+
+    # ── Strengths / gaps ──────────────────────────────────────────────────────
     col_l2, col_r2 = st.columns(2)
     with col_l2:
         with st.container(border=True):
             st.markdown("#### Key strengths")
             strengths = [b for b in benchmarks if
-                         (b.lower_is_better and b.company_value <= b.q25) or
-                         (not b.lower_is_better and b.company_value >= b.q75)]
+                (b.lower_is_better and b.company_value <= b.q25) or
+                (not b.lower_is_better and b.company_value >= b.q75)]
             if strengths:
                 for b in strengths:
-                    st.success(f"**{b.kpi_name}** — top quartile ({b.company_value:.3f} {b.unit})")
+                    st.success(f"**{b.kpi_name}** — top quartile  {b.company_value:.3f} {b.unit} ≤ Q25 {b.q25:.3f}")
             else:
-                st.info("No top-quartile metrics yet. Enter your data in the KPI entry tab.")
+                st.info("No top-quartile metrics for the selected company and year.")
     with col_r2:
         with st.container(border=True):
             st.markdown("#### Improvement areas")
             gaps = [b for b in benchmarks if
-                    (b.lower_is_better and b.company_value > b.median) or
-                    (not b.lower_is_better and b.company_value < b.median)]
+                (b.lower_is_better and b.company_value > b.median) or
+                (not b.lower_is_better and b.company_value < b.median)]
             if gaps:
                 for b in gaps:
-                    st.warning(f"**{b.kpi_name}** — below sector median ({b.company_value:.3f} vs median {b.median:.3f} {b.unit})")
+                    st.warning(f"**{b.kpi_name}** — {b.company_value:.3f} vs median {b.median:.3f} {b.unit}")
             else:
                 st.success("All KPIs at or above sector median.")
 
@@ -1650,118 +1714,389 @@ def page_benchmarking():
 # ─────────────────────────────────────────────────────────
 # PAGE 4 -- VERIFICATION (dss+ only)
 # ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# SHARED: dss+ company/year selector
+# ─────────────────────────────────────────────────────────
+def _dss_company_selector(page_key: str):
+    """
+    Lets a dss+ analyst pick any company + year from the consolidated DB.
+    Stores selection in session_state under dss_{page_key}_company / _year.
+    Returns (company, year, inp, out, prev_inp, prev_out, company_hist).
+    """
+    co_key = f"dss_{page_key}_company"
+    yr_key = f"dss_{page_key}_year"
+
+    companies_in_db = dl.get_companies(_CONSOLIDATED_DF) or COMPANIES
+    default_co = (st.session_state.get("reporting_company") or
+                  st.session_state.get("user_company") or companies_in_db[0])
+    if default_co not in companies_in_db:
+        default_co = companies_in_db[0]
+
+    col1, col2, _ = st.columns([2, 1, 3])
+    with col1:
+        sel_co = st.selectbox(
+            "Company to review", options=companies_in_db,
+            index=companies_in_db.index(st.session_state.get(co_key, default_co)),
+            key=f"sel_{page_key}_co"
+        )
+    with col2:
+        avail_years = dl.get_years(_CONSOLIDATED_DF, sel_co) or [CURR_YEAR]
+        sel_yr = st.selectbox(
+            "Year", options=sorted(avail_years, reverse=True),
+            key=f"sel_{page_key}_yr"
+        )
+
+    st.session_state[co_key] = sel_co
+    st.session_state[yr_key] = sel_yr
+
+    # Load data for selected and previous year
+    hist = dl.get_company_hist(_CONSOLIDATED_DF, sel_co)
+
+    def _make_inp_out(year):
+        sd = dl.get_step_data(hist, year)
+        sd_clean = {k: v for k, v in sd.items() if k in _VALID_TEMPLATE_FIELDS}
+        inp = TemplateInputs(company=sel_co, year=year, **sd_clean)
+        return inp, calculate(inp)
+
+    inp,  out  = _make_inp_out(sel_yr)
+    try:
+        prev_inp, prev_out = _make_inp_out(sel_yr - 1)
+    except Exception:
+        prev_inp, prev_out = TemplateInputs(company=sel_co, year=sel_yr-1), None
+
+    return sel_co, sel_yr, inp, out, prev_inp, prev_out, hist
+
+
+def _compute_completeness(inp: "TemplateInputs", out: "TemplateOutputs") -> dict:
+    """
+    Returns {section_label: pct_complete} based on which fields have non-zero data.
+    """
+    def pct(*vals):
+        filled = sum(1 for v in vals if v is not None and float(v) != 0)
+        return int(filled / len(vals) * 100)
+
+    fuel_vals = [inp.nat_gas, inp.coal_sub, inp.propane, inp.fuel_oil_heavy_a,
+                 inp.diesel, inp.petrol, inp.biomass, inp.lpg, inp.other_fuels]
+    fuel_filled = sum(1 for v in fuel_vals if v > 0)
+
+    return {
+        "ISO 14001":           pct(inp.total_sites, inp.iso_sites),
+        "Production":          pct(inp.production),
+        "Water":               pct(inp.water_withdrawals),
+        "Energy — Electricity":pct(inp.renew_elec_purchased + inp.nonrenew_elec_purchased, inp.self_gen_elec),
+        "Energy — Fuels":      min(100, int(fuel_filled / max(len(fuel_vals), 1) * 100)) if inp.nat_gas or inp.coal_sub else 0,
+        "CO₂ Scope 1":         pct(out.total_co2_scope1),
+        "CO₂ Scope 2":         pct(inp.co2_scope2_steam),
+        "Waste":               pct(inp.waste_total, inp.waste_recovery),
+        "Pathway 3 (SBTi)":    0,   # not captured in current template
+        "Pathway 4 (H&S)":     0,   # not captured in current template
+        "Pathway 4 (D&I)":     0,   # not captured in current template
+    }
+
+
+def _compute_readiness_score(completeness: dict, flags) -> tuple:
+    """
+    Score = weighted completeness average, minus penalties for flags.
+    Returns (score: int, label: str)
+    """
+    weights = {
+        "ISO 14001":1,"Production":2,"Water":2,
+        "Energy — Electricity":3,"Energy — Fuels":3,
+        "CO₂ Scope 1":3,"CO₂ Scope 2":2,"Waste":2,
+        "Pathway 3 (SBTi)":1,"Pathway 4 (H&S)":1,"Pathway 4 (D&I)":1,
+    }
+    total_w  = sum(weights.values())
+    raw      = sum(completeness.get(k,0) * w for k,w in weights.items()) / total_w
+    n_errors   = sum(1 for f in flags if f.severity == "error")
+    n_warnings = sum(1 for f in flags if f.severity == "warning")
+    score = max(0, min(100, int(raw - n_errors * 10 - n_warnings * 3)))
+    label = "Ready" if score >= 90 else "Review required" if score >= 70 else "Not ready"
+    return score, label
+
+
+# ─────────────────────────────────────────────────────────
+# PAGE 4 -- VERIFICATION (dss+ only)  — fully live
+# ─────────────────────────────────────────────────────────
 def page_verification():
     if not st.session_state.is_dss:
         st.error("This section is restricted to dss+ analysts and managers."); return
 
     st.markdown("## Data Verification")
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Company",      "Bridgestone")
-    c2.metric("Year",         "2023")
-    c3.metric("Status",       "Pending review")
-    c4.metric("Completeness", "87%")
-    c5.metric("Open flags",   "2 warnings · 1 error")
+    st.caption("Select any company and reporting year from the consolidated dataset to review.")
+
+    sel_co, sel_yr, inp, out, prev_inp, prev_out, hist = _dss_company_selector("verif")
     st.divider()
 
-    flags_def = [
-        ("warn","Fuel Oil — >20% YoY decrease (−62.2%)",
-         "Bridgestone 2023 vs 2022: Fuel Oil dropped from 166,773 GJ to 150,000 GJ. Comment: 'Transition to natural gas.' Plausible — verify against procurement records.","flag1"),
-        ("warn","Renewable electricity — >20% YoY increase (+27.3%)",
-         "Renewable electricity rose from 4,082,923 GJ to 5,200,000 GJ. No comment provided. Requires explanation from company.","flag2"),
-        ("error","Waste consistency check FAILED",
-         "Total waste (338,000 MT) ≠ Recovery (290,000) + Elimination. Discrepancy of 2,000 MT. Must be corrected before acceptance.","flag3"),
-        ("ok","Energy totals — all values consistent",
-         "Total energy reconciles with all sub-category inputs. Unit conversions verified. All YoY changes within ±20%.","flag4"),
-        ("ok","CO₂ calculations verified",
-         "Scope 1 matches emission factor outputs. Scope 2 consistent with IEA country factors.","flag5"),
-    ]
+    # -- Real flags from formula_engine ----------------------------------------
+    flags = validate_submission(inp, out, prev_out, threshold=20.0)
 
-    for severity, title, detail, flag_id in flags_def:
-        icon_map  = {"warn":"!","error":"X","ok":"OK"}
-        color_map = {"warn":"fc-warn fi-warn","error":"fc-error fi-error","ok":"fc-ok fi-ok"}
-        fc, fi    = color_map[severity].split()
-        resolved  = flag_id in st.session_state.flags_resolved
-        if resolved: fc, fi = "fc-ok","fi-ok"; title += " — Approved"
+    # -- Also compute YoY field-level flags from the data ----------------------
+    extra_flags = []
+    yoy_fields = [
+        ("nat_gas",              "Natural Gas"),
+        ("renew_elec_purchased", "Renewable Electricity"),
+        ("nonrenew_elec_purchased","Non-Renewable Electricity"),
+        ("fuel_oil_heavy_a",     "Fuel Oil"),
+        ("coal_sub",             "Coal"),
+        ("water_withdrawals",    "Water Withdrawals"),
+        ("production",           "Production"),
+    ]
+    from formula_engine import ValidationFlag
+    for field, label in yoy_fields:
+        cur  = getattr(inp,      field, 0) or 0
+        prev = getattr(prev_inp, field, 0) or 0
+        if prev > 0 and cur > 0:
+            pct = (cur - prev) / abs(prev) * 100
+            if abs(pct) > 20:
+                direction = "increase" if pct > 0 else "decrease"
+                extra_flags.append(ValidationFlag(
+                    severity="warning",
+                    message=f"{label} — >{20}% YoY {direction} ({pct:+.1f}%)",
+                    detail=(f"{label}: {prev:,.0f} → {cur:,.0f} "
+                            f"({'↑' if pct>0 else '↓'}{abs(pct):.1f}%). "
+                            f"Verify with company documentation.")
+                ))
+
+    all_flags = flags + extra_flags
+
+    # -- Completeness + summary metrics ----------------------------------------
+    completeness = _compute_completeness(inp, out)
+    avg_complete  = int(sum(completeness.values()) / len(completeness))
+    n_err  = sum(1 for f in all_flags if f.severity == "error")
+    n_warn = sum(1 for f in all_flags if f.severity == "warning")
+    score, label = _compute_readiness_score(completeness, all_flags)
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("Company",      sel_co)
+    c2.metric("Year",         str(sel_yr))
+    c3.metric("Status",       "Ready" if score >= 90 else "Pending review")
+    c4.metric("Completeness", f"{avg_complete}%")
+    c5.metric("Open flags",   f"{n_warn} warning{'s' if n_warn!=1 else ''} · {n_err} error{'s' if n_err!=1 else ''}")
+    st.divider()
+
+    # -- Flag cards ------------------------------------------------------------
+    if not st.session_state.get("flags_resolved_real"):
+        st.session_state["flags_resolved_real"] = set()
+
+    resolved_set = st.session_state["flags_resolved_real"]
+
+    for i, flag in enumerate(all_flags):
+        flag_id  = f"flag_{sel_co}_{sel_yr}_{i}"
+        resolved = flag_id in resolved_set
+
+        sev = "ok" if resolved else flag.severity
+        icon_map  = {"ok":"✓", "warning":"!", "error":"✕", "warn":"!"}
+        color_map = {"ok":"fc-ok fi-ok", "warning":"fc-warn fi-warn",
+                     "error":"fc-error fi-error", "warn":"fc-warn fi-warn"}
+        fc, fi = color_map.get(sev, "fc-ok fi-ok").split()
+        icon   = icon_map.get(sev, "OK")
+        title  = flag.message + (" — Approved" if resolved else "")
+        detail = flag.detail
+
         st.markdown(f"""<div class="flag-card {fc}">
-          <div class="fc-icon {fi}">{icon_map.get("ok" if resolved else severity,"")}</div>
-          <div><div class="fc-title">{title}</div><div class="fc-detail">{detail}</div></div>
+          <div class="fc-icon {fi}">{icon}</div>
+          <div><div class="fc-title">{title}</div>
+               <div class="fc-detail">{detail}</div></div>
         </div>""", unsafe_allow_html=True)
-        if not resolved and severity in ("warn","error"):
+
+        if not resolved and flag.severity in ("warning","error"):
             cols = st.columns([6,1,1])
             with cols[1]:
                 if st.button("Query", key=f"q_{flag_id}"):
-                    st.toast(f"Query sent for: {title[:40]}...")
+                    st.toast(f"Query logged: {flag.message[:50]}...")
             with cols[2]:
-                if severity == "warn" and st.button("Accept", key=f"a_{flag_id}", type="primary"):
-                    st.session_state.flags_resolved.add(flag_id); st.rerun()
-                elif severity == "error" and st.button("Send Back", key=f"sb_{flag_id}"):
-                    st.toast("Submission returned to company with error details.")
+                if flag.severity == "warning":
+                    if st.button("Accept", key=f"a_{flag_id}", type="primary"):
+                        resolved_set.add(flag_id)
+                        st.session_state["flags_resolved_real"] = resolved_set
+                        st.rerun()
+                else:
+                    if st.button("Send Back", key=f"sb_{flag_id}"):
+                        st.toast(f"Submission returned to {sel_co} with error details.")
 
     st.divider()
-    col_approve, _ = st.columns([1,3])
+    col_approve, col_export, _ = st.columns([1.5, 1.5, 3])
     with col_approve:
+        warn_ids = [f"flag_{sel_co}_{sel_yr}_{i}"
+                    for i, f in enumerate(all_flags) if f.severity == "warning"]
         if st.button("Approve All Warnings", type="primary"):
-            st.session_state.flags_resolved.update({"flag1","flag2"}); st.rerun()
+            resolved_set.update(warn_ids)
+            st.session_state["flags_resolved_real"] = resolved_set
+            st.rerun()
+    with col_export:
+        if st.button("Export Flag Report"):
+            rows = [{"Flag": f.message, "Severity": f.severity, "Detail": f.detail,
+                     "Status": "Resolved" if f"flag_{sel_co}_{sel_yr}_{i}" in resolved_set else "Open"}
+                    for i, f in enumerate(all_flags)]
+            export_df = pd.DataFrame(rows)
+            st.download_button(
+                "Download CSV", data=export_df.to_csv(index=False).encode(),
+                file_name=f"flags_{sel_co.replace(' ','_')}_{sel_yr}.csv",
+                mime="text/csv", key="dl_flags"
+            )
 
 
 # ─────────────────────────────────────────────────────────
-# PAGE 5 -- AI READINESS (dss+ only)
+# PAGE 5 -- AI READINESS (dss+ only) — fully live
 # ─────────────────────────────────────────────────────────
 def page_readiness():
     if not st.session_state.is_dss:
         st.error("This section is restricted to dss+ analysts and managers."); return
 
     st.markdown("## AI Readiness Check")
-    col_score, col_info = st.columns([1,3])
+    st.caption("Select any company and reporting year to compute a live readiness score.")
+
+    sel_co, sel_yr, inp, out, prev_inp, prev_out, hist = _dss_company_selector("ready")
+    st.divider()
+
+    # -- Compute live values ---------------------------------------------------
+    flags        = validate_submission(inp, out, prev_out, threshold=20.0)
+    completeness = _compute_completeness(inp, out)
+    score, label = _compute_readiness_score(completeness, flags)
+    n_errors     = sum(1 for f in flags if f.severity == "error")
+    n_warnings   = sum(1 for f in flags if f.severity == "warning")
+
+    renew_pct = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
+    prev_co2  = out.total_co2  # placeholder for YoY
+    prev_e    = out.total_energy
+    if prev_out:
+        yoy_co2 = yoy_change(out.total_co2, prev_out.total_co2) or 0
+        yoy_e   = yoy_change(out.total_energy, prev_out.total_energy) or 0
+    else:
+        yoy_co2 = yoy_e = 0
+
+    # -- Gauge + summary -------------------------------------------------------
+    col_score, col_info = st.columns([1, 3])
     with col_score:
-        fig = go.Figure(go.Indicator(mode="gauge+number", value=82,
-            number=dict(suffix="/100", font=dict(size=32, color="#00916E")),
-            gauge=dict(axis=dict(range=[0,100]), bar=dict(color="#00916E", thickness=.25),
-                steps=[dict(range=[0,60],color="#FEE2E2"),dict(range=[60,80],color="#FEF3C7"),dict(range=[80,100],color="#D1FAE5")],
-                threshold=dict(line=dict(color="#065F46",width=3),thickness=.75,value=82))))
+        score_color = "#00916E" if score >= 80 else "#D97706" if score >= 60 else "#DC2626"
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number", value=score,
+            number=dict(suffix="/100", font=dict(size=32, color=score_color)),
+            gauge=dict(
+                axis=dict(range=[0,100]),
+                bar=dict(color=score_color, thickness=.25),
+                steps=[
+                    dict(range=[0,60],  color="#FEE2E2"),
+                    dict(range=[60,80], color="#FEF3C7"),
+                    dict(range=[80,100],color="#D1FAE5"),
+                ],
+                threshold=dict(line=dict(color="#065F46",width=3), thickness=.75, value=score)
+            )
+        ))
         fig.update_layout(height=200, margin=dict(l=10,r=10,t=10,b=10), paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
+
     with col_info:
-        st.markdown("### Report Readiness Score: **82 / 100**")
-        st.caption("Bridgestone · 2023 Reporting Year · 3 items pending resolution")
-        st.warning("Review required before submission to consolidated database")
+        st.markdown(f"### Report Readiness Score: **{score} / 100**")
+        st.caption(f"{sel_co} · {sel_yr} Reporting Year · "
+                   f"{n_errors} error{'s' if n_errors!=1 else ''}, "
+                   f"{n_warnings} warning{'s' if n_warnings!=1 else ''}")
+        if score >= 90:
+            st.success(f"✅ {label} — submission can be included in consolidated report.")
+        elif score >= 70:
+            st.warning(f"⚠️ {label} — resolve open items before submission.")
+        else:
+            st.error(f"❌ {label} — significant data gaps must be addressed.")
+
+        # Key live KPIs at a glance
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("Energy KPI",   f"{out.energy_kpi:.2f} GJ/T")
+        k2.metric("CO₂ KPI",      f"{out.co2_kpi:.3f} T/T")
+        k3.metric("Water KPI",    f"{out.water_kpi:.2f} m³/T")
+        k4.metric("Renewable %",  f"{renew_pct:.1f}%")
 
     st.divider()
+
+    # -- Completeness by section -----------------------------------------------
     st.markdown("#### Data completeness by section")
-    sections = [
-        ("ISO 14001",100,"#00916E"),("Production",100,"#00916E"),("Water",100,"#00916E"),
-        ("Energy — Electricity",100,"#00916E"),("Energy — Fuels",95,"#00916E"),
-        ("CO₂ Scope 1",100,"#00916E"),("CO₂ Scope 2",85,"#D97706"),
-        ("Waste",88,"#D97706"),("Pathway 3 (SBTi / Water)",60,"#DC2626"),
-        ("Pathway 4 (H&S)",55,"#DC2626"),("Pathway 4 (D&I)",50,"#DC2626"),
-        ("Electricity by country",80,"#D97706"),
-    ]
     cols = st.columns(3)
-    for i, (label, pct, color) in enumerate(sections):
-        with cols[i%3]:
+    for i, (label_s, pct) in enumerate(completeness.items()):
+        color = "#00916E" if pct == 100 else "#D97706" if pct >= 60 else "#DC2626"
+        with cols[i % 3]:
             with st.container(border=True):
-                st.caption(label); st.progress(pct/100, text=f"{pct}%")
+                st.caption(label_s)
+                st.progress(pct / 100, text=f"{pct}%")
 
     st.divider()
+
+    # -- AI Insights (calls llm_client; mock if no API key) --------------------
     st.markdown("#### AI-generated insights *(for analyst review — not final output)*")
-    for title, body in [
-        ("Energy & Emissions Summary",
-         "Total energy consumption remained broadly stable year-on-year. Fuel oil usage fell 10%, "
-         "continuing the multi-year transition toward natural gas and renewables. Renewable electricity "
-         "reached 48.3% of total — the highest reported in the 2023 TIP cohort. CO₂ intensity declined "
-         "to 0.551 T/T, placing this company in the top quartile for the second consecutive year."),
-        ("Data Gaps & Actions Required",
-         "3 items must be resolved before submission is accepted:\n\n"
-         "1. Waste consistency error — Total waste does not reconcile with recovery + elimination sub-totals.\n\n"
-         "2. Pathway 4 incomplete — Injury rate and gender representation data are missing.\n\n"
-         "3. Scope 3 emissions not reported — Category 11 (rolling resistance use-phase) flagged for voluntary disclosure."),
+
+    bench_kpis = dl.get_benchmark_kpis(_CONSOLIDATED_DF, sel_yr - 1)
+    benchmarks_for_llm = []
+    if not bench_kpis.empty:
+        for col, kpi_name in [("Total CO2 - KPI","CO2 intensity"),
+                               ("Total energy - KPI","Energy intensity")]:
+            if col in bench_kpis.columns:
+                vals = bench_kpis[col].dropna().values
+                if len(vals) >= 3:
+                    med = float(np.median(vals))
+                    pos = "Top 25%" if (out.co2_kpi < np.percentile(vals,25) if "CO2" in col
+                          else out.energy_kpi < np.percentile(vals,25)) else "Above avg"
+                    benchmarks_for_llm.append({
+                        "kpi": kpi_name,
+                        "position": pos,
+                        "value": out.co2_kpi if "CO2" in col else out.energy_kpi,
+                        "median": med,
+                    })
+
+    kpi_dict = {
+        "production_mt":      inp.production,
+        "total_energy_gj":    out.total_energy,
+        "energy_kpi":         out.energy_kpi,
+        "co2_scope1":         out.total_co2_scope1,
+        "co2_scope2":         out.total_co2_scope2,
+        "total_co2":          out.total_co2,
+        "co2_kpi":            out.co2_kpi,
+        "water_m3":           inp.water_withdrawals,
+        "water_kpi":          out.water_kpi,
+        "renew_elec_pct":     renew_pct,
+        "waste_recovery_pct": out.waste_recovery_pct * 100,
+        "yoy_co2_pct":        yoy_co2,
+        "yoy_energy_pct":     yoy_e,
+        "benchmarks":         benchmarks_for_llm,
+    }
+
+    try:
+        from llm_client import get_llm
+        llm = get_llm()
+        with st.spinner("Generating AI insights…"):
+            insight_text = llm.generate_insight(kpi_dict, sel_co, sel_yr)
+            gaps_text    = llm.identify_gaps(kpi_dict, sel_co, sel_yr,
+                               [{"severity": f.severity, "message": f.message,
+                                 "detail": f.detail} for f in flags])
+            ready_result = llm.score_readiness(kpi_dict, sel_co, sel_yr,
+                               {k: v for k,v in completeness.items()}, flags)
+    except Exception as e:
+        insight_text = (f"[LLM unavailable: {e}]\n\n"
+                        f"Key metrics for {sel_co} {sel_yr}: "
+                        f"Energy KPI {out.energy_kpi:.2f} GJ/T, "
+                        f"CO₂ KPI {out.co2_kpi:.3f} T/T, "
+                        f"Renewable electricity {renew_pct:.1f}%, "
+                        f"Waste recovery {out.waste_recovery_pct*100:.1f}%.")
+        gaps_text    = ("\n".join(f"{i+1}. {f.message}: {f.detail}"
+                                   for i,f in enumerate(flags)
+                                   if f.severity in ("error","warning"))
+                        or "No validation issues found.")
+        ready_result = {"score": score, "label": label,
+                        "justification": f"Score computed from {n_errors} errors, "
+                                         f"{n_warnings} warnings, "
+                                         f"and {int(sum(completeness.values())/len(completeness))}% avg completeness."}
+
+    for ai_title, ai_body in [
+        ("Energy & Emissions Summary", insight_text),
+        ("Data Gaps & Actions Required", gaps_text),
+        ("Readiness Assessment",
+         f"Score: {ready_result.get('score',score)}/100 — "
+         f"{ready_result.get('label', label)}. "
+         f"{ready_result.get('justification','')}"),
     ]:
         st.markdown(f"""<div class="ai-card">
           <div class="ai-head"><div class="ai-pulse"></div>
-            <span class="ai-title">{title}</span>
+            <span class="ai-title">{ai_title}</span>
             <span class="ai-badge">AI insight · review before use</span>
           </div>
-          <div class="ai-body">{body.replace(chr(10),"<br>")}</div>
+          <div class="ai-body">{str(ai_body).replace(chr(10),"<br>")}</div>
         </div>""", unsafe_allow_html=True)
 
 

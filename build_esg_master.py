@@ -1,41 +1,43 @@
 """
-ESG Master Database Builder
-============================
-Pipeline: CONSOLIDATED Excel → Wide Master CSV/Excel
+build_esg_master.py  —  ESG Master Database Builder
+=====================================================
+Pipeline: CONSOLIDATED Excel  →  data_storage/master/
 
 Run:  python build_esg_master.py
-Output saved to: data_storage/raw/
 """
 
 import os
+import shutil
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# Script directory — all paths are relative to where this .py file lives
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-RAW_OUT     = os.path.join(BASE_DIR, "data_storage", "raw")
+# ── Folder structure ──────────────────────────────────────────────────────────
+BASE_DIR    = Path(os.path.dirname(os.path.abspath(__file__)))
+MASTER_DIR  = BASE_DIR / "data_storage" / "master"
+MEMBERS_TIP = BASE_DIR / "data_storage" / "members" / "TIP"
+MEMBERS_NON = BASE_DIR / "data_storage" / "members" / "non_TIP"
+VERSIONS_DIR= BASE_DIR / "data_storage" / "versions"
+REPORTS_TIP = BASE_DIR / "data_storage" / "reports" / "TIP"
+REPORTS_NON = BASE_DIR / "data_storage" / "reports" / "non_TIP"
 
-os.makedirs(RAW_OUT, exist_ok=True)
+for d in [MASTER_DIR, MEMBERS_TIP, MEMBERS_NON, VERSIONS_DIR, REPORTS_TIP, REPORTS_NON]:
+    d.mkdir(parents=True, exist_ok=True)
 
-# Auto-find the consolidated Excel: check raw folder first, then project root
+# ── Locate source file ────────────────────────────────────────────────────────
 FILENAME    = "CONSOLIDATED_DUMMY_2009_2023.xlsx"
-SOURCE_FILE = os.path.join(RAW_OUT, FILENAME)
-if not os.path.exists(SOURCE_FILE):
-    fallback = os.path.join(BASE_DIR, FILENAME)
-    if os.path.exists(fallback):
-        import shutil
+SOURCE_FILE = MASTER_DIR / FILENAME
+if not SOURCE_FILE.exists():
+    fallback = BASE_DIR / FILENAME
+    if fallback.exists():
         shutil.copy(fallback, SOURCE_FILE)
-        print(f"[INFO] Copied {FILENAME} → data_storage/raw/")
+        print(f"[INFO] Copied {FILENAME} → data_storage/master/")
     else:
-        print(f"[ERROR] Cannot find '{FILENAME}'.")
-        print(f"        Place it in either:")
-        print(f"          {RAW_OUT}")
-        print(f"          {BASE_DIR}")
+        print(f"[ERROR] Cannot find '{FILENAME}'. Place it in the project root or data_storage/master/")
         raise SystemExit(1)
 
-# ── Step 1: Load raw consolidated data ────────────────────────────────────────
-print("[1/5] Loading consolidated data...")
+# ── Step 1: Load ──────────────────────────────────────────────────────────────
+print("[1/6] Loading consolidated data...")
 raw = pd.read_excel(SOURCE_FILE, sheet_name="Raw Dummy data", header=0)
 raw.columns = raw.columns.str.strip()
 raw = raw.dropna(subset=["Row_Label"]).copy()
@@ -46,80 +48,60 @@ COMPANIES = raw["Company"].unique().tolist()
 YEARS     = sorted(raw["Year"].unique().tolist())
 print(f"    → {len(COMPANIES)} companies | {YEARS[0]}–{YEARS[-1]} | {raw['Row_Label'].nunique()} KPI fields")
 
-# ── Step 2: Pivot to wide format ──────────────────────────────────────────────
-print("[2/5] Pivoting to wide format (Company × Year)...")
-wide = raw.pivot_table(
-    index=["Company", "Year"],
-    columns="Row_Label",
-    values="Data",
-    aggfunc="first"
-).reset_index()
+# ── Step 2: Pivot ─────────────────────────────────────────────────────────────
+print("[2/6] Pivoting to wide format (Company × Year)...")
+wide = raw.pivot_table(index=["Company","Year"], columns="Row_Label", values="Data", aggfunc="first").reset_index()
 wide.columns.name = None
 
-# Logical column order
 ordered = [
-    "Company", "Year",
-    "Total no. of sites", "ISO 14001 sites", "% certified sites",
-    "Production",
-    "Water intake", "Water intake - KPI",
-    "Total Electricity", "Renewable Electricity Purchased",
-    "Non-Renewable Electricity Purchased",
-    "Self-generated AND consumed electricity on-site",
-    "Purchased Steam", "Sold Electricity", "Sold Steam",
-    "Natural Gas", "Coal", "Propane", "Fuel Oil",
-    "Diesel", "Petrol", "Biomass", "Waste tires", "LPG", "Other",
-    "Total energy", "Total energy - KPI",
-    "Total CO2 - Scope 1", "Total CO2 - Scope 2",
-    "Total CO2", "Total CO2 - KPI",
+    "Company","Year","Total no. of sites","ISO 14001 sites","% certified sites",
+    "Production","Water intake","Water intake - KPI","Total Electricity",
+    "Renewable Electricity Purchased","Non-Renewable Electricity Purchased",
+    "Self-generated AND consumed electricity on-site","Purchased Steam",
+    "Sold Electricity","Sold Steam","Natural Gas","Coal","Propane","Fuel Oil",
+    "Diesel","Petrol","Biomass","Waste tires","LPG","Other",
+    "Total energy","Total energy - KPI","Total CO2 - Scope 1","Total CO2 - Scope 2",
+    "Total CO2","Total CO2 - KPI",
 ]
 ordered = [c for c in ordered if c in wide.columns]
 wide = wide[ordered]
 print(f"    → {wide.shape[0]} rows × {wide.shape[1]} columns")
 
-# ── Step 3: Add derived / formulated KPIs ────────────────────────────────────
-print("[3/5] Engineering derived KPIs...")
+# ── Step 3: Derived KPIs ──────────────────────────────────────────────────────
+print("[3/6] Engineering derived KPIs...")
 df = wide.copy()
 
 df["Renewable_Electricity_Share_%"] = (
-    df["Renewable Electricity Purchased"] / df["Total Electricity"].replace(0, np.nan) * 100
-).round(4)
-
+    df["Renewable Electricity Purchased"] / df["Total Electricity"].replace(0, np.nan) * 100).round(4)
 df["Scope1_Share_%"] = (
-    df["Total CO2 - Scope 1"] / df["Total CO2"].replace(0, np.nan) * 100
-).round(4)
-
+    df["Total CO2 - Scope 1"] / df["Total CO2"].replace(0, np.nan) * 100).round(4)
 df["Scope2_Share_%"] = (
-    df["Total CO2 - Scope 2"] / df["Total CO2"].replace(0, np.nan) * 100
-).round(4)
+    df["Total CO2 - Scope 2"] / df["Total CO2"].replace(0, np.nan) * 100).round(4)
 
 fuel_cols = ["Natural Gas","Coal","Propane","Fuel Oil","Diesel","Petrol","Biomass","Waste tires","LPG","Other"]
 df["Fossil_Energy_Share_%"] = (
     df[[c for c in fuel_cols if c in df.columns]].sum(axis=1, min_count=1)
-    / df["Total energy"].replace(0, np.nan) * 100
-).round(4)
+    / df["Total energy"].replace(0, np.nan) * 100).round(4)
 
-df["Water_per_ton"]  = (df["Water intake"]  / df["Production"].replace(0, np.nan)).round(4)
-df["CO2_per_ton"]    = (df["Total CO2"]      / df["Production"].replace(0, np.nan)).round(4)
-df["Energy_per_ton"] = (df["Total energy"]   / df["Production"].replace(0, np.nan)).round(4)
+df["Water_per_ton"]   = (df["Water intake"]  / df["Production"].replace(0, np.nan)).round(4)
+df["CO2_per_ton"]     = (df["Total CO2"]     / df["Production"].replace(0, np.nan)).round(4)
+df["Energy_per_ton"]  = (df["Total energy"]  / df["Production"].replace(0, np.nan)).round(4)
 df["ISO_Certification_%"] = (df["% certified sites"] * 100).round(2)
 
 print(f"    → Final shape: {df.shape[0]} rows × {df.shape[1]} columns")
 
-# ── Step 4: Save outputs ──────────────────────────────────────────────────────
-print("[4/5] Saving files...")
+# ── Step 4: Save master outputs ───────────────────────────────────────────────
+print("[4/6] Saving master files...")
 
-# Long format (original structure, cleaned)
-long_path = os.path.join(RAW_OUT, "ESG_LONG_ALL_COMPANIES_2009_2023.csv")
+long_path = MASTER_DIR / "ESG_LONG_ALL_COMPANIES_2009_2023.csv"
 raw.to_csv(long_path, index=False)
 print(f"    → LONG CSV:         {long_path}")
 
-# Wide master CSV
-wide_csv = os.path.join(RAW_OUT, "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
+wide_csv = MASTER_DIR / "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"
 df.to_csv(wide_csv, index=False)
 print(f"    → WIDE CSV:         {wide_csv}")
 
-# Wide master Excel (one sheet per company + all)
-wide_xlsx = os.path.join(RAW_OUT, "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.xlsx")
+wide_xlsx = MASTER_DIR / "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.xlsx"
 with pd.ExcelWriter(wide_xlsx, engine="openpyxl") as writer:
     df.to_excel(writer, sheet_name="All_Companies", index=False)
     for company in COMPANIES:
@@ -128,34 +110,30 @@ with pd.ExcelWriter(wide_xlsx, engine="openpyxl") as writer:
         subset.to_excel(writer, sheet_name=sheet, index=False)
 print(f"    → WIDE Excel:       {wide_xlsx}")
 
-# Sector-level year aggregation
 sector = df.groupby("Year").agg(
-    n_companies          = ("Company",               "nunique"),
-    Total_Production     = ("Production",            "sum"),
-    Total_Energy         = ("Total energy",          "sum"),
-    Total_CO2            = ("Total CO2",             "sum"),
-    Total_Water          = ("Water intake",          "sum"),
-    Avg_Energy_KPI       = ("Total energy - KPI",    "mean"),
-    Avg_CO2_KPI          = ("Total CO2 - KPI",       "mean"),
-    Avg_Water_KPI        = ("Water intake - KPI",    "mean"),
-    Avg_Renewable_Share  = ("Renewable_Electricity_Share_%", "mean"),
-    Avg_ISO_Cert         = ("ISO_Certification_%",   "mean"),
+    n_companies=("Company","nunique"), Total_Production=("Production","sum"),
+    Total_Energy=("Total energy","sum"), Total_CO2=("Total CO2","sum"),
+    Total_Water=("Water intake","sum"), Avg_Energy_KPI=("Total energy - KPI","mean"),
+    Avg_CO2_KPI=("Total CO2 - KPI","mean"), Avg_Water_KPI=("Water intake - KPI","mean"),
+    Avg_Renewable_Share=("Renewable_Electricity_Share_%","mean"),
+    Avg_ISO_Cert=("ISO_Certification_%","mean"),
 ).reset_index()
-sector_path = os.path.join(RAW_OUT, "ESG_SECTOR_AGGREGATED_2009_2023.csv")
+sector_path = MASTER_DIR / "ESG_SECTOR_AGGREGATED_2009_2023.csv"
 sector.to_csv(sector_path, index=False)
 print(f"    → SECTOR CSV:       {sector_path}")
 
-# ── Step 5: Summary ───────────────────────────────────────────────────────────
-print("\n[5/5] Done. Files in data_storage/raw/:")
-for f in sorted(os.listdir(RAW_OUT)):
-    size = os.path.getsize(os.path.join(RAW_OUT, f)) / 1024
-    print(f"    {f:<55} {size:>7.1f} KB")
+# ── Step 5: Per-company files in members/TIP/ ─────────────────────────────────
+print("[5/6] Writing per-company files to members/TIP/...")
+for company in COMPANIES:
+    co_folder = MEMBERS_TIP / company.replace(" ", "_")
+    co_folder.mkdir(parents=True, exist_ok=True)
+    co_df = df[df["Company"] == company].reset_index(drop=True)
+    co_df.to_csv(co_folder / f"{company.replace(' ','_')}_latest.csv", index=False)
+    (REPORTS_TIP / company.replace(" ", "_")).mkdir(parents=True, exist_ok=True)
+print(f"    → {len(COMPANIES)} company folders created in members/TIP/")
 
-print("\n✅ Master database ready. Load it in Streamlit with:")
-print('   df = pd.read_csv("data/storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")')
-
-# ── Step 6: Clean any dirty CSV (removes snake_case duplicate columns from old saves) ──
-print("[6/6] Cleaning up any duplicate snake_case columns from old app saves...")
+# ── Step 6: Clean up any legacy paths ────────────────────────────────────────
+print("[6/6] Cleaning up legacy paths / duplicate columns...")
 MASTER_COLS = [
     "Company","Year","Total no. of sites","ISO 14001 sites","% certified sites",
     "Production","Water intake","Water intake - KPI","Total Electricity",
@@ -163,20 +141,24 @@ MASTER_COLS = [
     "Self-generated AND consumed electricity on-site","Purchased Steam",
     "Sold Electricity","Sold Steam","Natural Gas","Coal","Propane","Fuel Oil",
     "Diesel","Petrol","Biomass","Waste tires","LPG","Other",
-    "Total energy","Total energy - KPI","Total CO2 - Scope 1",
-    "Total CO2 - Scope 2","Total CO2","Total CO2 - KPI",
-    "Renewable_Electricity_Share_%","Scope1_Share_%","Scope2_Share_%",
-    "Fossil_Energy_Share_%","Water_per_ton","CO2_per_ton",
+    "Total energy","Total energy - KPI","Total CO2 - Scope 1","Total CO2 - Scope 2",
+    "Total CO2","Total CO2 - KPI","Renewable_Electricity_Share_%","Scope1_Share_%",
+    "Scope2_Share_%","Fossil_Energy_Share_%","Water_per_ton","CO2_per_ton",
     "Energy_per_ton","ISO_Certification_%",
 ]
-_dirty_path = Path(os.path.join(RAW_OUT, "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"))
-if _dirty_path.exists():
-    _dirty = pd.read_csv(_dirty_path)
-    _before = len(_dirty.columns)
-    _clean_cols = [c for c in MASTER_COLS if c in _dirty.columns]
-    _dirty[_clean_cols].to_csv(_dirty_path, index=False)
-    _dropped = _before - len(_clean_cols)
-    if _dropped > 0:
-        print(f"    Removed {_dropped} duplicate/legacy columns. CSV now has {len(_clean_cols)} clean columns.")
-    else:
-        print("    CSV already clean.")
+_dirty = pd.read_csv(wide_csv)
+_before = len(_dirty.columns)
+_clean  = [c for c in MASTER_COLS if c in _dirty.columns]
+_dropped = _before - len(_clean)
+if _dropped > 0:
+    _dirty[_clean].to_csv(wide_csv, index=False)
+    print(f"    Removed {_dropped} legacy duplicate columns from master CSV.")
+else:
+    print("    Master CSV is clean — no legacy columns found.")
+
+print("\n✅ Master database ready.")
+print(f"   Master files:  {MASTER_DIR}")
+print(f"   Member files:  {MEMBERS_TIP}")
+print(f"   Version files: {VERSIONS_DIR}")
+print('\n   Load in Streamlit with:')
+print('   df = pd.read_csv("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")')

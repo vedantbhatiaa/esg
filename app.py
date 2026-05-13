@@ -24,12 +24,12 @@ from formula_engine import (
 
 import data_loader as dl
 
-# Load consolidated dataset once at startup
+# Load fresh from disk on every Streamlit rerun (Streamlit reruns the full
+# script on every user interaction, so this is always up-to-date after a save).
+# data_loader checks data_storage/master/ first, then falls back to raw/ etc.
 _CONSOLIDATED_DF = dl.load_consolidated()
 _COMPANIES       = dl.get_companies(_CONSOLIDATED_DF)
-
-# Load sector aggregated data for analysis charts (falls back to static if not found)
-_SECTOR_DF = dl.load_sector_aggregated()
+_SECTOR_DF       = dl.load_sector_aggregated()
 
 # ─────────────────────────────────────────────────────────
 # PAGE CONFIG & GLOBAL CSS
@@ -440,10 +440,29 @@ _VALID_TEMPLATE_FIELDS = {
     "co2_scope2_steam", "waste_total", "waste_recovery",
 }
 
+def _get_fresh_hist(company: str = None) -> dict:
+    """
+    Always load company historical data fresh from _CONSOLIDATED_DF.
+    Because _CONSOLIDATED_DF is reloaded from disk on every Streamlit rerun,
+    this automatically reflects any saves (including updates to previous years)
+    without requiring a manual reload or re-running the stepper.
+    Falls back to session state cache, then HIST_RAW if company is unknown.
+    """
+    co = company or st.session_state.get("reporting_company") or st.session_state.get("user_company") or ""
+    if co and not _CONSOLIDATED_DF.empty:
+        hist = dl.get_company_hist(_CONSOLIDATED_DF, co)
+        if hist:
+            return dl.get_hist_raw(hist, HIST_YEARS)
+    # Fallback: session state (set during company setup), then static defaults
+    return st.session_state.get("live_hist_raw") or HIST_RAW
+
+
 def get_hist_outputs():
-    _hist = st.session_state.get("live_hist_raw") or HIST_RAW
+    # Always use fresh data from _CONSOLIDATED_DF so any saved updates
+    # (including changes to previous years) are immediately visible.
     company = (st.session_state.get("reporting_company") or
                st.session_state.get("user_company") or "")
+    _hist = _get_fresh_hist(company)
     outs = []
     for i, yr in enumerate(HIST_YEARS):
         # Only pass keys that are valid TemplateInputs fields
@@ -656,57 +675,45 @@ STEP_FIELDS = [
 def _build_master_row(inp, out) -> dict:
     """
     Build a dict whose keys exactly match the master wide CSV column names.
-    This ensures no duplicate columns when the row is appended to the CSV.
+    Ensures no duplicate columns when appended to the master CSV.
     """
-    renew_share = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
+    renew_share  = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
     scope1_share = out.total_co2_scope1 / max(out.total_co2, 1) * 100
     scope2_share = out.total_co2_scope2 / max(out.total_co2, 1) * 100
-    fuel_total = (inp.nat_gas + inp.coal_sub + inp.propane + inp.fuel_oil_heavy_a +
-                  inp.diesel + inp.petrol)
+    fuel_total   = (inp.nat_gas + inp.coal_sub + inp.propane + inp.fuel_oil_heavy_a + inp.diesel + inp.petrol)
     fossil_share = fuel_total / max(out.total_energy, 1) * 100
-    prod = max(inp.production, 1)
-
+    prod         = max(inp.production, 1)
     return {
-        # Identity
-        "Company":   inp.company,
-        "Year":      inp.year,
-        # ISO
-        "Total no. of sites":  int(round(inp.total_sites)),
-        "ISO 14001 sites":     int(round(inp.iso_sites)),
-        "% certified sites":   round(out.pct_certified, 6),
-        # Production
-        "Production":          round(inp.production, 4),
-        # Water
-        "Water intake":        round(inp.water_withdrawals, 4),
-        "Water intake - KPI":  round(out.water_kpi, 6),
-        # Electricity
-        "Total Electricity":                              round(out.total_electricity, 4),
-        "Renewable Electricity Purchased":                round(inp.renew_elec_purchased, 4),
-        "Non-Renewable Electricity Purchased":            round(inp.nonrenew_elec_purchased, 4),
-        "Self-generated AND consumed electricity on-site":round(inp.self_gen_elec, 4),
-        "Purchased Steam":                                round(inp.purchased_steam, 4),
-        "Sold Electricity":                               round(inp.sold_electricity, 4),
-        "Sold Steam":                                     round(inp.sold_steam, 4),
-        # Fuels
-        "Natural Gas":   round(inp.nat_gas, 4),
-        "Coal":          round(inp.coal_sub, 4),
-        "Propane":       round(inp.propane, 4),
-        "Fuel Oil":      round(inp.fuel_oil_heavy_a, 4),
-        "Diesel":        round(inp.diesel, 4),
-        "Petrol":        round(inp.petrol, 4),
-        "Biomass":       round(inp.biomass, 4),
-        "Waste tires":   round(inp.waste_tires_mt, 4),
-        "LPG":           round(inp.lpg, 4),
-        "Other":         round(inp.other_fuels, 4),
-        # Energy totals (formulated)
+        "Company": inp.company, "Year": inp.year,
+        "Total no. of sites": int(round(inp.total_sites)),
+        "ISO 14001 sites":    int(round(inp.iso_sites)),
+        "% certified sites":  round(out.pct_certified, 6),
+        "Production":         round(inp.production, 4),
+        "Water intake":       round(inp.water_withdrawals, 4),
+        "Water intake - KPI": round(out.water_kpi, 6),
+        "Total Electricity":                               round(out.total_electricity, 4),
+        "Renewable Electricity Purchased":                 round(inp.renew_elec_purchased, 4),
+        "Non-Renewable Electricity Purchased":             round(inp.nonrenew_elec_purchased, 4),
+        "Self-generated AND consumed electricity on-site": round(inp.self_gen_elec, 4),
+        "Purchased Steam":   round(inp.purchased_steam, 4),
+        "Sold Electricity":  round(inp.sold_electricity, 4),
+        "Sold Steam":        round(inp.sold_steam, 4),
+        "Natural Gas":       round(inp.nat_gas, 4),
+        "Coal":              round(inp.coal_sub, 4),
+        "Propane":           round(inp.propane, 4),
+        "Fuel Oil":          round(inp.fuel_oil_heavy_a, 4),
+        "Diesel":            round(inp.diesel, 4),
+        "Petrol":            round(inp.petrol, 4),
+        "Biomass":           round(inp.biomass, 4),
+        "Waste tires":       round(inp.waste_tires_mt, 4),
+        "LPG":               round(inp.lpg, 4),
+        "Other":             round(inp.other_fuels, 4),
         "Total energy":          round(out.total_energy, 4),
         "Total energy - KPI":    round(out.energy_kpi, 6),
-        # CO2
         "Total CO2 - Scope 1":   round(out.total_co2_scope1, 4),
         "Total CO2 - Scope 2":   round(out.total_co2_scope2, 4),
         "Total CO2":             round(out.total_co2, 4),
         "Total CO2 - KPI":       round(out.co2_kpi, 6),
-        # Derived KPIs
         "Renewable_Electricity_Share_%": round(renew_share, 4),
         "Scope1_Share_%":                round(scope1_share, 4),
         "Scope2_Share_%":                round(scope2_share, 4),
@@ -718,55 +725,136 @@ def _build_master_row(inp, out) -> dict:
     }
 
 
-def _save_submission_to_csv(inp, out) -> str:
+def _save_version_parquet(inp, combined_df: pd.DataFrame) -> str:
     """
-    Save / overwrite one company-year record in the master wide CSV.
-    The new row uses the exact same column names as the master CSV so
-    no duplicate columns are created on concat.
-    Returns a status string starting with "✅" on success or "❌" on error.
+    Save the ENTIRE company template (all years) as a Parquet snapshot.
+    Stored in data_storage/versions/{CompanyName}/ — subfolder only, never flat.
+    Filename: CompanyName_Year_YYYYMMDD_HHMMSS.parquet (year = the year just edited).
+    NEVER overwritten — each save event creates a new file (full audit trail).
+    Reading this file shows the complete state of all years for that company
+    at the exact moment the save was made.
     """
     from pathlib import Path
+    from datetime import datetime
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    co_safe = inp.company.replace(" ", "_").replace("/", "_")
+    # Extract ALL rows for this company from the combined master DataFrame
+    company_all_years = combined_df[combined_df["Company"] == inp.company].copy()
+    filename = f"{co_safe}_{inp.year}_{ts}.parquet"
+    # Subfolder only — no flat file
+    ver_dir  = Path("data_storage") / "versions" / co_safe
+    ver_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        company_all_years.to_parquet(ver_dir / filename, index=False)
+        return f"{co_safe}/{filename}"
+    except Exception as e:
+        return f"[version save failed: {e}]"
 
-    csv_path = Path("data_storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
+
+def _save_submission_to_csv(inp, out) -> str:
+    """
+    Two independent operations:
+
+    1. MASTER CSV (data_storage/master/) — overwrite the row for this company+year.
+       The master always holds the LATEST values. Same company+year saved twice?
+       The second save replaces the first row in master.
+
+    2. VERSION Parquet (data_storage/versions/) — always ADD a new file with timestamp.
+       Never overwritten. Provides full audit trail of every save event.
+       If VerdaTyres 2023 is saved 3 times, master has 1 row (latest),
+       versions/ has 3 Parquet files showing each historical state.
+    """
+    import os, tempfile
+    from pathlib import Path
+    from datetime import datetime
+
+    csv_path = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build row with master CSV column names
-    new_row = pd.DataFrame([_build_master_row(inp, out)])
+    new_row     = pd.DataFrame([_build_master_row(inp, out)])
+    master_cols = list(new_row.columns)
 
+    def _align(df):
+        """Align DataFrame to master column order: strip extras, fill missing."""
+        if df.empty:
+            return pd.DataFrame(columns=master_cols)
+        extra = [c for c in df.columns if c not in master_cols]
+        if extra:
+            df = df.drop(columns=extra)
+        for col in master_cols:
+            if col not in df.columns:
+                df[col] = None
+        return df[master_cols]
+
+    def _load_best_existing():
+        """
+        Load the most complete existing master DataFrame.
+        Checks all candidate paths and picks the one with the most rows.
+        This prevents corruption where a small CSV (e.g. 2 rows from a
+        previous bad save) is used as the bootstrap source.
+        """
+        candidates = [
+            csv_path,  # data_storage/master/ — primary
+            Path("data_storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"),
+        ]
+        best = pd.DataFrame(columns=master_cols)
+        for p in candidates:
+            if p.exists():
+                try:
+                    df = pd.read_csv(p)
+                    if "Company" in df.columns and "Year" in df.columns and len(df) > len(best):
+                        best = df
+                except PermissionError:
+                    pass   # file locked — skip, try next
+                except Exception:
+                    pass
+        return _align(best)
+
+    # ── 1. Build combined DataFrame ──────────────────────────────────────────
+    # Load the most complete existing data from any available path.
+    # Then overwrite ONLY the one row for this company+year.
+    existing = _load_best_existing()
+    mask     = ~((existing["Company"] == inp.company) & (existing["Year"] == inp.year))
+    existing = existing[mask]
+    combined = pd.concat([existing, new_row], ignore_index=True)
+    combined = combined.sort_values(["Company", "Year"]).reset_index(drop=True)
+
+    n_records   = len(combined)
+    n_companies = combined["Company"].nunique()
+
+    # ── 2. Save version Parquet BEFORE touching master (audit trail first) ───
+    # Parquet contains ALL years for this company (entire template snapshot).
+    version_filename = _save_version_parquet(inp, combined)
+
+    # ── 3. Atomic write to master CSV ────────────────────────────────────────
+    tmp_path = csv_path.with_suffix(".tmp")
     try:
-        if csv_path.exists():
-            existing = pd.read_csv(csv_path)
-
-            # Drop ALL columns that are NOT in the master column set
-            # (cleans up any previously saved snake_case duplicates)
-            master_cols = list(new_row.columns)
-            extra_cols  = [c for c in existing.columns if c not in master_cols]
-            if extra_cols:
-                existing = existing.drop(columns=extra_cols)
-
-            # Add any master columns that are missing from existing CSV
-            for col in master_cols:
-                if col not in existing.columns:
-                    existing[col] = None
-
-            # Reorder to match master column order
-            existing = existing[master_cols]
-
-            # Remove ALL existing rows for this company+year
-            mask = ~((existing["Company"] == inp.company) &
-                     (existing["Year"]    == inp.year))
-            existing = existing[mask]
-
-            combined = pd.concat([existing, new_row], ignore_index=True)
-        else:
-            combined = new_row
-
-        combined = combined.sort_values(["Company", "Year"]).reset_index(drop=True)
-        combined.to_csv(csv_path, index=False)
+        combined.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, csv_path)
         return (f"✅ Saved {inp.company} — {inp.year}. "
-                f"Database now has {len(combined)} records across "
-                f"{combined['Company'].nunique()} companies.")
+                f"Master: {n_records} records across {n_companies} companies. "
+                f"Version: {version_filename}")
+
+    except PermissionError:
+        if tmp_path.exists():
+            try: tmp_path.unlink()
+            except Exception: pass
+        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"ESG_MASTER_{inp.company.replace(' ','_')}_{inp.year}_{ts}.csv"
+        backup_path = csv_path.parent / backup_name
+        try:
+            combined.to_csv(backup_path, index=False)
+            return (
+                f"⚠️ Master file open in Excel — saved backup: **{backup_name}**\n"
+                f"Version snapshot: {version_filename}\n"
+                f"Close Excel and click Save again to update the master file."
+            )
+        except Exception as e2:
+            return f"❌ Save failed (file locked AND backup failed): {e2}"
     except Exception as e:
+        if tmp_path.exists():
+            try: tmp_path.unlink()
+            except Exception: pass
         return f"❌ Save failed: {e}"
 
 
@@ -878,7 +966,7 @@ def page_entry():
 
     # -- Stepper ----------------------------------------------------------------
     render_stepper_bar()
-    _hist    = st.session_state.get("live_hist_raw") or HIST_RAW
+    _hist    = _get_fresh_hist()   # always fresh — reflects any saved updates
     _prev_yr = st.session_state.get("reporting_year", CURR_YEAR) - 1
     step     = st.session_state.step
     name, desc = STEP_META[step]
@@ -967,7 +1055,8 @@ def render_template_table():
     company  = st.session_state.get("reporting_company") or st.session_state.get("user_company") or "TIP Member Company"
     if company == "All Companies": company = "TIP Member Company"
     rep_year = st.session_state.get("reporting_year", CURR_YEAR)
-    _hist    = st.session_state.get("live_hist_raw") or HIST_RAW
+    # Always reload from _CONSOLIDATED_DF so updates to any year are visible
+    _hist    = _get_fresh_hist(company)
 
     st.markdown(f"""
     <div style="display:flex;align-items:center;justify-content:space-between;

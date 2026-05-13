@@ -162,3 +162,18 @@ print(f"   Member files:  {MEMBERS_TIP}")
 print(f"   Version files: {VERSIONS_DIR}")
 print('\n   Load in Streamlit with:')
 print('   df = pd.read_csv("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")')
+
+# ── Step 7: TIP members aggregate in members/TIP/ (not in company subfolder) ─
+print("[7/7] Writing TIP members aggregate to members/TIP/...")
+
+# Wide master — all TIP companies, all years, all columns including derived KPIs
+tip_wide = MEMBERS_TIP / "ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv"
+df.to_csv(tip_wide, index=False)
+print(f"    → TIP wide CSV:       {tip_wide}")
+
+# Consolidated long format — one row per KPI per company per year
+tip_long = MEMBERS_TIP / "ESG_CONSOLIDATED_TIP_MEMBERS_2009_2023.csv"
+raw.to_csv(tip_long, index=False)
+print(f"    → TIP consolidated:   {tip_long}")
+
+print(f"\n✅ TIP member files ready in {MEMBERS_TIP}")

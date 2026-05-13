@@ -831,6 +831,8 @@ def _save_submission_to_csv(inp, out) -> str:
     try:
         combined.to_csv(tmp_path, index=False)
         os.replace(tmp_path, csv_path)
+        # Keep TIP members aggregate in sync
+        _update_tip_members_file(combined)
         return (f"✅ Saved {inp.company} — {inp.year}. "
                 f"Master: {n_records} records across {n_companies} companies. "
                 f"Version: {version_filename}")
@@ -1200,6 +1202,94 @@ def render_template_table():
 # ─────────────────────────────────────────────────────────
 # ELECTRICITY TAB
 # ─────────────────────────────────────────────────────────
+def _update_tip_members_file(master_df: pd.DataFrame) -> None:
+    """
+    Keep data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_*.csv in sync
+    with the master CSV. Called after every save (KPI or electricity).
+    This file lives directly in members/TIP/ (NOT in a company subfolder)
+    and contains ALL TIP company data — identical to master while all
+    companies are TIP members; diverges when non-TIP companies are added.
+    """
+    from pathlib import Path
+    tip_dir  = Path("data_storage/members/TIP")
+    tip_dir.mkdir(parents=True, exist_ok=True)
+    tip_path = tip_dir / "ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv"
+    try:
+        tmp = tip_path.with_suffix(".tmp")
+        master_df.to_csv(tmp, index=False)
+        os.replace(tmp, tip_path)
+    except Exception as e:
+        print(f"[tip_members] Could not update: {e}")
+
+
+def _save_electricity_to_master(company: str, year: int) -> str:
+    """
+    Save electricity-by-country data (all years) from st.session_state.elec_data
+    into the master CSV and TIP members file.
+
+    Columns added at the END of the master: "Electricity in {Country}" (MWh).
+    Each company-year row gets the value for that country in that year.
+    Also saves a unified Parquet (KPI data + electricity data for all years)
+    so one file captures the complete picture.
+    """
+    from pathlib import Path
+    from datetime import datetime
+
+    elec_df = st.session_state.get("elec_data", pd.DataFrame())
+    if elec_df.empty:
+        return "⚠️ No electricity data entered yet."
+
+    csv_path = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
+    if not csv_path.exists():
+        return "❌ Master CSV not found. Save KPI data first, then save electricity data."
+
+    try:
+        master = pd.read_csv(csv_path)
+    except PermissionError:
+        return "❌ Master CSV is open in Excel. Close it first."
+
+    # Year columns present in the electricity editor
+    yr_cols = [c for c in elec_df.columns if str(c).isdigit() and 2000 < int(c) < 2030]
+
+    updated_years = []
+    for yr_str in yr_cols:
+        yr  = int(yr_str)
+        mask = (master["Company"] == company) & (master["Year"] == yr)
+        if not mask.any():
+            continue   # No KPI row for this year yet — skip
+        for _, elec_row in elec_df.iterrows():
+            val = elec_row[yr_str]
+            if pd.notna(val) and float(val) != 0:
+                col = f"Electricity in {elec_row['Country']}"
+                master.loc[mask, col] = float(val)
+        updated_years.append(yr)
+
+    if not updated_years:
+        return f"⚠️ No matching rows found for {company} in the master. Save KPI data first."
+
+    # ── Atomic write to master ────────────────────────────────────────────────
+    tmp = csv_path.with_suffix(".tmp")
+    master.to_csv(tmp, index=False)
+    os.replace(tmp, csv_path)
+
+    # ── Sync TIP members aggregate ────────────────────────────────────────────
+    _update_tip_members_file(master)
+
+    # ── Unified Parquet: all company rows with both KPI + electricity data ────
+    co_rows  = master[master["Company"] == company].copy()
+    co_safe  = company.replace(" ", "_").replace("/", "_")
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ver_dir  = Path("data_storage/versions") / co_safe
+    ver_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{co_safe}_{year}_elec_{ts}.parquet"
+    co_rows.to_parquet(ver_dir / filename, index=False)
+
+    return (f"✅ Electricity saved for {company} — "
+            f"{len(updated_years)} year(s) updated "
+            f"({min(updated_years)}–{max(updated_years)}). "
+            f"Version: {co_safe}/{filename}")
+
+
 def render_electricity_tab():
     st.markdown("#### Non-Renewable Electricity Purchased by Country")
     st.caption("Enter MWh values per country per year. Country-specific IEA emission factors are applied for Scope 2 calculations.")
@@ -1227,14 +1317,33 @@ def render_electricity_tab():
                              hide_index=True, use_container_width=True, height=900, key="elec_editor")
     st.session_state.elec_data = edited
 
-    col_a, col_b = st.columns([3,1])
+    col_a, col_b, col_c = st.columns([2, 1, 1])
     with col_b:
         if st.button("Reset to zero", key="elec_reset"):
             for yr in range(2009, 2024): st.session_state.elec_data[str(yr)] = 0
             st.rerun()
+    with col_c:
+        if st.button("Save electricity data", type="primary", key="elec_save"):
+            _co  = (st.session_state.get("reporting_company") or
+                    st.session_state.get("user_company") or "")
+            _yr  = st.session_state.get("reporting_year", CURR_YEAR)
+            if not _co:
+                st.error("No company selected. Complete company setup first.")
+            else:
+                _msg = _save_electricity_to_master(_co, _yr)
+                if _msg.startswith("✅"):
+                    st.success(_msg)
+                elif _msg.startswith("⚠️"):
+                    st.warning(_msg)
+                else:
+                    st.error(_msg)
 
-    total_2023 = edited["2023"].sum() if "2023" in edited.columns else 0
-    st.metric("Total Non-Renewable Electricity 2023 (all countries)", f"{total_2023:,.0f} MWh")
+    rep_yr_str = str(st.session_state.get("reporting_year", CURR_YEAR))
+    total_rep  = edited[rep_yr_str].sum() if rep_yr_str in edited.columns else 0
+    total_all  = sum(edited[str(yr)].sum() for yr in range(2009, 2024) if str(yr) in edited.columns)
+    c1, c2 = st.columns(2)
+    c1.metric(f"Total Electricity {rep_yr_str} (all countries)", f"{total_rep:,.0f} MWh")
+    c2.metric("Grand total all years", f"{total_all:,.0f} MWh")
 
 
 # ─────────────────────────────────────────────────────────

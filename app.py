@@ -829,11 +829,15 @@ def _save_submission_to_csv(inp, out) -> str:
     # ── 3. Write master CSV directly (no temp files) ─────────────────────────
     try:
         combined.to_csv(csv_path, index=False)
-        _update_tip_members_file(combined)
+        # rebuild TIP members aggregate from the just-written master CSV
+        tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
+        _update_tip_members_file(csv_path, tip_master_path)
         return (f"✅ Saved {inp.company} — {inp.year}. "
+
                 f"Master: {n_records} records across {n_companies} companies. "
                 f"Version: {version_filename}")
     except PermissionError:
+
         ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_name = f"ESG_MASTER_{inp.company.replace(' ','_')}_{inp.year}_{ts}.csv"
         backup_path = csv_path.parent / backup_name
@@ -1201,22 +1205,27 @@ def render_template_table():
 # ─────────────────────────────────────────────────────────
 # ELECTRICITY TAB
 # ─────────────────────────────────────────────────────────
-def _update_tip_members_file(master_df: pd.DataFrame) -> None:
+def _update_tip_members_file(master_path: "Path", tip_master_path: "Path") -> None:
+    """Rebuild the TIP members aggregate strictly from the latest master on disk.
+
+    This prevents mismatches where the in-memory combined_df used during save
+    (bootstrap/reconstruction) differs from the finally-written master CSV.
     """
-    Keep data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_*.csv in sync
-    with the master CSV. Called after every save (KPI or electricity).
-    This file lives directly in members/TIP/ (NOT in a company subfolder)
-    and contains ALL TIP company data — identical to master while all
-    companies are TIP members; diverges when non-TIP companies are added.
-    """
-    from pathlib import Path
-    tip_dir  = Path("data_storage/members/TIP")
-    tip_dir.mkdir(parents=True, exist_ok=True)
-    tip_path = tip_dir / "ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv"
+    import pandas as pd
+    tip_master_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        master_df.to_csv(tip_path, index=False)
+        master_df = pd.read_csv(master_path)
     except Exception as e:
-        print(f"[tip_members] Could not update: {e}")
+        print(f"[tip_members] Could not read master to rebuild tip members: {e}")
+        return
+
+    # In the current dataset all companies are TIP members, so TIP aggregate
+    # is identical to master.
+    try:
+        master_df.to_csv(tip_master_path, index=False)
+    except Exception as e:
+        print(f"[tip_members] Could not write: {e}")
+
 
 
 def _save_electricity_to_master(company: str, year: int) -> str:
@@ -1243,19 +1252,30 @@ def _save_electricity_to_master(company: str, year: int) -> str:
     except PermissionError:
         return "❌ Master CSV is open in Excel — close it and try again."
 
+    # Only save years that exist as columns in the electricity editor.
     yr_cols = [c for c in elec_df.columns if str(c).isdigit() and 2000 < int(c) < 2030]
 
-    updated_years = []
+    # Deterministic update: one value assignment per (company, year, country).
+    # Also write zeros explicitly so the first save cannot “drop” values.
+    updated_years: list[int] = []
     for yr_str in yr_cols:
-        yr   = int(yr_str)
+        yr = int(yr_str)
         mask = (master["Company"] == company) & (master["Year"] == yr)
         if not mask.any():
             continue
-        for _, elec_row in elec_df.iterrows():
-            val = elec_row[yr_str]
-            if pd.notna(val) and float(val) != 0:
-                master.loc[mask, f"Electricity in {elec_row['Country']}"] = float(val)
+
+        # Subset of the editor for this year only
+        year_series = elec_df.set_index("Country")[yr_str]
+        for country, val in year_series.items():
+            col_name = f"Electricity in {country}"
+            if col_name not in master.columns:
+                # If the master doesn't have the column yet, skip (but don't crash)
+                continue
+            v = float(val) if pd.notna(val) else 0.0
+            master.loc[mask, col_name] = v
+
         updated_years.append(yr)
+
 
     if not updated_years:
         return f"⚠️ No KPI rows found for {company}. Save KPI data first."
@@ -1266,8 +1286,10 @@ def _save_electricity_to_master(company: str, year: int) -> str:
     except PermissionError:
         return "❌ Master CSV is open in Excel — close it and try again."
 
-    # Sync TIP members aggregate
-    _update_tip_members_file(master)
+    # Sync TIP members aggregate by rebuilding from the just-written master
+    tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
+    _update_tip_members_file(csv_path, tip_master_path)
+
 
     # Parquet: complete row for this company+year (KPI + electricity columns)
     co_safe  = company.replace(" ", "_").replace("/", "_")

@@ -24,6 +24,13 @@ from formula_engine import (
 
 import data_loader as dl
 
+# Chatbot (DSS internal only — lazy import in chatbot_ui)
+try:
+    from chatbot.chatbot_ui import render_chatbot as _render_chatbot
+    _CHATBOT_AVAILABLE = True
+except ImportError:
+    _CHATBOT_AVAILABLE = False
+
 # Load fresh from disk on every Streamlit rerun (Streamlit reruns the full
 # script on every user interaction, so this is always up-to-date after a save).
 # data_loader checks data_storage/master/ first, then falls back to raw/ etc.
@@ -2592,3 +2599,7 @@ else:
     elif page == "benchmarking":  page_benchmarking()
     elif page == "verification":  page_verification()
     elif page == "readiness":     page_readiness()
+
+    # ── Chatbot (DSS employees only, all pages) ─────────────
+    if _CHATBOT_AVAILABLE:
+        _render_chatbot()

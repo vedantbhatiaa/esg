@@ -47,7 +47,8 @@ LABEL_TO_FIELD = {
     "Waste tires":                                     "waste_tires_mt",
     "LPG":                                             "lpg",
     "Other":                                           "other_fuels",
-    "Total amount of waste ":                          "waste_total",
+    "Total amount of waste":                           "waste_total",
+    "Total amount of waste ":                          "waste_total",   # trailing-space variant (legacy)
     "Amount of waste sent to recovery":                "waste_recovery",
 }
 
@@ -87,6 +88,9 @@ WIDE_COL_TO_FIELD = {
     "Other":                                           "other_fuels",
     "Total amount of waste":                           "waste_total",
     "Amount of waste sent to recovery":                "waste_recovery",
+    # ── Master wide CSV column names (used after build_esg_master.py) ─────────
+    "Total Waste":                                     "waste_total",
+    "Waste Recovered":                                 "waste_recovery",
 }
 
 TEMPLATE_INPUT_FIELDS = {

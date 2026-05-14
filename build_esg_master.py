@@ -24,6 +24,14 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+
+def _drop_zero_elec_cols(df):
+    """Drop Elec_*_GJ country columns where every value is zero/null."""
+    elec_cols = [c for c in df.columns if c.startswith("Elec_") and c.endswith("_GJ")
+                 and c != "Total_Electricity_by_Country_GJ"]
+    zero_cols = [c for c in elec_cols if df[c].fillna(0).eq(0).all()]
+    return df.drop(columns=zero_cols) if zero_cols else df
+
 # ── Folder structure ──────────────────────────────────────────────────────────
 BASE_DIR    = Path(os.path.dirname(os.path.abspath(__file__)))
 MASTER_DIR  = BASE_DIR / "data_storage" / "master"
@@ -49,9 +57,16 @@ if not SOURCE_FILE.exists():
         raise SystemExit(1)
 
 # ── Country electricity columns ───────────────────────────────────────────────
-ELEC_COUNTRIES = ['Canada', 'Mexico', 'United States', 'Japan', 'France', 'Hungary', 'Italy']
-# In Raw Dummy data they appear as "Electricity - <Country>"
-# In the wide master they are renamed to "Elec_<Country>_GJ"
+ELEC_COUNTRIES = [
+    "Canada", "Chile", "Mexico", "United States",
+    "Australia", "Japan", "Korea", "New Zealand",
+    "Austria", "Belgium", "Czech Republic", "Denmark", "Finland", "France",
+    "Germany", "Hungary", "Iceland", "Ireland", "Italy", "Luxembourg",
+    "Netherlands", "Norway", "Poland", "Portugal", "Spain", "Sweden",
+    "Switzerland", "Turkey", "United Kingdom",
+    "China", "India",
+]
+
 def elec_col_raw(country):   return f"Electricity - {country}"
 def elec_col_clean(country): return f"Elec_{country.replace(' ', '_')}_GJ"
 
@@ -132,21 +147,31 @@ print(f"    → Final shape: {df.shape[0]} rows × {df.shape[1]} columns")
 # ── Step 4: Save master outputs ───────────────────────────────────────────────
 print("[4/6] Saving master files...")
 
+# Long CSV: drop electricity country rows that are zero across all companies
+elec_labels = {f"Electricity - {c}" for c in ELEC_COUNTRIES}
+long_filtered = raw[
+    ~(raw["Row_Label"].isin(elec_labels) & raw["Data"].fillna(0).eq(0))
+].copy()
 long_path = MASTER_DIR / "ESG_LONG_ALL_COMPANIES_2009_2023.csv"
-raw.to_csv(long_path, index=False)
+long_filtered.to_csv(long_path, index=False)
 print(f"    → LONG CSV:         {long_path}")
 
 wide_csv = MASTER_DIR / "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"
+# Master CSV keeps full schema; derived outputs strip all-zero elec country cols
 df.to_csv(wide_csv, index=False)
-print(f"    → WIDE CSV:         {wide_csv}")
+df_out = _drop_zero_elec_cols(df)  # used for Excel + member files
+print(f"    → WIDE CSV:         {wide_csv} ({len(df.columns)} cols, "
+      f"{len(df_out.columns)} after dropping all-zero country cols)")
 
 wide_xlsx = MASTER_DIR / "ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.xlsx"
 with pd.ExcelWriter(wide_xlsx, engine="openpyxl") as writer:
-    df.to_excel(writer, sheet_name="All_Companies", index=False)
+    df_out.to_excel(writer, sheet_name="All_Companies", index=False)
     for company in COMPANIES:
-        subset = df[df["Company"] == company].reset_index(drop=True)
-        sheet  = company.replace(" ", "_")[:31]
-        subset.to_excel(writer, sheet_name=sheet, index=False)
+        # Per-company sheet: strip columns that are all-zero for that company only
+        co_df = df[df["Company"] == company].reset_index(drop=True)
+        co_df_out = _drop_zero_elec_cols(co_df)
+        sheet = company.replace(" ", "_")[:31]
+        co_df_out.to_excel(writer, sheet_name=sheet, index=False)
 print(f"    → WIDE Excel:       {wide_xlsx}")
 
 agg_dict = dict(
@@ -180,7 +205,8 @@ for company in COMPANIES:
     co_folder = MEMBERS_TIP / company.replace(" ", "_")
     co_folder.mkdir(parents=True, exist_ok=True)
     co_df = df[df["Company"] == company].reset_index(drop=True)
-    co_df.to_csv(co_folder / f"{company.replace(' ','_')}_latest.csv", index=False)
+    _drop_zero_elec_cols(co_df).to_csv(
+        co_folder / f"{company.replace(' ','_')}_latest.csv", index=False)
     (REPORTS_TIP / company.replace(" ", "_")).mkdir(parents=True, exist_ok=True)
 print(f"    → {len(COMPANIES)} company folders created in members/TIP/")
 
@@ -227,7 +253,7 @@ print('   df = pd.read_csv("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_20
 # ── Step 7: TIP aggregate ──────────────────────────────────────────────────────
 print("\n[7/7] Writing TIP members aggregate to members/TIP/...")
 tip_wide = MEMBERS_TIP / "ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv"
-df.to_csv(tip_wide, index=False)
+_drop_zero_elec_cols(df).to_csv(tip_wide, index=False)
 tip_long = MEMBERS_TIP / "ESG_CONSOLIDATED_TIP_MEMBERS_2009_2023.csv"
 raw.to_csv(tip_long, index=False)
 print(f"    → TIP wide:  {tip_wide}")

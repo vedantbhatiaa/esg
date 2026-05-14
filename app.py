@@ -182,6 +182,24 @@ HIST_YEARS = list(range(2009, 2023))
 CURR_YEAR  = 2023
 LONG_YEARS = list(range(2009, 2024))
 
+# ── All 31 electricity-by-country names (matches UI editor row order) ─────────
+ELEC_ALL_COUNTRIES = [
+    "Canada", "Chile", "Mexico", "United States",
+    "Australia", "Japan", "Korea", "New Zealand",
+    "Austria", "Belgium", "Czech Republic", "Denmark", "Finland", "France",
+    "Germany", "Hungary", "Iceland", "Ireland", "Italy", "Luxembourg",
+    "Netherlands", "Norway", "Poland", "Portugal", "Spain", "Sweden",
+    "Switzerland", "Turkey", "United Kingdom",
+    "China", "India",
+]
+
+def _elec_col(country: str) -> str:
+    """Canonical master CSV column name for a country's electricity (GJ)."""
+    return "Elec_" + country.replace(" ", "_") + "_GJ"
+
+# Dict: country name → master CSV column name
+ELEC_COUNTRY_COLS = {c: _elec_col(c) for c in ELEC_ALL_COUNTRIES}
+
 COMPANIES = _COMPANIES if _COMPANIES else [
     "VerdaTyres Corp", "AlphaTread Ltd", "BetaRubber Inc", "GammaTire SA",
     "DeltaGrip GmbH", "EpsilonWheel Co", "ZetaTrac LLC", "EtaRoad AG",
@@ -727,13 +745,7 @@ def _build_master_row(inp, out) -> dict:
         "Waste Recovered":       round(waste_recovery, 4),
         "Recovery Rate":         recovery_rate,
         # ── Country electricity placeholders (filled by _save_electricity_to_master) ─
-        "Elec_Canada_GJ":        None,
-        "Elec_Mexico_GJ":        None,
-        "Elec_United_States_GJ": None,
-        "Elec_Japan_GJ":         None,
-        "Elec_France_GJ":        None,
-        "Elec_Hungary_GJ":       None,
-        "Elec_Italy_GJ":         None,
+        **{_elec_col(c): None for c in ELEC_ALL_COUNTRIES},
         # ── Derived KPIs ──────────────────────────────────────────────────────
         "Renewable_Electricity_Share_%": round(renew_share, 4),
         "Scope1_Share_%":                round(scope1_share, 4),
@@ -774,6 +786,19 @@ def _save_version_parquet(inp, combined_df: pd.DataFrame) -> str:
     except Exception as e:
         return f"[version save failed: {e}]"
 
+
+
+def _drop_zero_elec_cols(df: "pd.DataFrame") -> "pd.DataFrame":
+    """
+    Return df with Elec_*_GJ country columns removed if every value in that
+    column is zero or null across all rows.  Non-electricity columns are
+    never touched.  Used so files only carry countries with actual consumption.
+    """
+    elec_cols = [c for c in df.columns if c.startswith("Elec_") and c.endswith("_GJ")
+                 and c != "Total_Electricity_by_Country_GJ"]
+    zero_cols = [c for c in elec_cols
+                 if df[c].fillna(0).eq(0).all()]
+    return df.drop(columns=zero_cols) if zero_cols else df
 
 def _sync_consolidate_excel(master_df: "pd.DataFrame") -> None:
     """
@@ -825,13 +850,7 @@ def _sync_consolidate_excel(master_df: "pd.DataFrame") -> None:
         "Total Waste":                                     ("Waste",        "Total Waste"),
         "Waste Recovered":                                 ("Waste",        "Waste Recovered"),
         "Recovery Rate":                                   ("Waste",        "Recovery Rate"),
-        "Elec_Canada_GJ":                                  ("Energy",       "Electricity - Canada"),
-        "Elec_Mexico_GJ":                                  ("Energy",       "Electricity - Mexico"),
-        "Elec_United_States_GJ":                           ("Energy",       "Electricity - United States"),
-        "Elec_Japan_GJ":                                   ("Energy",       "Electricity - Japan"),
-        "Elec_France_GJ":                                  ("Energy",       "Electricity - France"),
-        "Elec_Hungary_GJ":                                 ("Energy",       "Electricity - Hungary"),
-        "Elec_Italy_GJ":                                   ("Energy",       "Electricity - Italy"),
+        **{_elec_col(c): ("Energy", f"Electricity - {c}") for c in ELEC_ALL_COUNTRIES},
     }
 
     # Build long rows from master_df
@@ -840,13 +859,29 @@ def _sync_consolidate_excel(master_df: "pd.DataFrame") -> None:
     # Assign fixed row numbers to match what build_esg_master.py uses
     ROW_NUM = {col: i + 1 for i, col in enumerate(row_order)}
 
+    # Pre-compute which electricity country columns have any non-zero value
+    # across the whole master — only those countries get rows in the consolidate.
+    active_elec_cols = {
+        col for col in COL_MAP
+        if col.startswith("Elec_") and col.endswith("_GJ")
+        and col in master_df.columns
+        and master_df[col].fillna(0).ne(0).any()
+    }
+
     for _, wrow in master_df.sort_values(["Company", "Year"]).iterrows():
         company = wrow["Company"]
         year    = int(wrow["Year"]) if pd.notna(wrow.get("Year")) else None
         if not company or not year:
             continue
         for col, (section, label) in COL_MAP.items():
+            # Skip electricity country columns that are all-zero across the dataset
+            is_elec_country = col.startswith("Elec_") and col.endswith("_GJ")
+            if is_elec_country and col not in active_elec_cols:
+                continue
             val = wrow.get(col)
+            # For an active electricity country, skip rows where this company-year is zero
+            if is_elec_country and (pd.isna(val) or float(val) == 0):
+                continue
             long_rows.append({
                 "Company": company,
                 "Row":     ROW_NUM[col],
@@ -895,7 +930,9 @@ def _sync_company_member_files(master_df: "pd.DataFrame") -> list:
         co_folder = members_tip / co_safe
         co_folder.mkdir(parents=True, exist_ok=True)
         try:
-            grp.reset_index(drop=True).to_csv(co_folder / f"{co_safe}_latest.csv", index=False)
+            # Drop electricity country columns that are all zero for this company
+            grp_clean = _drop_zero_elec_cols(grp.reset_index(drop=True))
+            grp_clean.to_csv(co_folder / f"{co_safe}_latest.csv", index=False)
         except (PermissionError, OSError):
             skipped.append(str(company))
     return skipped
@@ -976,6 +1013,8 @@ def _save_submission_to_csv(inp, out) -> str:
 
     # ── 3. Write master CSV, then sync all dependent files ───────────────────
     try:
+        # Master CSV keeps all country columns (even all-zero) as the full schema.
+        # Derived outputs (member files, TIP aggregate) strip all-zero country cols.
         combined.to_csv(csv_path, index=False)
         # Sync TIP members aggregate
         tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
@@ -1364,9 +1403,9 @@ def _update_tip_members_file(master_path: "Path", tip_master_path: "Path") -> No
         return
 
     # In the current dataset all companies are TIP members, so TIP aggregate
-    # is identical to master.
+    # is identical to master — but strip all-zero electricity country columns.
     try:
-        master_df.to_csv(tip_master_path, index=False)
+        _drop_zero_elec_cols(master_df).to_csv(tip_master_path, index=False)
     except Exception as e:
         print(f"[tip_members] Could not write: {e}")
 
@@ -1389,16 +1428,7 @@ def _save_electricity_to_master(company: str, year: int) -> str:
     from pathlib import Path
     from datetime import datetime
 
-    # Country name as shown in editor -> master CSV column name (GJ)
-    COUNTRY_COL = {
-        "Canada":        "Elec_Canada_GJ",
-        "Mexico":        "Elec_Mexico_GJ",
-        "United States": "Elec_United_States_GJ",
-        "Japan":         "Elec_Japan_GJ",
-        "France":        "Elec_France_GJ",
-        "Hungary":       "Elec_Hungary_GJ",
-        "Italy":         "Elec_Italy_GJ",
-    }
+    COUNTRY_COL = ELEC_COUNTRY_COLS  # all 31 countries
     MWH_TO_GJ = 3.6
 
     elec_df = st.session_state.get("elec_data", pd.DataFrame())
@@ -1496,23 +1526,8 @@ def render_electricity_tab():
        from _CONSOLIDATED_DF, convert GJ→MWh, and populate the editor.
     """
     # Countries shown in the UI (all 31 — display-only for countries not in master schema)
-    ELEC_COUNTRIES = [
-        "Canada","Chile","Mexico","United States","Australia","Japan","Korea","New Zealand",
-        "Austria","Belgium","Czech Republic","Denmark","Finland","France","Germany","Italy",
-        "Netherlands","Poland","Portugal","Spain","Sweden","United Kingdom",
-        "China","India","Indonesia","Malaysia","Thailand","Vietnam",
-        "Brazil","South Africa","Turkey",
-    ]
-    # Only these 7 are stored in the master; the rest are display-only zeros
-    COUNTRY_COL_GJ = {
-        "Canada":        "Elec_Canada_GJ",
-        "Mexico":        "Elec_Mexico_GJ",
-        "United States": "Elec_United_States_GJ",
-        "Japan":         "Elec_Japan_GJ",
-        "France":        "Elec_France_GJ",
-        "Hungary":       "Elec_Hungary_GJ",
-        "Italy":         "Elec_Italy_GJ",
-    }
+    ELEC_COUNTRIES = ELEC_ALL_COUNTRIES  # module-level list of all 31
+    COUNTRY_COL_GJ = ELEC_COUNTRY_COLS  # all 31 countries stored in master
     GJ_TO_MWH = 1.0 / 3.6
     YEARS = list(range(2009, 2024))
 
@@ -1591,20 +1606,9 @@ def render_electricity_tab():
     # Always keep session_state in sync with what the editor returns this frame
     st.session_state.elec_data = edited
 
-    # ── Controls ──────────────────────────────────────────────────────────────
-    col_a, col_b, col_c = st.columns([3, 1, 1])
+    # ── Save button ───────────────────────────────────────────────────────────
+    col_a, col_b = st.columns([4, 1])
     with col_b:
-        if st.button("Reset to zero", key="elec_reset"):
-            fresh = st.session_state.elec_data.copy()
-            for yr in YEARS:
-                fresh[str(yr)] = 0.0
-            st.session_state.elec_data = fresh
-            # Force a new editor key so the widget re-renders with zeros
-            st.session_state._elec_editor_key_idx = (
-                st.session_state.get("_elec_editor_key_idx", 0) + 1
-            )
-            st.rerun()
-    with col_c:
         if st.button("💾 Save electricity data", type="primary", key="elec_save_btn"):
             msg = _save_electricity_to_master(company, rep_year)
             if "saved" in msg.lower() or "synced" in msg.lower():

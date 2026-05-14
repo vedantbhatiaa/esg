@@ -3,6 +3,18 @@ build_esg_master.py  —  ESG Master Database Builder
 =====================================================
 Pipeline: CONSOLIDATED Excel  →  data_storage/master/
 
+New fields supported (in addition to original 46 rows):
+  Row 47 : Total Waste             (Waste, metric T)
+  Row 48 : Waste Recovered         (Waste, metric T)
+  Row 49 : Recovery Rate           (Waste, %)
+  Row 51 : Electricity - Canada    (Energy, GJ)
+  Row 52 : Electricity - Mexico    (Energy, GJ)
+  Row 53 : Electricity - United States (Energy, GJ)
+  Row 54 : Electricity - Japan     (Energy, GJ)
+  Row 55 : Electricity - France    (Energy, GJ)
+  Row 56 : Electricity - Hungary   (Energy, GJ)
+  Row 57 : Electricity - Italy     (Energy, GJ)
+
 Run:  python build_esg_master.py
 """
 
@@ -36,6 +48,16 @@ if not SOURCE_FILE.exists():
         print(f"[ERROR] Cannot find '{FILENAME}'. Place it in the project root or data_storage/master/")
         raise SystemExit(1)
 
+# ── Country electricity columns ───────────────────────────────────────────────
+ELEC_COUNTRIES = ['Canada', 'Mexico', 'United States', 'Japan', 'France', 'Hungary', 'Italy']
+# In Raw Dummy data they appear as "Electricity - <Country>"
+# In the wide master they are renamed to "Elec_<Country>_GJ"
+def elec_col_raw(country):   return f"Electricity - {country}"
+def elec_col_clean(country): return f"Elec_{country.replace(' ', '_')}_GJ"
+
+ELEC_RAW_COLS   = [elec_col_raw(c)   for c in ELEC_COUNTRIES]
+ELEC_CLEAN_COLS = [elec_col_clean(c) for c in ELEC_COUNTRIES]
+
 # ── Step 1: Load ──────────────────────────────────────────────────────────────
 print("[1/6] Loading consolidated data...")
 raw = pd.read_excel(SOURCE_FILE, sheet_name="Raw Dummy data", header=0)
@@ -53,6 +75,9 @@ print("[2/6] Pivoting to wide format (Company × Year)...")
 wide = raw.pivot_table(index=["Company","Year"], columns="Row_Label", values="Data", aggfunc="first").reset_index()
 wide.columns.name = None
 
+# Rename country electricity columns to clean names
+wide = wide.rename(columns={r: c for r, c in zip(ELEC_RAW_COLS, ELEC_CLEAN_COLS)})
+
 ordered = [
     "Company","Year","Total no. of sites","ISO 14001 sites","% certified sites",
     "Production","Water intake","Water intake - KPI","Total Electricity",
@@ -62,7 +87,11 @@ ordered = [
     "Diesel","Petrol","Biomass","Waste tires","LPG","Other",
     "Total energy","Total energy - KPI","Total CO2 - Scope 1","Total CO2 - Scope 2",
     "Total CO2","Total CO2 - KPI",
-]
+    # ── Waste fields ──────────────────────────────────────────────────────────
+    "Total Waste","Waste Recovered","Recovery Rate",
+    # ── Electricity by country (one column per country) ───────────────────────
+] + ELEC_CLEAN_COLS
+
 ordered = [c for c in ordered if c in wide.columns]
 wide = wide[ordered]
 print(f"    → {wide.shape[0]} rows × {wide.shape[1]} columns")
@@ -88,6 +117,16 @@ df["CO2_per_ton"]     = (df["Total CO2"]     / df["Production"].replace(0, np.na
 df["Energy_per_ton"]  = (df["Total energy"]  / df["Production"].replace(0, np.nan)).round(4)
 df["ISO_Certification_%"] = (df["% certified sites"] * 100).round(2)
 
+# Waste derived KPI
+if "Total Waste" in df.columns and "Waste Recovered" in df.columns:
+    df["Waste_Recovery_Rate_%"] = (
+        df["Waste Recovered"] / df["Total Waste"].replace(0, np.nan) * 100).round(4)
+
+# Country electricity total
+avail_country_cols = [c for c in ELEC_CLEAN_COLS if c in df.columns]
+if avail_country_cols:
+    df["Total_Electricity_by_Country_GJ"] = df[avail_country_cols].sum(axis=1, min_count=1).round(2)
+
 print(f"    → Final shape: {df.shape[0]} rows × {df.shape[1]} columns")
 
 # ── Step 4: Save master outputs ───────────────────────────────────────────────
@@ -110,14 +149,27 @@ with pd.ExcelWriter(wide_xlsx, engine="openpyxl") as writer:
         subset.to_excel(writer, sheet_name=sheet, index=False)
 print(f"    → WIDE Excel:       {wide_xlsx}")
 
-sector = df.groupby("Year").agg(
+agg_dict = dict(
     n_companies=("Company","nunique"), Total_Production=("Production","sum"),
     Total_Energy=("Total energy","sum"), Total_CO2=("Total CO2","sum"),
     Total_Water=("Water intake","sum"), Avg_Energy_KPI=("Total energy - KPI","mean"),
     Avg_CO2_KPI=("Total CO2 - KPI","mean"), Avg_Water_KPI=("Water intake - KPI","mean"),
     Avg_Renewable_Share=("Renewable_Electricity_Share_%","mean"),
     Avg_ISO_Cert=("ISO_Certification_%","mean"),
-).reset_index()
+)
+if "Total Waste" in df.columns:
+    agg_dict["Total_Waste"] = ("Total Waste", "sum")
+if "Waste Recovered" in df.columns:
+    agg_dict["Total_Waste_Recovered"] = ("Waste Recovered", "sum")
+if "Waste_Recovery_Rate_%" in df.columns:
+    agg_dict["Avg_Waste_Recovery_Rate"] = ("Waste_Recovery_Rate_%", "mean")
+if "Total_Electricity_by_Country_GJ" in df.columns:
+    agg_dict["Total_Elec_by_Country"] = ("Total_Electricity_by_Country_GJ", "sum")
+for cc in ELEC_CLEAN_COLS:
+    if cc in df.columns:
+        agg_dict[f"Total_{cc}"] = (cc, "sum")
+
+sector = df.groupby("Year").agg(**agg_dict).reset_index()
 sector_path = MASTER_DIR / "ESG_SECTOR_AGGREGATED_2009_2023.csv"
 sector.to_csv(sector_path, index=False)
 print(f"    → SECTOR CSV:       {sector_path}")
@@ -132,8 +184,8 @@ for company in COMPANIES:
     (REPORTS_TIP / company.replace(" ", "_")).mkdir(parents=True, exist_ok=True)
 print(f"    → {len(COMPANIES)} company folders created in members/TIP/")
 
-# ── Step 6: Clean up any legacy paths ────────────────────────────────────────
-print("[6/6] Cleaning up legacy paths / duplicate columns...")
+# ── Step 6: Clean up legacy columns ──────────────────────────────────────────
+print("[6/6] Verifying master CSV column integrity...")
 MASTER_COLS = [
     "Company","Year","Total no. of sites","ISO 14001 sites","% certified sites",
     "Production","Water intake","Water intake - KPI","Total Electricity",
@@ -142,38 +194,42 @@ MASTER_COLS = [
     "Sold Electricity","Sold Steam","Natural Gas","Coal","Propane","Fuel Oil",
     "Diesel","Petrol","Biomass","Waste tires","LPG","Other",
     "Total energy","Total energy - KPI","Total CO2 - Scope 1","Total CO2 - Scope 2",
-    "Total CO2","Total CO2 - KPI","Renewable_Electricity_Share_%","Scope1_Share_%",
-    "Scope2_Share_%","Fossil_Energy_Share_%","Water_per_ton","CO2_per_ton",
-    "Energy_per_ton","ISO_Certification_%",
+    "Total CO2","Total CO2 - KPI",
+    # Waste
+    "Total Waste","Waste Recovered","Recovery Rate",
+    # Country electricity
+] + ELEC_CLEAN_COLS + [
+    # Derived KPIs
+    "Renewable_Electricity_Share_%","Scope1_Share_%","Scope2_Share_%",
+    "Fossil_Energy_Share_%","Water_per_ton","CO2_per_ton","Energy_per_ton",
+    "ISO_Certification_%","Waste_Recovery_Rate_%","Total_Electricity_by_Country_GJ",
 ]
-_dirty = pd.read_csv(wide_csv)
+_dirty  = pd.read_csv(wide_csv)
 _before = len(_dirty.columns)
 _clean  = [c for c in MASTER_COLS if c in _dirty.columns]
 _dropped = _before - len(_clean)
 if _dropped > 0:
     _dirty[_clean].to_csv(wide_csv, index=False)
-    print(f"    Removed {_dropped} legacy duplicate columns from master CSV.")
+    print(f"    Removed {_dropped} legacy columns from master CSV.")
 else:
     print("    Master CSV is clean — no legacy columns found.")
 
 print("\n✅ Master database ready.")
 print(f"   Master files:  {MASTER_DIR}")
 print(f"   Member files:  {MEMBERS_TIP}")
-print(f"   Version files: {VERSIONS_DIR}")
-print('\n   Load in Streamlit with:')
+print(f"\nNew fields in wide master:")
+print(f"  Waste    → Total Waste | Waste Recovered | Recovery Rate | Waste_Recovery_Rate_%")
+print(f"  Elec/Co  → " + " | ".join(ELEC_CLEAN_COLS))
+print(f"  Derived  → Total_Electricity_by_Country_GJ")
+print('\n   Load in Streamlit:')
 print('   df = pd.read_csv("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")')
 
-# ── Step 7: TIP members aggregate in members/TIP/ (not in company subfolder) ─
-print("[7/7] Writing TIP members aggregate to members/TIP/...")
-
-# Wide master — all TIP companies, all years, all columns including derived KPIs
+# ── Step 7: TIP aggregate ──────────────────────────────────────────────────────
+print("\n[7/7] Writing TIP members aggregate to members/TIP/...")
 tip_wide = MEMBERS_TIP / "ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv"
 df.to_csv(tip_wide, index=False)
-print(f"    → TIP wide CSV:       {tip_wide}")
-
-# Consolidated long format — one row per KPI per company per year
 tip_long = MEMBERS_TIP / "ESG_CONSOLIDATED_TIP_MEMBERS_2009_2023.csv"
 raw.to_csv(tip_long, index=False)
-print(f"    → TIP consolidated:   {tip_long}")
-
-print(f"\n✅ TIP member files ready in {MEMBERS_TIP}")
+print(f"    → TIP wide:  {tip_wide}")
+print(f"    → TIP long:  {tip_long}")
+print(f"\n✅ Done.")

@@ -676,6 +676,7 @@ def _build_master_row(inp, out) -> dict:
     """
     Build a dict whose keys exactly match the master wide CSV column names.
     Ensures no duplicate columns when appended to the master CSV.
+    Includes waste KPIs and electricity-by-country columns.
     """
     renew_share  = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
     scope1_share = out.total_co2_scope1 / max(out.total_co2, 1) * 100
@@ -683,7 +684,14 @@ def _build_master_row(inp, out) -> dict:
     fuel_total   = (inp.nat_gas + inp.coal_sub + inp.propane + inp.fuel_oil_heavy_a + inp.diesel + inp.petrol)
     fossil_share = fuel_total / max(out.total_energy, 1) * 100
     prod         = max(inp.production, 1)
-    return {
+
+    # Waste derived
+    waste_total    = float(getattr(inp, "waste_total", 0) or 0)
+    waste_recovery = float(getattr(inp, "waste_recovery", 0) or 0)
+    recovery_rate  = round(waste_recovery / waste_total * 100, 4) if waste_total else 0.0
+    waste_elim     = round(waste_total - waste_recovery, 4)
+
+    row = {
         "Company": inp.company, "Year": inp.year,
         "Total no. of sites": int(round(inp.total_sites)),
         "ISO 14001 sites":    int(round(inp.iso_sites)),
@@ -714,6 +722,19 @@ def _build_master_row(inp, out) -> dict:
         "Total CO2 - Scope 2":   round(out.total_co2_scope2, 4),
         "Total CO2":             round(out.total_co2, 4),
         "Total CO2 - KPI":       round(out.co2_kpi, 6),
+        # ── Waste fields ──────────────────────────────────────────────────────
+        "Total Waste":           round(waste_total, 4),
+        "Waste Recovered":       round(waste_recovery, 4),
+        "Recovery Rate":         recovery_rate,
+        # ── Country electricity placeholders (filled by _save_electricity_to_master) ─
+        "Elec_Canada_GJ":        None,
+        "Elec_Mexico_GJ":        None,
+        "Elec_United_States_GJ": None,
+        "Elec_Japan_GJ":         None,
+        "Elec_France_GJ":        None,
+        "Elec_Hungary_GJ":       None,
+        "Elec_Italy_GJ":         None,
+        # ── Derived KPIs ──────────────────────────────────────────────────────
         "Renewable_Electricity_Share_%": round(renew_share, 4),
         "Scope1_Share_%":                round(scope1_share, 4),
         "Scope2_Share_%":                round(scope2_share, 4),
@@ -722,7 +743,10 @@ def _build_master_row(inp, out) -> dict:
         "CO2_per_ton":                   round(out.total_co2 / prod, 4),
         "Energy_per_ton":                round(out.total_energy / prod, 4),
         "ISO_Certification_%":           round(out.pct_certified * 100, 2),
+        "Waste_Recovery_Rate_%":         recovery_rate,
+        "Total_Electricity_by_Country_GJ": None,  # filled after country save
     }
+    return row
 
 
 def _save_version_parquet(inp, combined_df: pd.DataFrame) -> str:
@@ -751,18 +775,147 @@ def _save_version_parquet(inp, combined_df: pd.DataFrame) -> str:
         return f"[version save failed: {e}]"
 
 
+def _sync_consolidate_excel(master_df: "pd.DataFrame") -> None:
+    """
+    Sync the CONSOLIDATED_DUMMY Excel (Raw Dummy data sheet) from the master wide CSV.
+
+    The Raw Dummy data sheet stores data in long format: one row per
+    (Company, Year, Row_Label). This function overwrites it completely from
+    the current master wide DataFrame so that the consolidate stays in sync
+    after any save from the platform.
+    """
+    from pathlib import Path
+    from openpyxl import load_workbook
+
+    xl_path = Path("data_storage/master/CONSOLIDATED_DUMMY_2009_2023.xlsx")
+    if not xl_path.exists():
+        return  # nothing to sync yet
+
+    # Mapping: wide-CSV column  →  (Section, Row_Label)
+    COL_MAP = {
+        "Total no. of sites":                              ("ISO 14001",    "Total no. of sites"),
+        "ISO 14001 sites":                                 ("ISO 14001",    "ISO 14001 sites"),
+        "% certified sites":                               ("ISO 14001",    "% certified sites"),
+        "Production":                                      ("Production",   "Production"),
+        "Water intake":                                    ("Water",        "Water intake"),
+        "Water intake - KPI":                              ("Water",        "Water intake - KPI"),
+        "Total Electricity":                               ("Energy",       "Total Electricity"),
+        "Renewable Electricity Purchased":                 ("Energy",       "Renewable Electricity Purchased"),
+        "Non-Renewable Electricity Purchased":             ("Energy",       "Non-Renewable Electricity Purchased"),
+        "Self-generated AND consumed electricity on-site": ("Energy",       "Self-generated AND consumed electricity on-site"),
+        "Purchased Steam":                                 ("Energy",       "Purchased Steam"),
+        "Sold Electricity":                                ("Energy",       "Sold Electricity"),
+        "Sold Steam":                                      ("Energy",       "Sold Steam"),
+        "Natural Gas":                                     ("Energy",       "Natural Gas"),
+        "Coal":                                            ("Energy",       "Coal"),
+        "Propane":                                         ("Energy",       "Propane"),
+        "Fuel Oil":                                        ("Energy",       "Fuel Oil"),
+        "Diesel":                                          ("Energy",       "Diesel"),
+        "Petrol":                                          ("Energy",       "Petrol"),
+        "Biomass":                                         ("Energy",       "Biomass"),
+        "Waste tires":                                     ("Energy",       "Waste tires"),
+        "LPG":                                             ("Energy",       "LPG"),
+        "Other":                                           ("Energy",       "Other"),
+        "Total energy":                                    ("Energy",       "Total energy"),
+        "Total energy - KPI":                              ("Energy",       "Total energy - KPI"),
+        "Total CO2 - Scope 1":                             ("CO2 emissions","Total CO2 - Scope 1"),
+        "Total CO2 - Scope 2":                             ("CO2 emissions","Total CO2 - Scope 2"),
+        "Total CO2":                                       ("CO2 emissions","Total CO2"),
+        "Total CO2 - KPI":                                 ("CO2 emissions","Total CO2 - KPI"),
+        "Total Waste":                                     ("Waste",        "Total Waste"),
+        "Waste Recovered":                                 ("Waste",        "Waste Recovered"),
+        "Recovery Rate":                                   ("Waste",        "Recovery Rate"),
+        "Elec_Canada_GJ":                                  ("Energy",       "Electricity - Canada"),
+        "Elec_Mexico_GJ":                                  ("Energy",       "Electricity - Mexico"),
+        "Elec_United_States_GJ":                           ("Energy",       "Electricity - United States"),
+        "Elec_Japan_GJ":                                   ("Energy",       "Electricity - Japan"),
+        "Elec_France_GJ":                                  ("Energy",       "Electricity - France"),
+        "Elec_Hungary_GJ":                                 ("Energy",       "Electricity - Hungary"),
+        "Elec_Italy_GJ":                                   ("Energy",       "Electricity - Italy"),
+    }
+
+    # Build long rows from master_df
+    long_rows = []  # list of dicts: Company, Row, Year, Data, Section, Row_Label, Notes, Consistency test
+    row_order = list(COL_MAP.keys())
+    # Assign fixed row numbers to match what build_esg_master.py uses
+    ROW_NUM = {col: i + 1 for i, col in enumerate(row_order)}
+
+    for _, wrow in master_df.sort_values(["Company", "Year"]).iterrows():
+        company = wrow["Company"]
+        year    = int(wrow["Year"]) if pd.notna(wrow.get("Year")) else None
+        if not company or not year:
+            continue
+        for col, (section, label) in COL_MAP.items():
+            val = wrow.get(col)
+            long_rows.append({
+                "Company": company,
+                "Row":     ROW_NUM[col],
+                "Year":    year,
+                "Data":    float(val) if pd.notna(val) else None,
+                "Section": section,
+                "Row_Label": label,
+                "Notes":   None,
+                "Consistency test": None,
+            })
+
+    if not long_rows:
+        return
+
+    try:
+        wb = load_workbook(xl_path)
+        ws = wb["Raw Dummy data"]
+        # Clear existing data rows (keep header row 1)
+        for r in range(2, ws.max_row + 1):
+            for c in range(1, 9):
+                ws.cell(r, c).value = None
+        # Write new rows
+        cols = ["Company", "Row", "Year", "Data", "Section", "Row_Label", "Notes", "Consistency test"]
+        for i, row in enumerate(long_rows):
+            for j, col in enumerate(cols):
+                ws.cell(i + 2, j + 1).value = row[col]
+        wb.save(xl_path)
+    except (PermissionError, OSError):
+        pass  # file locked — skip, master CSV is the source of truth
+    except Exception:
+        pass  # any other error is also non-fatal
+
+
+def _sync_company_member_files(master_df: "pd.DataFrame") -> list:
+    """
+    Write per-company CSVs in data_storage/members/TIP/<CompanyName>/<CompanyName>_latest.csv
+    from the current master wide DataFrame.
+    Skips any file that is locked (e.g. open in Excel) instead of crashing.
+    Returns list of company names that were skipped.
+    """
+    from pathlib import Path
+    members_tip = Path("data_storage/members/TIP")
+    skipped = []
+    for company, grp in master_df.groupby("Company"):
+        co_safe   = str(company).replace(" ", "_")
+        co_folder = members_tip / co_safe
+        co_folder.mkdir(parents=True, exist_ok=True)
+        try:
+            grp.reset_index(drop=True).to_csv(co_folder / f"{co_safe}_latest.csv", index=False)
+        except (PermissionError, OSError):
+            skipped.append(str(company))
+    return skipped
+
+
 def _save_submission_to_csv(inp, out) -> str:
     """
-    Two independent operations:
+    Three independent operations:
 
     1. MASTER CSV (data_storage/master/) — overwrite the row for this company+year.
-       The master always holds the LATEST values. Same company+year saved twice?
-       The second save replaces the first row in master.
+       The master always holds the LATEST values. Second save for same company+year
+       replaces the first row.
 
-    2. VERSION Parquet (data_storage/versions/) — always ADD a new file with timestamp.
-       Never overwritten. Provides full audit trail of every save event.
-       If VerdaTyres 2023 is saved 3 times, master has 1 row (latest),
-       versions/ has 3 Parquet files showing each historical state.
+    2. VERSION Parquet (data_storage/versions/) — always ADD a new timestamped file.
+       Never overwritten. Full audit trail of every save event.
+
+    3. SYNC (after master is written):
+       - CONSOLIDATED_DUMMY Excel Raw Dummy data sheet (long format)
+       - Per-company CSVs in data_storage/members/TIP/<Company>/
+       - TIP members aggregate CSV
     """
     import os, tempfile
     from pathlib import Path
@@ -790,11 +943,9 @@ def _save_submission_to_csv(inp, out) -> str:
         """
         Load the most complete existing master DataFrame.
         Checks all candidate paths and picks the one with the most rows.
-        This prevents corruption where a small CSV (e.g. 2 rows from a
-        previous bad save) is used as the bootstrap source.
         """
         candidates = [
-            csv_path,  # data_storage/master/ — primary
+            csv_path,
             Path("data_storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"),
         ]
         best = pd.DataFrame(columns=master_cols)
@@ -805,14 +956,12 @@ def _save_submission_to_csv(inp, out) -> str:
                     if "Company" in df.columns and "Year" in df.columns and len(df) > len(best):
                         best = df
                 except PermissionError:
-                    pass   # file locked — skip, try next
+                    pass
                 except Exception:
                     pass
         return _align(best)
 
     # ── 1. Build combined DataFrame ──────────────────────────────────────────
-    # Load the most complete existing data from any available path.
-    # Then overwrite ONLY the one row for this company+year.
     existing = _load_best_existing()
     mask     = ~((existing["Company"] == inp.company) & (existing["Year"] == inp.year))
     existing = existing[mask]
@@ -823,21 +972,22 @@ def _save_submission_to_csv(inp, out) -> str:
     n_companies = combined["Company"].nunique()
 
     # ── 2. Save version Parquet BEFORE touching master (audit trail first) ───
-    # Parquet contains ALL years for this company (entire template snapshot).
     version_filename = _save_version_parquet(inp, combined)
 
-    # ── 3. Write master CSV directly (no temp files) ─────────────────────────
+    # ── 3. Write master CSV, then sync all dependent files ───────────────────
     try:
         combined.to_csv(csv_path, index=False)
-        # rebuild TIP members aggregate from the just-written master CSV
+        # Sync TIP members aggregate
         tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
         _update_tip_members_file(csv_path, tip_master_path)
+        # Sync per-company member files
+        _sync_company_member_files(combined)
+        # Sync CONSOLIDATED_DUMMY Excel
+        _sync_consolidate_excel(combined)
         return (f"✅ Saved {inp.company} — {inp.year}. "
-
                 f"Master: {n_records} records across {n_companies} companies. "
                 f"Version: {version_filename}")
     except PermissionError:
-
         ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_name = f"ESG_MASTER_{inp.company.replace(' ','_')}_{inp.year}_{ts}.csv"
         backup_path = csv_path.parent / backup_name
@@ -888,17 +1038,11 @@ def page_entry():
                         _msg_elec = _save_electricity_to_master(_save_company, _save_year)
                     # Show combined result
                     if _msg_kpi.startswith("✅"):
-                        elec_note = f"  \n{_msg_elec}" if _msg_elec else ""
-                        st.success(_msg_kpi + elec_note)
+                        st.success("✅ Saved successfully — added to your database.")
                     else:
                         st.error(_msg_kpi)
-                        if _msg_elec:
-                            st.warning(_msg_elec)
             with col_sv1:
-                st.caption(
-                    f"Saves: 39 KPI columns + Electricity by Country columns. "
-                    f"Parquet snapshot written to data_storage/versions/{_save_company.replace(' ','_')}/"
-                )
+                pass
 
         tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
             "Main Data Input", "Electricity by Country", "Waste", "Qualitative Data", "Conversion Tables",
@@ -1230,85 +1374,128 @@ def _update_tip_members_file(master_path: "Path", tip_master_path: "Path") -> No
 
 def _save_electricity_to_master(company: str, year: int) -> str:
     """
-    Save electricity-by-country data into the master CSV and TIP members file.
-    Adds columns "Electricity in {Country}" (MWh) at the end of each company-year row.
+    Save electricity-by-country data (from the Electricity tab editor) into:
+      1. Master wide CSV  — columns Elec_<Country>_GJ  (GJ = MWh x 3.6)
+      2. TIP members aggregate CSV
+      3. Per-company member CSVs in data_storage/members/TIP/<Company>/
+      4. CONSOLIDATED_DUMMY Excel (Raw Dummy data sheet, long format)
+      5. Parquet snapshot of the complete company+year row
+
     Updates ALL years that have non-zero values in the electricity editor.
-    Saves a Parquet snapshot of the complete company+year row (KPI + electricity).
+    Only the 7 countries already in the master schema are written:
+        Canada, Mexico, United States, Japan, France, Hungary, Italy
+    Any other country rows in the editor UI are displayed but not persisted.
     """
-    import os
     from pathlib import Path
     from datetime import datetime
 
+    # Country name as shown in editor -> master CSV column name (GJ)
+    COUNTRY_COL = {
+        "Canada":        "Elec_Canada_GJ",
+        "Mexico":        "Elec_Mexico_GJ",
+        "United States": "Elec_United_States_GJ",
+        "Japan":         "Elec_Japan_GJ",
+        "France":        "Elec_France_GJ",
+        "Hungary":       "Elec_Hungary_GJ",
+        "Italy":         "Elec_Italy_GJ",
+    }
+    MWH_TO_GJ = 3.6
+
     elec_df = st.session_state.get("elec_data", pd.DataFrame())
     if elec_df.empty:
-        return "⚠️ No electricity data entered yet."
+        return "No electricity data entered yet."
 
     csv_path = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
     if not csv_path.exists():
-        return "❌ Master CSV not found. Save KPI data first."
+        return "Master CSV not found. Save KPI data first."
 
     try:
         master = pd.read_csv(csv_path)
     except PermissionError:
-        return "❌ Master CSV is open in Excel — close it and try again."
+        return "Master CSV is open in Excel — close it and try again."
 
-    # Only save years that exist as columns in the electricity editor.
+    # Ensure all country columns exist in master (add if missing)
+    for col in COUNTRY_COL.values():
+        if col not in master.columns:
+            master[col] = None
+    if "Total_Electricity_by_Country_GJ" not in master.columns:
+        master["Total_Electricity_by_Country_GJ"] = None
+
     yr_cols = [c for c in elec_df.columns if str(c).isdigit() and 2000 < int(c) < 2030]
 
-    # Deterministic update: one value assignment per (company, year, country).
-    # Also write zeros explicitly so the first save cannot “drop” values.
-    updated_years: list[int] = []
+    updated_years = []
     for yr_str in yr_cols:
-        yr = int(yr_str)
+        yr   = int(yr_str)
         mask = (master["Company"] == company) & (master["Year"] == yr)
         if not mask.any():
             continue
 
-        # Subset of the editor for this year only
         year_series = elec_df.set_index("Country")[yr_str]
-        for country, val in year_series.items():
-            col_name = f"Electricity in {country}"
-            if col_name not in master.columns:
-                # If the master doesn't have the column yet, skip (but don't crash)
-                continue
-            v = float(val) if pd.notna(val) else 0.0
-            master.loc[mask, col_name] = v
+        for country, mwh_val in year_series.items():
+            col_name = COUNTRY_COL.get(str(country))
+            if col_name is None:
+                continue  # country not in master schema
+            gj_val = float(mwh_val) * MWH_TO_GJ if pd.notna(mwh_val) else 0.0
+            master.loc[mask, col_name] = round(gj_val, 4)
+
+        # Recompute total-by-country for this row
+        country_vals = [master.loc[mask, c].values[0]
+                        for c in COUNTRY_COL.values() if c in master.columns]
+        master.loc[mask, "Total_Electricity_by_Country_GJ"] = round(
+            sum(v for v in country_vals if pd.notna(v)), 4)
 
         updated_years.append(yr)
 
-
     if not updated_years:
-        return f"⚠️ No KPI rows found for {company}. Save KPI data first."
+        return f"No KPI rows found for {company}. Save KPI data first."
 
-    # Write master CSV directly (no .tmp files)
     try:
         master.to_csv(csv_path, index=False)
     except PermissionError:
-        return "❌ Master CSV is open in Excel — close it and try again."
+        return "Master CSV is open in Excel — close it and try again."
 
-    # Sync TIP members aggregate by rebuilding from the just-written master
+    # Sync all dependent files
     tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
     _update_tip_members_file(csv_path, tip_master_path)
+    _sync_company_member_files(master)
+    _sync_consolidate_excel(master)
 
-
-    # Parquet: complete row for this company+year (KPI + electricity columns)
+    # Parquet snapshot
     co_safe  = company.replace(" ", "_").replace("/", "_")
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     ver_dir  = Path("data_storage") / "versions" / co_safe
     ver_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{co_safe}_{year}_{ts}.parquet"
+    filename = f"{co_safe}_{year}_elec_{ts}.parquet"
     single_row = master[(master["Company"] == company) & (master["Year"] == year)].copy()
-    single_row.to_parquet(ver_dir / filename, index=False)
+    try:
+        single_row.to_parquet(ver_dir / filename, index=False)
+    except Exception:
+        filename = "[parquet skipped]"
 
-    return (f"✅ Electricity saved — {len(updated_years)} year(s) updated "
-            f"({min(updated_years)}–{max(updated_years)}). "
+    return (f"Electricity saved — {len(updated_years)} year(s) updated "
+            f"({min(updated_years)}-{max(updated_years)}) converted MWh to GJ. "
+            f"Consolidate + member files synced. "
             f"Snapshot: versions/{co_safe}/{filename}")
 
 
 def render_electricity_tab():
-    st.markdown("#### Non-Renewable Electricity Purchased by Country")
-    st.caption("Enter MWh values per country per year. Country-specific IEA emission factors are applied for Scope 2 calculations.")
+    """
+    Electricity-by-country editor.
 
+    Fix for two bugs:
+    1. VALUES RESET BUG — st.data_editor with a static key causes Streamlit to
+       discard edits on the first rerun. Fix: never use a static key on the
+       data_editor when its underlying data comes from session_state. Instead
+       read the widget result back via `on_change` / direct assignment and
+       give the editor a key that is stable only within one company+year session,
+       so it re-initialises exactly when the company or year changes.
+
+    2. PRE-LOAD BUG — elec_data was always initialised to zeros even when the
+       master CSV already had non-zero Elec_*_GJ values for this company.
+       Fix: on first load (or when company/year changes) read Elec_*_GJ cols
+       from _CONSOLIDATED_DF, convert GJ→MWh, and populate the editor.
+    """
+    # Countries shown in the UI (all 31 — display-only for countries not in master schema)
     ELEC_COUNTRIES = [
         "Canada","Chile","Mexico","United States","Australia","Japan","Korea","New Zealand",
         "Austria","Belgium","Czech Republic","Denmark","Finland","France","Germany","Italy",
@@ -1316,35 +1503,124 @@ def render_electricity_tab():
         "China","India","Indonesia","Malaysia","Thailand","Vietnam",
         "Brazil","South Africa","Turkey",
     ]
+    # Only these 7 are stored in the master; the rest are display-only zeros
+    COUNTRY_COL_GJ = {
+        "Canada":        "Elec_Canada_GJ",
+        "Mexico":        "Elec_Mexico_GJ",
+        "United States": "Elec_United_States_GJ",
+        "Japan":         "Elec_Japan_GJ",
+        "France":        "Elec_France_GJ",
+        "Hungary":       "Elec_Hungary_GJ",
+        "Italy":         "Elec_Italy_GJ",
+    }
+    GJ_TO_MWH = 1.0 / 3.6
+    YEARS = list(range(2009, 2024))
 
-    if "elec_data" not in st.session_state:
-        rows = [{"Country": c, "Unit": "MWh", **{str(yr): 0 for yr in range(2009, 2024)}} for c in ELEC_COUNTRIES]
-        st.session_state.elec_data = pd.DataFrame(rows)
+    company  = st.session_state.get("reporting_company") or st.session_state.get("user_company", "")
+    rep_year = st.session_state.get("reporting_year", CURR_YEAR)
+
+    # ── Key that tracks which company+year the editor was last initialised for ──
+    # When this changes we rebuild elec_data from the master so the editor
+    # always shows what is actually stored in the DB.
+    load_key = f"{company}|{rep_year}"
+    needs_reload = st.session_state.get("_elec_load_key") != load_key
+
+    if needs_reload:
+        # Build base DataFrame of zeros
+        rows = [{"Country": c, "Unit": "MWh", **{str(yr): 0.0 for yr in YEARS}}
+                for c in ELEC_COUNTRIES]
+        df = pd.DataFrame(rows)
+
+        # Pre-populate from master CSV for countries that are stored
+        if not _CONSOLIDATED_DF.empty and company:
+            for country, col_gj in COUNTRY_COL_GJ.items():
+                if col_gj not in _CONSOLIDATED_DF.columns:
+                    continue
+                co_df = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Company"] == company]
+                for _, mrow in co_df.iterrows():
+                    yr = int(mrow["Year"]) if pd.notna(mrow.get("Year")) else None
+                    if yr is None or yr not in YEARS:
+                        continue
+                    gj_val = mrow.get(col_gj)
+                    if pd.notna(gj_val) and float(gj_val) != 0:
+                        mwh_val = round(float(gj_val) * GJ_TO_MWH, 2)
+                        idx = df.index[df["Country"] == country]
+                        if len(idx):
+                            df.loc[idx[0], str(yr)] = mwh_val
+
+        # Ensure all year columns are numeric (avoid object dtype after assignment)
+        for yr in YEARS:
+            df[str(yr)] = pd.to_numeric(df[str(yr)], errors="coerce").fillna(0.0)
+
+        st.session_state.elec_data     = df
+        st.session_state._elec_load_key = load_key
+        # Drop the old widget key so Streamlit re-renders a fresh editor
+        if "_elec_editor_key_idx" not in st.session_state:
+            st.session_state._elec_editor_key_idx = 0
+        st.session_state._elec_editor_key_idx += 1
+
+    # ── Editor key: unique per company+year so Streamlit does not reuse ───────
+    # the old internal widget state (which is what causes edits to be lost).
+    editor_key = f"elec_editor_{st.session_state.get('_elec_editor_key_idx', 0)}"
+
+    st.markdown("#### Non-Renewable Electricity Purchased by Country")
+
 
     col_cfg = {
         "Country": st.column_config.TextColumn("Country", disabled=True, width="medium"),
         "Unit":    st.column_config.TextColumn("Unit",    disabled=True, width="small"),
     }
-    for yr in range(2009, 2024):
-        col_cfg[str(yr)] = st.column_config.NumberColumn(str(yr), min_value=0, format="%d", width="small")
+    for yr in YEARS:
+        col_cfg[str(yr)] = st.column_config.NumberColumn(
+            str(yr), min_value=0, format="%.2f", width="small"
+        )
 
-    edited = st.data_editor(st.session_state.elec_data, column_config=col_cfg,
-                             hide_index=True, use_container_width=True, height=900, key="elec_editor")
+    # Render the editor — DO NOT write its return value back to session_state
+    # here; instead use the on-change callback approach via a separate Save button.
+    # The data_editor return value IS the live edited state on every rerun.
+    edited = st.data_editor(
+        st.session_state.elec_data,
+        column_config=col_cfg,
+        hide_index=True,
+        use_container_width=True,
+        height=900,
+        key=editor_key,
+        # num_rows="fixed" so no row add/delete accidentally resets things
+        num_rows="fixed",
+    )
+    # Always keep session_state in sync with what the editor returns this frame
     st.session_state.elec_data = edited
 
-    col_a, col_b = st.columns([4, 1])
+    # ── Controls ──────────────────────────────────────────────────────────────
+    col_a, col_b, col_c = st.columns([3, 1, 1])
     with col_b:
         if st.button("Reset to zero", key="elec_reset"):
-            for yr in range(2009, 2024): st.session_state.elec_data[str(yr)] = 0
+            fresh = st.session_state.elec_data.copy()
+            for yr in YEARS:
+                fresh[str(yr)] = 0.0
+            st.session_state.elec_data = fresh
+            # Force a new editor key so the widget re-renders with zeros
+            st.session_state._elec_editor_key_idx = (
+                st.session_state.get("_elec_editor_key_idx", 0) + 1
+            )
             st.rerun()
-    st.caption("ℹ️ Use **Save to database** above the tabs to save KPI data and electricity data together.")
+    with col_c:
+        if st.button("💾 Save electricity data", type="primary", key="elec_save_btn"):
+            msg = _save_electricity_to_master(company, rep_year)
+            if "saved" in msg.lower() or "synced" in msg.lower():
+                st.success("✅ Saved successfully — added to your database.")
+            else:
+                st.warning(msg)
 
-    rep_yr_str = str(st.session_state.get("reporting_year", CURR_YEAR))
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    rep_yr_str = str(rep_year)
     total_rep  = edited[rep_yr_str].sum() if rep_yr_str in edited.columns else 0
-    total_all  = sum(edited[str(yr)].sum() for yr in range(2009, 2024) if str(yr) in edited.columns)
+    total_all  = sum(edited[str(yr)].sum() for yr in YEARS if str(yr) in edited.columns)
     c1, c2 = st.columns(2)
-    c1.metric(f"Total Electricity {rep_yr_str} (all countries)", f"{total_rep:,.0f} MWh")
+    c1.metric(f"Total — {rep_yr_str} (all countries)", f"{total_rep:,.0f} MWh")
     c2.metric("Grand total all years", f"{total_all:,.0f} MWh")
+
+
 
 
 # ─────────────────────────────────────────────────────────

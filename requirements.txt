@@ -1,21 +1,22 @@
 # TIP ESG Platform — Python dependencies
 # Install: pip install -r requirements.txt
 
-# Frontend
+# ── Frontend ───────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
 
-# Data
+# ── Data ───────────────────────────────────────────────────────────────────────
 pandas>=2.0.0
 numpy>=1.24.0
 openpyxl>=3.1.0
+pyarrow>=14.0.0
 
-# Charts
+# ── Charts ─────────────────────────────────────────────────────────────────────
 plotly>=5.18.0
 
-
-# Microsoft 365 / OneDrive (MSAL auth + Graph API)
-msal>=1.28.0
+# ── Chatbot ────────────────────────────────────────────────────────────────────
 requests>=2.31.0
+duckduckgo-search>=6.1.0
 
-# Utilities
+# ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
+msal>=1.28.0

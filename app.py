@@ -27,9 +27,12 @@ import data_loader as dl
 # Chatbot (DSS internal only — lazy import in chatbot_ui)
 try:
     from chatbot.chatbot_ui import render_chatbot as _render_chatbot
+    from chatbot.chatbot_panel import analyst_panel_layout, render_analyst_panel
     _CHATBOT_AVAILABLE = True
 except ImportError:
     _CHATBOT_AVAILABLE = False
+    def analyst_panel_layout(): return st.columns([1, 0.001])
+    def render_analyst_panel(**kwargs): pass
 
 # Load fresh from disk on every Streamlit rerun (Streamlit reruns the full
 # script on every user interaction, so this is always up-to-date after a save).
@@ -1981,6 +1984,7 @@ def _compute_kpi_improvement(company: str, base_year: int, end_year: int) -> dic
     }
 
 
+
 def page_benchmarking():
     st.markdown("## Peer Benchmarking")
 
@@ -2303,6 +2307,7 @@ def _compute_readiness_score(completeness: dict, flags) -> tuple:
 # ─────────────────────────────────────────────────────────
 # PAGE 4 -- VERIFICATION (dss+ only)  — fully live
 # ─────────────────────────────────────────────────────────
+
 def page_verification():
     if not st.session_state.is_dss:
         st.error("This section is restricted to dss+ analysts and managers."); return
@@ -2425,6 +2430,7 @@ def page_verification():
 # ─────────────────────────────────────────────────────────
 # PAGE 5 -- AI READINESS (dss+ only) — fully live
 # ─────────────────────────────────────────────────────────
+
 def page_readiness():
     if not st.session_state.is_dss:
         st.error("This section is restricted to dss+ analysts and managers."); return
@@ -2594,12 +2600,36 @@ if not st.session_state.authenticated:
 else:
     show_sidebar()
     page = st.session_state.page
-    if   page == "entry":         page_entry()
-    elif page == "analysis":      page_analysis()
-    elif page == "benchmarking":  page_benchmarking()
-    elif page == "verification":  page_verification()
-    elif page == "readiness":     page_readiness()
+    is_panel_page = page in ("analysis", "benchmarking", "verification")
+    show_panel    = _CHATBOT_AVAILABLE and st.session_state.get("is_dss") and is_panel_page
 
-    # ── Chatbot (DSS employees only, all pages) ─────────────
-    if _CHATBOT_AVAILABLE:
+    if show_panel:
+        _left_col, _right_col = analyst_panel_layout()
+    else:
+        _left_col = None
+
+    # ── Run the page function (always in full width or left column) ──────────
+    if show_panel:
+        with _left_col:
+            if   page == "entry":         page_entry()
+            elif page == "analysis":      page_analysis()
+            elif page == "benchmarking":  page_benchmarking()
+            elif page == "verification":  page_verification()
+            elif page == "readiness":     page_readiness()
+        with _right_col:
+            _page_company = (st.session_state.get("reporting_company") or
+                             st.session_state.get("bench_company_sel") or
+                             st.session_state.get("user_company") or "")
+            _page_year    = int(st.session_state.get("reporting_year") or
+                                st.session_state.get("bench_year_sel") or 2023)
+            render_analyst_panel(page=page, company=_page_company, year=_page_year)
+    else:
+        if   page == "entry":         page_entry()
+        elif page == "analysis":      page_analysis()
+        elif page == "benchmarking":  page_benchmarking()
+        elif page == "verification":  page_verification()
+        elif page == "readiness":     page_readiness()
+
+    # ── Floating bubble chatbot (KPI Entry + AI Readiness only) ─────────────
+    if _CHATBOT_AVAILABLE and page in ("entry", "readiness"):
         _render_chatbot()

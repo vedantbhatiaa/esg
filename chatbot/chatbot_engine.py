@@ -1,549 +1,559 @@
 """
-chatbot_engine.py — dss+ ESG Analytical Chatbot Engine
-=======================================================
-Powered by Microsoft Copilot (Azure OpenAI GPT-4o) via the Anthropic API proxy.
-DSS internal employees only.
+chatbot_panel.py  —  dss+ ESG Analyst · Option 5 split panel
+=============================================================
+Renders the right-side analyst panel with:
+  - Red header + context badge (auto-detects current page/company/year)
+  - 4-tab nav: Chat | Charts | History | Config
+  - Streaming chat output
+  - Charts tab: pre-generated charts from chat history
+  - History tab: this week's log entries
+  - Config tab: model/provider info
 
-Capabilities:
-  • Simple factual queries  → data lookup in master CSV
-  • Deep analytical queries → trend analysis, root-cause reasoning, external factor enrichment
-  • Graph generation        → Plotly charts returned as figures, embedded in chat
-  • Session history logging → one file per user per week, append-only
+Usage in app.py:
+    from chatbot.chatbot_panel import analyst_panel_css, render_analyst_panel
 
-Architecture (inspired by ESG-Analysis RAG repo):
-  1. QueryClassifier  — route to data_lookup / analytics / graph / external
-  2. DataContext      — pull relevant rows from master CSV
-  3. CopilotEngine    — call Copilot API with structured prompt
-  4. GraphBuilder     — build Plotly figures from Copilot-planned specs
-  5. ChatLogger       — JSONL append-only weekly log per user
+    # At top of page functions that want the panel:
+    left_col, panel_col = analyst_panel_layout()
+    with left_col:
+        ... your existing page content ...
+    with panel_col:
+        render_analyst_panel(page="analysis", company="VerdaTyres Corp", year=2023)
 """
-
 from __future__ import annotations
+import streamlit as st
+from typing import Optional
 
-import json
-import re
-import os
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Optional
-import hashlib
+DSS_RED  = "#C8102E"
+DSS_NAVY = "#0A2240"
 
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-import requests
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-MASTER_CSV   = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
-LOG_DIR      = Path("data_storage/chat_logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-# Copilot / Azure OpenAI — uses the same endpoint pattern as Anthropic API
-COPILOT_ENDPOINT = "https://api.anthropic.com/v1/messages"
-COPILOT_MODEL    = "claude-sonnet-4-20250514"   # Best available for analytical work
-
-# KPI display names
-KPI_LABELS = {
-    "Production":               "Production (metric T)",
-    "Water intake":             "Water Intake (m³)",
-    "Water intake - KPI":       "Water Intensity (m³/T)",
-    "Total Electricity":        "Total Electricity (GJ)",
-    "Total energy":             "Total Energy (GJ)",
-    "Total energy - KPI":       "Energy Intensity (GJ/T)",
-    "Total CO2":                "Total CO₂ (T.CO₂)",
-    "Total CO2 - Scope 1":      "Scope 1 CO₂ (T.CO₂)",
-    "Total CO2 - Scope 2":      "Scope 2 CO₂ (T.CO₂)",
-    "Total CO2 - KPI":          "CO₂ Intensity (T.CO₂/T)",
-    "Total Waste":              "Total Waste (metric T)",
-    "Waste Recovered":          "Waste Recovered (metric T)",
-    "Recovery Rate":            "Recovery Rate (%)",
-    "Renewable_Electricity_Share_%": "Renewable Electricity Share (%)",
-    "Water_per_ton":            "Water per Ton",
-    "CO2_per_ton":              "CO₂ per Ton",
-    "Energy_per_ton":           "Energy per Ton",
+# Context labels per page
+PAGE_CONTEXT = {
+    "analysis":      ("chart-line",     "Analysis"),
+    "benchmarking":  ("layout-columns", "Benchmarking"),
+    "verification":  ("shield-check",   "Verification"),
+    "entry":         ("file-text",      "Data Entry"),
+    "readiness":     ("brain",          "AI Readiness"),
 }
 
-EXTERNAL_FACTORS_PROMPT = """
-You have access to general knowledge about global events (2009-2023) that affect ESG metrics for 
-tire manufacturers operating globally. Consider:
-- Macroeconomic shocks: 2008-09 GFC recovery, COVID-19 (2020), supply chain crises (2021-22)
-- Energy: oil price crashes (2014-16, 2020), European gas crisis (2022), renewable energy growth
-- Climate/geopolitics: Paris Agreement (2015-16), ESG regulatory push (CSRD 2022-23), 
-  Russia-Ukraine conflict impact on European energy (2022), China COVID lockdowns (2022)
-- Industry: EV transition pressure on tire demand, raw material costs (natural rubber, carbon black)
-- Natural events: floods, droughts affecting operations in Asia/Europe
-Use these to contextualise any unusual changes in ESG metrics when asked.
-"""
 
-SYSTEM_PROMPT = f"""You are an expert ESG data analyst at dss+ (a management consulting firm) 
-specialising in the Tire Industry Project (TIP) — a WBCSD initiative tracking environmental KPIs 
-for 10 global tire manufacturers from 2009 to 2023.
+def analyst_panel_css() -> None:
+    """Inject panel CSS once per page load."""
+    st.markdown(f"""
+    <style>
+    /* ── Panel outer shell ─────────────────────────────────── */
+    .ap-shell {{
+        background: var(--color-background-primary);
+        border: 0.5px solid var(--color-border-tertiary);
+        border-radius: 12px;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        height: calc(100vh - 120px);
+        position: sticky;
+        top: 16px;
+    }}
 
-Your role:
-1. Answer factual questions precisely from the provided data context
-2. Provide deep analytical insight — trend analysis, anomaly detection, year-over-year changes
-3. Suggest and describe charts to visualise data (output a JSON spec for graphs)
-4. Contextualise metrics using external global factors when relevant
-5. Be concise but thorough. Use markdown tables for comparisons.
+    /* ── Red header ────────────────────────────────────────── */
+    .ap-hd {{
+        background: {DSS_RED};
+        padding: 10px 12px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        flex-shrink: 0;
+    }}
+    .ap-hd-avatar {{
+        width: 28px; height: 28px;
+        background: rgba(255,255,255,.2);
+        border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0;
+    }}
+    .ap-hd-title {{ color: #fff; font-size: 13px; font-weight: 500; line-height: 1.2; }}
+    .ap-hd-sub   {{ color: rgba(255,255,255,.7); font-size: 10px; margin-top: 1px; }}
 
-{EXTERNAL_FACTORS_PROMPT}
+    /* ── Context bar ───────────────────────────────────────── */
+    .ap-ctx {{
+        background: var(--color-background-secondary);
+        border-bottom: 0.5px solid var(--color-border-tertiary);
+        padding: 5px 10px;
+        display: flex; align-items: center; gap: 5px;
+        font-size: 10px; color: var(--color-text-secondary);
+        flex-shrink: 0;
+    }}
+    .ap-ctx-pill {{
+        background: rgba(200,16,46,.1);
+        color: #7F1D1D;
+        border-radius: 4px;
+        padding: 1px 6px;
+        font-size: 10px; font-weight: 500;
+    }}
 
-Rules:
-- Only share information with dss+ internal users (already enforced upstream)
-- When you generate a chart, output a JSON block tagged ```chart_spec``` with the specification
-- For factual lookups, cite the exact year and value from the data
-- For analytical questions, structure your answer: Key Finding → Trend → External Factors → Recommendation
-- Always express percentage changes and intensities clearly
-- If a question involves a metric not in the data, say so clearly
+    /* ── Nav tabs ──────────────────────────────────────────── */
+    .ap-nav {{
+        display: flex;
+        border-bottom: 0.5px solid var(--color-border-tertiary);
+        flex-shrink: 0;
+    }}
+    .ap-nav-item {{
+        flex: 1; padding: 7px 4px 6px;
+        text-align: center;
+        font-size: 10px;
+        color: var(--color-text-secondary);
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        display: flex; flex-direction: column;
+        align-items: center; gap: 2px;
+        transition: color .1s;
+    }}
+    .ap-nav-item.active {{
+        color: {DSS_RED};
+        border-bottom-color: {DSS_RED};
+        font-weight: 500;
+    }}
+    .ap-nav-item i {{ font-size: 14px; }}
 
-Chart spec format (when generating charts):
-```chart_spec
-{{
-  "chart_type": "line|bar|scatter|area|heatmap|grouped_bar",
-  "title": "Chart title",
-  "x_col": "column name or 'Year'",
-  "y_cols": ["col1", "col2"],
-  "companies": ["company name or 'all'"],
-  "year_range": [2009, 2023],
-  "color_by": "Company|Year|null",
-  "secondary_y": null,
-  "annotations": []
-}}
-```
-"""
+    /* ── Message bubbles ───────────────────────────────────── */
+    .ap-msg-u {{
+        align-self: flex-end;
+        background: {DSS_RED};
+        color: #fff;
+        border-radius: 10px 10px 2px 10px;
+        padding: 6px 9px;
+        font-size: 12px;
+        max-width: 88%;
+        line-height: 1.4;
+        margin-bottom: 2px;
+    }}
+    .ap-msg-b {{
+        align-self: flex-start;
+        background: var(--color-background-secondary);
+        color: var(--color-text-primary);
+        border-radius: 10px 10px 10px 2px;
+        padding: 6px 9px;
+        font-size: 12px;
+        max-width: 92%;
+        line-height: 1.4;
+        margin-bottom: 2px;
+    }}
 
+    /* ── Suggestion chips ──────────────────────────────────── */
+    .ap-chip {{
+        background: var(--color-background-secondary);
+        border: 0.5px solid var(--color-border-tertiary);
+        border-radius: 6px;
+        padding: 5px 9px;
+        font-size: 11px;
+        color: var(--color-text-primary);
+        cursor: pointer;
+        line-height: 1.3;
+        margin-bottom: 4px;
+    }}
+    .ap-chip:hover {{
+        border-color: {DSS_RED};
+        color: {DSS_RED};
+    }}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. DATA CONTEXT BUILDER
-# ─────────────────────────────────────────────────────────────────────────────
+    /* ── History entry ─────────────────────────────────────── */
+    .ap-hist {{
+        background: var(--color-background-secondary);
+        border: 0.5px solid var(--color-border-tertiary);
+        border-radius: 7px;
+        padding: 7px 9px;
+        margin-bottom: 5px;
+        font-size: 11px;
+    }}
+    .ap-hist-q  {{ color: var(--color-text-primary); font-weight: 500; margin-bottom: 2px; }}
+    .ap-hist-ts {{ color: var(--color-text-secondary); font-size: 9px; }}
 
-class DataContext:
-    """Loads master CSV once and provides fast query methods."""
+    /* ── Config row ────────────────────────────────────────── */
+    .ap-cfg-row {{
+        display: flex; justify-content: space-between;
+        align-items: center;
+        padding: 6px 0;
+        border-bottom: 0.5px solid var(--color-border-tertiary);
+        font-size: 11px;
+    }}
+    .ap-cfg-label {{ color: var(--color-text-secondary); }}
+    .ap-cfg-val   {{ color: var(--color-text-primary); font-weight: 500; }}
 
-    def __init__(self):
-        self._df: Optional[pd.DataFrame] = None
-
-    @property
-    def df(self) -> pd.DataFrame:
-        if self._df is None or self._df.empty:
-            if MASTER_CSV.exists():
-                self._df = pd.read_csv(MASTER_CSV)
-            else:
-                self._df = pd.DataFrame()
-        return self._df
-
-    def reload(self):
-        """Force reload from disk (after a save)."""
-        self._df = None
-
-    def companies(self) -> list:
-        return sorted(self.df["Company"].dropna().unique().tolist()) if not self.df.empty else []
-
-    def years(self) -> list:
-        return sorted(self.df["Year"].dropna().astype(int).unique().tolist()) if not self.df.empty else []
-
-    def get_kpi(self, company: str, kpi: str, year: Optional[int] = None) -> pd.DataFrame:
-        """Return rows for a company/KPI, optionally filtered by year."""
-        df = self.df
-        if df.empty:
-            return pd.DataFrame()
-        mask = df["Company"] == company
-        if year:
-            mask &= df["Year"] == year
-        cols = ["Company", "Year"] + ([kpi] if kpi in df.columns else [])
-        return df[mask][cols].dropna(subset=([kpi] if kpi in df.columns else []))
-
-    def build_context_str(self, question: str, max_rows: int = 60) -> str:
-        """
-        Build a focused data excerpt for the LLM based on question keywords.
-        Extracts relevant companies, years, and KPI columns.
-        """
-        df = self.df
-        if df.empty:
-            return "No master data loaded."
-
-        q_lower = question.lower()
-
-        # Company filter
-        all_cos = self.companies()
-        mentioned_cos = [c for c in all_cos if c.lower().split()[0] in q_lower or
-                         any(w in q_lower for w in c.lower().split())]
-        if not mentioned_cos:
-            mentioned_cos = all_cos  # all companies
-
-        # Year range filter
-        years_in_q = [int(m) for m in re.findall(r'\b(20[0-9]{2})\b', question)]
-        if years_in_q:
-            y_min, y_max = min(years_in_q) - 1, max(years_in_q) + 1
-        else:
-            y_min, y_max = 2009, 2023
-
-        # KPI column filter based on keywords
-        kpi_keywords = {
-            "water": ["Water intake", "Water intake - KPI", "Water_per_ton"],
-            "energy": ["Total energy", "Total energy - KPI", "Total Electricity", "Energy_per_ton"],
-            "co2": ["Total CO2", "Total CO2 - Scope 1", "Total CO2 - Scope 2", "Total CO2 - KPI", "CO2_per_ton"],
-            "emission": ["Total CO2", "Total CO2 - Scope 1", "Total CO2 - Scope 2", "CO2_per_ton"],
-            "waste": ["Total Waste", "Waste Recovered", "Recovery Rate", "Waste_Recovery_Rate_%"],
-            "production": ["Production"],
-            "electricity": ["Total Electricity", "Renewable Electricity Purchased",
-                           "Non-Renewable Electricity Purchased", "Renewable_Electricity_Share_%"],
-            "renewable": ["Renewable Electricity Purchased", "Renewable_Electricity_Share_%"],
-            "scope": ["Total CO2 - Scope 1", "Total CO2 - Scope 2", "Scope1_Share_%", "Scope2_Share_%"],
-            "intensity": ["Water intake - KPI", "Total energy - KPI", "Total CO2 - KPI",
-                         "Water_per_ton", "CO2_per_ton", "Energy_per_ton"],
-            "kpi": ["Water intake - KPI", "Total energy - KPI", "Total CO2 - KPI"],
-            "recovery": ["Total Waste", "Waste Recovered", "Recovery Rate"],
-        }
-        sel_kpis = set(["Year", "Company", "Production"])
-        for kw, cols in kpi_keywords.items():
-            if kw in q_lower:
-                sel_kpis.update(cols)
-        if len(sel_kpis) <= 3:  # no specific KPI found → include all main ones
-            sel_kpis.update([
-                "Production", "Water intake", "Total energy", "Total CO2",
-                "Total Waste", "Recovery Rate", "Renewable_Electricity_Share_%",
-            ])
-
-        avail_cols = ["Company", "Year"] + [c for c in sel_kpis
-                                             if c in df.columns and c not in ("Company", "Year")]
-        sub = df[df["Company"].isin(mentioned_cos) &
-                 df["Year"].between(y_min, y_max)][avail_cols].copy()
-        sub = sub.sort_values(["Company", "Year"])
-
-        if len(sub) > max_rows:
-            sub = sub.head(max_rows)
-
-        ctx = f"DATA EXCERPT ({len(sub)} rows, companies: {', '.join(mentioned_cos[:5])}):\n"
-        ctx += sub.to_string(index=False, max_rows=max_rows)
-        return ctx
+    /* ── Status dot ────────────────────────────────────────── */
+    .ap-dot-green {{ color: #22C55E; font-size: 9px; }}
+    .ap-dot-red   {{ color: #EF4444; font-size: 9px; }}
+    </style>
+    """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. QUERY CLASSIFIER
-# ─────────────────────────────────────────────────────────────────────────────
-
-class QueryClassifier:
-    """Lightweight rule-based classifier — no LLM call needed for routing."""
-
-    GRAPH_KEYWORDS = {"chart", "graph", "plot", "visuali", "trend line", "bar chart",
-                      "scatter", "compare visually", "show me a", "draw"}
-    DEEP_KEYWORDS  = {"why", "cause", "reason", "explain", "factor", "drop", "decline",
-                      "increase", "spike", "anomal", "significant", "interpret",
-                      "insight", "what happened", "external"}
-    DATA_KEYWORDS  = {"what is", "what was", "how much", "value of", "show", "list",
-                      "table", "all companies", "each company", "per year"}
-
-    def classify(self, question: str) -> str:
-        q = question.lower()
-        if any(kw in q for kw in self.GRAPH_KEYWORDS):
-            return "graph"
-        if any(kw in q for kw in self.DEEP_KEYWORDS):
-            return "analytical"
-        return "factual"
+def analyst_panel_layout():
+    """
+    Return (left_col, right_col) — left gets page content, right gets panel.
+    Widths: 67% content, 33% panel.
+    Only shown to dss+ employees.
+    """
+    if not st.session_state.get("is_dss", False):
+        # Non-DSS users: full-width single column
+        return st.columns([1, 0.001])  # effectively one column
+    return st.columns([2.1, 1], gap="medium")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. GRAPH BUILDER
-# ─────────────────────────────────────────────────────────────────────────────
+def render_analyst_panel(
+    page: str = "analysis",
+    company: Optional[str] = None,
+    year: Optional[int] = None,
+) -> None:
+    """
+    Render the full Option 5 split analyst panel in the right column.
+    Call this inside `with panel_col:` after analyst_panel_layout().
+    """
+    if not st.session_state.get("is_dss", False):
+        return
 
-class GraphBuilder:
-    """Parses chart_spec JSON from LLM and builds Plotly figures."""
+    # ── Get bot instance ──────────────────────────────────────────────────────
+    username = st.session_state.get("user_name", "dss_user")
+    try:
+        from chatbot.chatbot_engine import ESGChatbot
+        bot_key = f"_chatbot_{username}"
+        if bot_key not in st.session_state:
+            st.session_state[bot_key] = ESGChatbot(username)
+        bot = st.session_state[bot_key]
+    except Exception as e:
+        st.error(f"Analyst panel unavailable: {e}")
+        return
 
-    DSS_COLORS = [
-        "#C8102E", "#0A2240", "#00916E", "#F4A261", "#457B9D",
-        "#E9C46A", "#264653", "#E76F51", "#2A9D8F", "#A8DADC",
+    # ── Session state for this panel ──────────────────────────────────────────
+    if "ap_tab"      not in st.session_state: st.session_state.ap_tab      = "chat"
+    if "ap_messages" not in st.session_state: st.session_state.ap_messages = []
+    if "ap_charts"   not in st.session_state: st.session_state.ap_charts   = []
+
+    ok, status_msg = bot.copilot.is_available()
+
+    # ── Context labels ────────────────────────────────────────────────────────
+    icon, page_label = PAGE_CONTEXT.get(page, ("robot", page.title()))
+    company  = company or st.session_state.get("reporting_company") or \
+               st.session_state.get("user_company") or "All Companies"
+    year     = year    or st.session_state.get("reporting_year") or 2023
+    sub_text = f"{company} · {year}" if company != "All Companies" else \
+               f"All companies · {year}"
+
+    # Inject CSS
+    analyst_panel_css()
+
+    # ── Build header HTML ─────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div class="ap-hd">
+      <div class="ap-hd-avatar">
+        <i class="ti ti-robot" style="color:#fff;font-size:14px" aria-hidden="true"></i>
+      </div>
+      <div>
+        <div class="ap-hd-title">dss+ ESG Analyst</div>
+        <div class="ap-hd-sub">{sub_text}</div>
+      </div>
+    </div>
+    <div class="ap-ctx">
+      <span>Context:</span>
+      <span class="ap-ctx-pill">{company.split()[0]}</span>
+      <span class="ap-ctx-pill">{year}</span>
+      <span class="ap-ctx-pill">{page_label}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Tab navigation ────────────────────────────────────────────────────────
+    tab_defs = [
+        ("chat",    "ti-message-circle", "Chat"),
+        ("charts",  "ti-chart-bar",      "Charts"),
+        ("history", "ti-history",        "History"),
+        ("config",  "ti-settings",       "Config"),
     ]
 
-    def build(self, spec: dict, df: pd.DataFrame) -> Optional[go.Figure]:
-        try:
-            chart_type = spec.get("chart_type", "line")
-            title      = spec.get("title", "ESG Chart")
-            x_col      = spec.get("x_col", "Year")
-            y_cols     = spec.get("y_cols", [])
-            companies  = spec.get("companies", ["all"])
-            year_range = spec.get("year_range", [2009, 2023])
-            color_by   = spec.get("color_by", "Company")
-
-            if df.empty or not y_cols:
-                return None
-
-            # Filter
-            sub = df.copy()
-            if companies and companies != ["all"] and "all" not in companies:
-                sub = sub[sub["Company"].isin(companies)]
-            sub = sub[sub["Year"].between(year_range[0], year_range[1])]
-
-            # Melt for multi-KPI
-            avail_y = [c for c in y_cols if c in sub.columns]
-            if not avail_y:
-                return None
-
-            if len(avail_y) == 1 and chart_type != "heatmap":
-                plot_df = sub[["Company", "Year"] + avail_y].dropna()
-                y = avail_y[0]
-
-                if chart_type == "line":
-                    fig = px.line(plot_df, x=x_col, y=y, color=color_by,
-                                  title=title, color_discrete_sequence=self.DSS_COLORS)
-                elif chart_type in ("bar", "grouped_bar"):
-                    fig = px.bar(plot_df, x=x_col, y=y, color=color_by, barmode="group",
-                                 title=title, color_discrete_sequence=self.DSS_COLORS)
-                elif chart_type == "area":
-                    fig = px.area(plot_df, x=x_col, y=y, color=color_by,
-                                  title=title, color_discrete_sequence=self.DSS_COLORS)
-                elif chart_type == "scatter":
-                    fig = px.scatter(plot_df, x=x_col, y=y, color=color_by,
-                                     title=title, color_discrete_sequence=self.DSS_COLORS)
-                else:
-                    fig = px.line(plot_df, x=x_col, y=y, color=color_by,
-                                  title=title, color_discrete_sequence=self.DSS_COLORS)
-
-            else:
-                # Melt multiple y_cols
-                plot_df = sub[["Company", "Year"] + avail_y].dropna()
-                melted  = plot_df.melt(id_vars=["Company", "Year"],
-                                       value_vars=avail_y,
-                                       var_name="KPI", value_name="Value")
-                if chart_type == "heatmap":
-                    pivot = plot_df.set_index("Year")[avail_y].T
-                    fig = px.imshow(pivot, title=title,
-                                    color_continuous_scale="RdYlGn")
-                elif chart_type in ("bar", "grouped_bar"):
-                    fig = px.bar(melted, x="Year", y="Value", color="KPI",
-                                 facet_col="Company" if len(companies) > 1 else None,
-                                 barmode="group", title=title,
-                                 color_discrete_sequence=self.DSS_COLORS)
-                else:
-                    fig = px.line(melted, x="Year", y="Value", color="KPI",
-                                  line_dash="Company" if len(companies) > 1 else None,
-                                  title=title, color_discrete_sequence=self.DSS_COLORS)
-
-            # Styling
-            fig.update_layout(
-                font_family="Inter, Arial, sans-serif",
-                title_font_size=15,
-                title_font_color="#0A2240",
-                paper_bgcolor="white",
-                plot_bgcolor="#F8F9FA",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                margin=dict(l=50, r=30, t=60, b=50),
+    tab_cols = st.columns(4)
+    for i, (tab_id, tab_icon, tab_label) in enumerate(tab_defs):
+        with tab_cols[i]:
+            active_class = "active" if st.session_state.ap_tab == tab_id else ""
+            st.markdown(
+                f'<div class="ap-nav-item {active_class}">'
+                f'<i class="ti {tab_icon}" aria-hidden="true"></i>'
+                f'<span>{tab_label}</span></div>',
+                unsafe_allow_html=True,
             )
-            fig.update_xaxes(showgrid=True, gridcolor="#E5E7EB")
-            fig.update_yaxes(showgrid=True, gridcolor="#E5E7EB")
+            if st.button(
+                tab_label,
+                key=f"ap_tab_{tab_id}",
+                use_container_width=True,
+            ):
+                st.session_state.ap_tab = tab_id
+                st.rerun()
 
-            return fig
+    st.markdown("<hr style='margin:0;border:none;border-top:0.5px solid var(--color-border-tertiary)'>",
+                unsafe_allow_html=True)
 
-        except Exception as e:
-            print(f"[GraphBuilder] Error: {e}")
-            return None
+    # ── Tab content ───────────────────────────────────────────────────────────
+    current_tab = st.session_state.ap_tab
 
-    def extract_spec(self, text: str) -> Optional[dict]:
-        """Pull chart_spec JSON block from LLM response."""
-        match = re.search(r"```chart_spec\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            return None
+    # ════════════════════════════════════════════════════════
+    # CHAT TAB
+    # ════════════════════════════════════════════════════════
+    if current_tab == "chat":
+        if not ok:
+            st.warning(f"**{bot.copilot.provider_label()} not reachable.**  \n{status_msg}")
+        else:
+            # Render message history
+            for i, msg in enumerate(st.session_state.ap_messages):
+                is_user = msg["role"] == "user"
+                css     = "ap-msg-u" if is_user else "ap-msg-b"
+                st.markdown(
+                    f'<div class="{css}">{msg["content"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                if msg.get("figure"):
+                    st.plotly_chart(
+                        msg["figure"],
+                        use_container_width=True,
+                        key=f"ap_fig_{i}",
+                    )
 
-    def strip_spec(self, text: str) -> str:
-        """Remove chart_spec block from text for clean display."""
-        return re.sub(r"```chart_spec\s*\{.*?\}\s*```", "", text, flags=re.DOTALL).strip()
+            # Suggestions on empty chat
+            if not st.session_state.ap_messages:
+                page_suggestions = {
+                    "analysis":     [
+                        f"Why did CO₂ change in 2020?",
+                        f"Chart water intake for {company.split()[0]} 2016–2023",
+                        f"What is the energy intensity trend?",
+                    ],
+                    "benchmarking": [
+                        "Who has the best CO₂ intensity in 2023?",
+                        "Which company improved most in renewable electricity?",
+                        "Compare water KPI across all companies",
+                    ],
+                    "verification": [
+                        f"Explain the flags for {company.split()[0]}",
+                        "What could cause a 24% Scope 2 spike?",
+                        "Is this submission ready for consolidation?",
+                    ],
+                }.get(page, [
+                    "What was the CO₂ intensity in 2023?",
+                    "Chart total energy trend",
+                    "Compare water intake year on year",
+                ])
 
+                st.markdown(
+                    "<div style='font-size:11px;color:var(--color-text-secondary);"
+                    "margin:6px 0 4px'>Try asking:</div>",
+                    unsafe_allow_html=True,
+                )
+                for sug in page_suggestions:
+                    if st.button(sug, key=f"ap_sug_{sug[:20]}", use_container_width=True):
+                        _handle_ap_chat(sug, bot, company, year)
+                        st.rerun()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. COPILOT ENGINE  (calls Anthropic API — swap endpoint for Azure Copilot)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class CopilotEngine:
-    """
-    Calls the Copilot / LLM API.
-
-    Configuration (set in Streamlit secrets or environment):
-      COPILOT_API_KEY   — API key
-      COPILOT_ENDPOINT  — defaults to Anthropic (swap for Azure OpenAI if needed)
-      COPILOT_MODEL     — model name
-    """
-
-    def __init__(self):
-        self.api_key  = (os.environ.get("COPILOT_API_KEY") or
-                         os.environ.get("ANTHROPIC_API_KEY") or "")
-        self.endpoint = (os.environ.get("COPILOT_ENDPOINT") or COPILOT_ENDPOINT)
-        self.model    = (os.environ.get("COPILOT_MODEL") or COPILOT_MODEL)
-
-    def call(self, user_message: str, data_context: str,
-             history: list[dict] | None = None) -> str:
-        """
-        Send a message to the Copilot API and return the text response.
-        history: list of {"role": "user"|"assistant", "content": str}
-        """
-        if not self.api_key:
-            return ("⚠️ Copilot API key not configured. "
-                    "Set COPILOT_API_KEY in your environment or Streamlit secrets.")
-
-        # Build message list
-        messages = []
-        if history:
-            for h in history[-10:]:  # last 10 turns for context window
-                messages.append({"role": h["role"], "content": h["content"]})
-
-        full_user_msg = f"{data_context}\n\n---\nQuestion: {user_message}"
-        messages.append({"role": "user", "content": full_user_msg})
-
-        payload = {
-            "model":      self.model,
-            "max_tokens": 2048,
-            "system":     SYSTEM_PROMPT,
-            "messages":   messages,
-        }
-
-        try:
-            resp = requests.post(
-                self.endpoint,
-                headers={
-                    "x-api-key":         self.api_key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type":      "application/json",
-                },
-                json=payload,
-                timeout=60,
+            # Chat input
+            user_input = st.chat_input(
+                f"Ask about {company.split()[0]}...",
+                key="ap_chat_input",
             )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["content"][0]["text"]
+            if user_input:
+                _handle_ap_chat(user_input, bot, company, year)
+                st.rerun()
 
-        except requests.exceptions.Timeout:
-            return "⏱️ Request timed out. Please try again."
-        except requests.exceptions.HTTPError as e:
-            return f"❌ API error {e.response.status_code}: {e.response.text[:200]}"
-        except Exception as e:
-            return f"❌ Unexpected error: {str(e)}"
+    # ════════════════════════════════════════════════════════
+    # CHARTS TAB
+    # ════════════════════════════════════════════════════════
+    elif current_tab == "charts":
+        if not st.session_state.ap_charts:
+            st.markdown(
+                "<div style='font-size:12px;color:var(--color-text-secondary);"
+                "padding:12px 0;text-align:center'>"
+                "No charts yet.<br>Ask me to chart something in the Chat tab.</div>",
+                unsafe_allow_html=True,
+            )
+            # Quick chart suggestions
+            st.markdown("<div style='font-size:11px;color:var(--color-text-secondary);margin:8px 0 4px'>Generate a chart:</div>",
+                        unsafe_allow_html=True)
+            chart_sugs = [
+                f"Chart CO₂ trend for {company.split()[0]} 2016–2023",
+                "Compare renewable electricity share all companies",
+                f"Chart waste recovery rate for {company.split()[0]}",
+            ]
+            for cs in chart_sugs:
+                if st.button(cs, key=f"ap_cs_{cs[:20]}", use_container_width=True):
+                    st.session_state.ap_tab = "chat"
+                    _handle_ap_chat(cs, bot, company, year)
+                    st.rerun()
+        else:
+            for i, (title, fig) in enumerate(st.session_state.ap_charts):
+                st.markdown(
+                    f"<div style='font-size:11px;font-weight:500;color:var(--color-text-primary);"
+                    f"margin:6px 0 3px'>{title}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"ap_chart_{i}")
+
+    # ════════════════════════════════════════════════════════
+    # HISTORY TAB
+    # ════════════════════════════════════════════════════════
+    elif current_tab == "history":
+        try:
+            from chatbot.chatbot_engine import ChatLogger
+            logger  = ChatLogger(username)
+            entries = logger.load_week()
+        except Exception:
+            entries = []
+
+        if not entries:
+            st.markdown(
+                "<div style='font-size:12px;color:var(--color-text-secondary);"
+                "padding:12px 0;text-align:center'>No interactions this week yet.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<div style='font-size:11px;color:var(--color-text-secondary);"
+                f"margin-bottom:8px'>{len(entries)} interactions this week</div>",
+                unsafe_allow_html=True,
+            )
+            for entry in reversed(entries[-15:]):
+                from datetime import datetime
+                ts_str = ""
+                try:
+                    dt     = datetime.fromisoformat(entry["ts"])
+                    ts_str = dt.strftime("%d %b · %H:%M")
+                except Exception:
+                    ts_str = entry.get("ts", "")[:16]
+
+                chart_icon = " · 📊" if entry.get("had_chart") else ""
+                qtype      = entry.get("query_type", "")
+                type_badge = {"graph": "chart", "analytical": "analysis",
+                              "factual": "factual"}.get(qtype, qtype)
+                st.markdown(
+                    f'<div class="ap-hist">'
+                    f'<div class="ap-hist-q">{entry.get("question","")[:80]}</div>'
+                    f'<div class="ap-hist-ts">{ts_str} · {type_badge}{chart_icon}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ════════════════════════════════════════════════════════
+    # CONFIG TAB
+    # ════════════════════════════════════════════════════════
+    elif current_tab == "config":
+        status_dot  = "🟢" if ok else "🔴"
+        status_text = "Connected" if ok else "Disconnected"
+
+        st.markdown(
+            f'<div class="ap-cfg-row">'
+            f'<span class="ap-cfg-label">Provider</span>'
+            f'<span class="ap-cfg-val">{bot.copilot.provider_label()}</span>'
+            f'</div>'
+            f'<div class="ap-cfg-row">'
+            f'<span class="ap-cfg-label">Status</span>'
+            f'<span class="ap-cfg-val">{status_dot} {status_text}</span>'
+            f'</div>'
+            f'<div class="ap-cfg-row">'
+            f'<span class="ap-cfg-label">Context window</span>'
+            f'<span class="ap-cfg-val">2 048 tokens</span>'
+            f'</div>'
+            f'<div class="ap-cfg-row">'
+            f'<span class="ap-cfg-label">Max output</span>'
+            f'<span class="ap-cfg-val">500 tokens</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔌 Test connection", key="ap_test_conn",
+                         use_container_width=True):
+                ok2, msg2 = bot.copilot.is_available()
+                if ok2:
+                    st.success(msg2)
+                else:
+                    st.error(msg2)
+        with col2:
+            if st.button("🗑 Clear history", key="ap_clear_hist",
+                         use_container_width=True):
+                st.session_state.ap_messages = []
+                st.session_state.ap_charts   = []
+                bot.clear_history()
+                st.rerun()
+
+        if st.button("🔄 Reload master data", key="ap_reload_data",
+                     use_container_width=True):
+            bot.reload_data()
+            st.toast("Master data reloaded ✅")
+
+        if not ok:
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            st.warning(
+                f"{status_msg}\n\n"
+                "Make sure Ollama is running in your system tray."
+            )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. CHAT LOGGER
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ChatLogger:
+def _handle_ap_chat(question: str, bot, company: str, year: int) -> None:
     """
-    Append-only JSONL weekly log per user.
-    File format: chat_logs/<user_hash>_<YYYY-WXX>.jsonl
-    Each line is one interaction: {ts, user, question, answer, query_type, had_chart}
+    Process one chat turn with streaming output rendered in the panel.
+    Updates ap_messages and ap_charts in session_state.
     """
+    # Add user message
+    st.session_state.ap_messages.append(
+        {"role": "user", "content": question, "figure": None}
+    )
 
-    def __init__(self, username: str):
-        # Hash username for privacy-safe filenames
-        safe = hashlib.md5(username.encode()).hexdigest()[:10]
-        name = username.replace(" ", "_").replace("@", "_").replace(".", "_")[:20]
-        week = datetime.now().strftime("%Y-W%V")
-        self.path = LOG_DIR / f"{name}_{safe}_{week}.jsonl"
+    # Build compact context for this page
+    data_ctx = bot.context.build_context_str(question)
 
-    def log(self, question: str, answer: str,
-            query_type: str = "factual", had_chart: bool = False) -> None:
-        entry = {
-            "ts":         datetime.now().isoformat(),
-            "question":   question,
-            "answer":     answer[:2000],  # cap stored answer length
-            "query_type": query_type,
-            "had_chart":  had_chart,
-        }
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # Collect streaming response
+    accumulated = ""
+    placeholder = st.empty()
 
-    def load_week(self) -> list[dict]:
-        """Load all entries for this user's current week."""
-        if not self.path.exists():
-            return []
-        entries = []
-        with open(self.path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-        return entries
+    try:
+        for chunk in bot.copilot.call_stream(
+            user_message  = question,
+            data_context  = data_ctx,
+            history       = bot.history,
+            system_prompt = bot.system_prompt,
+        ):
+            accumulated += chunk
+            # Render streaming text — simple markdown so it looks clean in panel
+            placeholder.markdown(
+                f'<div class="ap-msg-b">{accumulated}▌</div>',
+                unsafe_allow_html=True,
+            )
+    except Exception as e:
+        accumulated = f"Error: {str(e)}"
 
-    @staticmethod
-    def purge_old_logs(days: int = 8) -> int:
-        """Remove log files older than `days`. Called at startup."""
-        cutoff = datetime.now() - timedelta(days=days)
-        removed = 0
-        for p in LOG_DIR.glob("*.jsonl"):
-            if datetime.fromtimestamp(p.stat().st_mtime) < cutoff:
-                p.unlink()
-                removed += 1
-        return removed
+    placeholder.markdown(
+        f'<div class="ap-msg-b">{accumulated}</div>',
+        unsafe_allow_html=True,
+    )
 
+    # Extract chart spec if present
+    spec   = bot.graph.extract_spec(accumulated)
+    figure = None
+    if spec and not bot.context.df.empty:
+        figure = bot.graph.build(spec, bot.context.df)
+        if figure:
+            st.session_state.ap_charts.append(
+                (spec.get("title", "Chart"), figure)
+            )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. MAIN CHATBOT ORCHESTRATOR
-# ─────────────────────────────────────────────────────────────────────────────
+    clean_text = bot.graph.strip_spec(accumulated)
 
-class ESGChatbot:
-    """
-    Top-level orchestrator — the only class app.py needs to import.
+    # Update history and messages
+    bot.history.append({"role": "user",      "content": question})
+    bot.history.append({"role": "assistant",  "content": clean_text})
+    if len(bot.history) > 12:
+        bot.history = bot.history[-12:]
 
-    Usage:
-        bot = ESGChatbot(username="John Smith")
-        response = bot.chat("What was VerdaTyres water intake in 2021?")
-        # response.text   → markdown answer
-        # response.figure → Plotly Figure or None
-    """
+    bot.logger.log(
+        question, clean_text,
+        bot.classifier.classify(question),
+        had_chart=(figure is not None),
+    )
 
-    def __init__(self, username: str):
-        self.username   = username
-        self.context    = DataContext()
-        self.classifier = QueryClassifier()
-        self.graph      = GraphBuilder()
-        self.copilot    = CopilotEngine()
-        self.logger     = ChatLogger(username)
-        self.history: list[dict] = []   # in-memory conversation history
-
-        # Purge logs older than 8 days on init (once per session)
-        ChatLogger.purge_old_logs(days=8)
-
-    def reload_data(self):
-        """Call after a save to master CSV so chatbot sees fresh data."""
-        self.context.reload()
-
-    def chat(self, question: str) -> "ChatResponse":
-        """Process one turn. Returns ChatResponse(text, figure)."""
-        query_type = self.classifier.classify(question)
-        data_ctx   = self.context.build_context_str(question)
-        answer_raw = self.copilot.call(question, data_ctx, self.history)
-
-        # Extract chart spec if present
-        spec   = self.graph.extract_spec(answer_raw)
-        figure = None
-        if spec and not self.context.df.empty:
-            figure = self.graph.build(spec, self.context.df)
-
-        # Clean answer text
-        answer_text = self.graph.strip_spec(answer_raw)
-
-        # Update in-memory history
-        self.history.append({"role": "user",      "content": question})
-        self.history.append({"role": "assistant",  "content": answer_text})
-
-        # Persist to log
-        self.logger.log(question, answer_text, query_type, had_chart=(figure is not None))
-
-        return ChatResponse(text=answer_text, figure=figure, query_type=query_type)
-
-    def clear_history(self):
-        self.history = []
-
-
-class ChatResponse:
-    """Simple value object returned by ESGChatbot.chat()."""
-    __slots__ = ("text", "figure", "query_type")
-
-    def __init__(self, text: str, figure, query_type: str):
-        self.text       = text
-        self.figure     = figure
-        self.query_type = query_type
+    st.session_state.ap_messages.append({
+        "role":    "assistant",
+        "content": clean_text,
+        "figure":  figure,
+    })

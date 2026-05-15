@@ -24,15 +24,7 @@ from formula_engine import (
 
 import data_loader as dl
 
-# Chatbot (DSS internal only — lazy import in chatbot_ui)
-try:
-    from chatbot.chatbot_ui import render_chatbot as _render_chatbot
-    from chatbot.chatbot_panel import analyst_panel_layout, render_analyst_panel
-    _CHATBOT_AVAILABLE = True
-except ImportError:
-    _CHATBOT_AVAILABLE = False
-    def analyst_panel_layout(): return st.columns([1, 0.001])
-    def render_analyst_panel(**kwargs): pass
+# Chatbot is embedded in page_readiness only — no global import needed
 
 # Load fresh from disk on every Streamlit rerun (Streamlit reruns the full
 # script on every user interaction, so this is always up-to-date after a save).
@@ -2511,85 +2503,128 @@ def page_readiness():
 
     st.divider()
 
-    # -- AI Insights (calls llm_client; mock if no API key) --------------------
-    st.markdown("#### AI-generated insights *(for analyst review — not final output)*")
-
-    bench_kpis = dl.get_benchmark_kpis(_CONSOLIDATED_DF, sel_yr - 1)
-    benchmarks_for_llm = []
-    if not bench_kpis.empty:
-        for col, kpi_name in [("Total CO2 - KPI","CO2 intensity"),
-                               ("Total energy - KPI","Energy intensity")]:
-            if col in bench_kpis.columns:
-                vals = bench_kpis[col].dropna().values
-                if len(vals) >= 3:
-                    med = float(np.median(vals))
-                    pos = "Top 25%" if (out.co2_kpi < np.percentile(vals,25) if "CO2" in col
-                          else out.energy_kpi < np.percentile(vals,25)) else "Above avg"
-                    benchmarks_for_llm.append({
-                        "kpi": kpi_name,
-                        "position": pos,
-                        "value": out.co2_kpi if "CO2" in col else out.energy_kpi,
-                        "median": med,
-                    })
-
-    kpi_dict = {
-        "production_mt":      inp.production,
-        "total_energy_gj":    out.total_energy,
-        "energy_kpi":         out.energy_kpi,
-        "co2_scope1":         out.total_co2_scope1,
-        "co2_scope2":         out.total_co2_scope2,
-        "total_co2":          out.total_co2,
-        "co2_kpi":            out.co2_kpi,
-        "water_m3":           inp.water_withdrawals,
-        "water_kpi":          out.water_kpi,
-        "renew_elec_pct":     renew_pct,
-        "waste_recovery_pct": out.waste_recovery_pct * 100,
-        "yoy_co2_pct":        yoy_co2,
-        "yoy_energy_pct":     yoy_e,
-        "benchmarks":         benchmarks_for_llm,
-    }
+    # ── ESG Analyst Chat (replaces old LLM insights) ──────────────────────────
+    st.markdown("#### dss+ ESG Analyst")
+    st.caption(f"Ask about {sel_co} {sel_yr} or any TIP company — powered by local AI (Ollama).")
 
     try:
-        from llm_client import get_llm
-        llm = get_llm()
-        with st.spinner("Generating AI insights…"):
-            insight_text = llm.generate_insight(kpi_dict, sel_co, sel_yr)
-            gaps_text    = llm.identify_gaps(kpi_dict, sel_co, sel_yr,
-                               [{"severity": f.severity, "message": f.message,
-                                 "detail": f.detail} for f in flags])
-            ready_result = llm.score_readiness(kpi_dict, sel_co, sel_yr,
-                               {k: v for k,v in completeness.items()}, flags)
-    except Exception as e:
-        insight_text = (f"[LLM unavailable: {e}]\n\n"
-                        f"Key metrics for {sel_co} {sel_yr}: "
-                        f"Energy KPI {out.energy_kpi:.2f} GJ/T, "
-                        f"CO₂ KPI {out.co2_kpi:.3f} T/T, "
-                        f"Renewable electricity {renew_pct:.1f}%, "
-                        f"Waste recovery {out.waste_recovery_pct*100:.1f}%.")
-        gaps_text    = ("\n".join(f"{i+1}. {f.message}: {f.detail}"
-                                   for i,f in enumerate(flags)
-                                   if f.severity in ("error","warning"))
-                        or "No validation issues found.")
-        ready_result = {"score": score, "label": label,
-                        "justification": f"Score computed from {n_errors} errors, "
-                                         f"{n_warnings} warnings, "
-                                         f"and {int(sum(completeness.values())/len(completeness))}% avg completeness."}
+        from chatbot.chatbot_engine import ESGChatbot
+        _bot_key = f"_readiness_bot_{st.session_state.get('user_name','dss')}"
+        if _bot_key not in st.session_state:
+            st.session_state[_bot_key] = ESGChatbot(
+                st.session_state.get("user_name", "dss_user"))
+        _bot = st.session_state[_bot_key]
 
-    for ai_title, ai_body in [
-        ("Energy & Emissions Summary", insight_text),
-        ("Data Gaps & Actions Required", gaps_text),
-        ("Readiness Assessment",
-         f"Score: {ready_result.get('score',score)}/100 — "
-         f"{ready_result.get('label', label)}. "
-         f"{ready_result.get('justification','')}"),
-    ]:
-        st.markdown(f"""<div class="ai-card">
-          <div class="ai-head"><div class="ai-pulse"></div>
-            <span class="ai-title">{ai_title}</span>
-            <span class="ai-badge">AI insight · review before use</span>
-          </div>
-          <div class="ai-body">{str(ai_body).replace(chr(10),"<br>")}</div>
-        </div>""", unsafe_allow_html=True)
+        _ok, _status = _bot.copilot.is_available()
+
+        # Status bar
+        _dot   = "🟢" if _ok else "🔴"
+        _slabel = _bot.copilot.provider_label() if _ok else "Ollama not running — open from system tray"
+        st.markdown(
+            f'<div style="font-size:12px;color:#6B7280;margin-bottom:8px">'
+            f'{_dot} {_slabel}</div>',
+            unsafe_allow_html=True,
+        )
+
+        if not _ok:
+            st.info("Start Ollama from your system tray, then reload this page.")
+        else:
+            # Quick-context chips for this company
+            _chat_key = f"ai_msgs_{sel_co}_{sel_yr}"
+            if _chat_key not in st.session_state:
+                st.session_state[_chat_key] = []
+
+            _msgs = st.session_state[_chat_key]
+
+            # Render message history
+            for _i, _m in enumerate(_msgs):
+                _av = "👤" if _m["role"] == "user" else "🤖"
+                with st.chat_message(_m["role"], avatar=_av):
+                    st.markdown(_m["content"])
+                    if _m.get("figure"):
+                        st.plotly_chart(_m["figure"], use_container_width=True,
+                                        key=f"ai_fig_{_i}")
+
+            # Suggestion chips on empty state
+            if not _msgs:
+                _sugs = [
+                    f"Summarise {sel_co} ESG performance in {sel_yr}",
+                    f"Why did CO₂ intensity change for {sel_co.split()[0]}?",
+                    f"Chart water intake for {sel_co.split()[0]} 2016–{sel_yr}",
+                    f"Compare {sel_co.split()[0]} vs sector average in {sel_yr}",
+                ]
+                _sc = st.columns(2)
+                for _si, _s in enumerate(_sugs):
+                    with _sc[_si % 2]:
+                        if st.button(_s, key=f"ai_chip_{_si}", use_container_width=True):
+                            st.session_state[_chat_key].append(
+                                {"role": "user", "content": _s, "figure": None})
+                            with st.spinner("Thinking…"):
+                                _resp = _bot.chat(_s)
+                            st.session_state[_chat_key].append({
+                                "role": "assistant",
+                                "content": _resp.text,
+                                "figure": _resp.figure,
+                            })
+                            st.rerun()
+
+            # Chat input
+            _q = st.chat_input(
+                f"Ask about {sel_co} {sel_yr} or any ESG metric…",
+                key=f"ai_input_{sel_co}_{sel_yr}",
+            )
+            if _q:
+                st.session_state[_chat_key].append(
+                    {"role": "user", "content": _q, "figure": None})
+                with st.chat_message("user", avatar="👤"):
+                    st.markdown(_q)
+
+                with st.chat_message("assistant", avatar="🤖"):
+                    _placeholder = st.empty()
+                    _acc = ""
+                    for _chunk in _bot.copilot.call_stream(
+                        user_message  = _q,
+                        data_context  = _bot.context.build_context_str(_q),
+                        history       = _bot.history,
+                        system_prompt = _bot.system_prompt,
+                    ):
+                        _acc += _chunk
+                        _placeholder.markdown(_acc + "▌")
+
+                    _placeholder.markdown(_acc)
+
+                    _spec = _bot.graph.extract_spec(_acc)
+                    _fig  = None
+                    if _spec and not _bot.context.df.empty:
+                        _fig = _bot.graph.build(_spec, _bot.context.df)
+                        if _fig:
+                            st.plotly_chart(_fig, use_container_width=True,
+                                            key=f"ai_resp_fig_{len(_msgs)}")
+
+                    _clean = _bot.graph.strip_spec(_acc)
+
+                _bot.history.append({"role": "user",      "content": _q})
+                _bot.history.append({"role": "assistant",  "content": _clean})
+                if len(_bot.history) > 12:
+                    _bot.history = _bot.history[-12:]
+                _bot.logger.log(_q, _clean, _bot.classifier.classify(_q),
+                                had_chart=(_fig is not None))
+
+                st.session_state[_chat_key].append({
+                    "role": "assistant", "content": _clean, "figure": _fig})
+                st.rerun()
+
+            # Clear button
+            if _msgs:
+                if st.button("🗑 Clear conversation", key="ai_clear_conv"):
+                    st.session_state[_chat_key] = []
+                    _bot.clear_history()
+                    st.rerun()
+
+    except ImportError:
+        st.info("Chatbot module not available. Ensure chatbot/ folder is present.")
+    except Exception as _e:
+        st.error(f"Chat error: {_e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -2600,36 +2635,8 @@ if not st.session_state.authenticated:
 else:
     show_sidebar()
     page = st.session_state.page
-    is_panel_page = page in ("analysis", "benchmarking", "verification")
-    show_panel    = _CHATBOT_AVAILABLE and st.session_state.get("is_dss") and is_panel_page
-
-    if show_panel:
-        _left_col, _right_col = analyst_panel_layout()
-    else:
-        _left_col = None
-
-    # ── Run the page function (always in full width or left column) ──────────
-    if show_panel:
-        with _left_col:
-            if   page == "entry":         page_entry()
-            elif page == "analysis":      page_analysis()
-            elif page == "benchmarking":  page_benchmarking()
-            elif page == "verification":  page_verification()
-            elif page == "readiness":     page_readiness()
-        with _right_col:
-            _page_company = (st.session_state.get("reporting_company") or
-                             st.session_state.get("bench_company_sel") or
-                             st.session_state.get("user_company") or "")
-            _page_year    = int(st.session_state.get("reporting_year") or
-                                st.session_state.get("bench_year_sel") or 2023)
-            render_analyst_panel(page=page, company=_page_company, year=_page_year)
-    else:
-        if   page == "entry":         page_entry()
-        elif page == "analysis":      page_analysis()
-        elif page == "benchmarking":  page_benchmarking()
-        elif page == "verification":  page_verification()
-        elif page == "readiness":     page_readiness()
-
-    # ── Floating bubble chatbot (KPI Entry + AI Readiness only) ─────────────
-    if _CHATBOT_AVAILABLE and page in ("entry", "readiness"):
-        _render_chatbot()
+    if   page == "entry":         page_entry()
+    elif page == "analysis":      page_analysis()
+    elif page == "benchmarking":  page_benchmarking()
+    elif page == "verification":  page_verification()
+    elif page == "readiness":     page_readiness()

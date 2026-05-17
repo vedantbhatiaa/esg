@@ -1791,113 +1791,545 @@ def render_conversion_tab():
 # PAGE 2 -- ANALYSIS (wired to real sector data)
 # ─────────────────────────────────────────────────────────
 def page_analysis():
+    import plotly.graph_objects as go
+
+    data_src = "live consolidated data" if not _CONSOLIDATED_DF.empty else "built-in demo data"
     st.markdown("## Analysis & Trends")
-    data_source = "live consolidated data" if not _SECTOR_DF.empty else "built-in demo data"
-    st.caption(f"Sector aggregated across all TIP member companies · Source: {data_source}")
+    st.caption(f"Sector aggregated across all TIP member companies · Source: {data_src}")
 
-    yrs = [str(y) for y in LONG_YEARS]
+    yrs     = [str(y) for y in LONG_YEARS]
+    yrs_int = LONG_YEARS
 
-    # KPI summary strip -- use last value in LONG_DATA (2023)
-    c1,c2,c3,c4,c5 = st.columns(5)
-    e_val   = LONG_DATA["energy"][-1]; e_prev = LONG_DATA["energy"][-2]
-    co2_val = LONG_DATA["co2"][-1];   co2_prev= LONG_DATA["co2"][-2]
-    ck_val  = LONG_DATA["co2_kpi"][-1]; ck_prev= LONG_DATA["co2_kpi"][-2]
-    r_val   = LONG_DATA["renew_pct"][-1]; r_prev = LONG_DATA["renew_pct"][-2]
-    w_val   = LONG_DATA["waste_recov"][-1]; w_prev = LONG_DATA["waste_recov"][-2]
+    C = {
+        "navy":"#0A2240","red":"#C8102E","green":"#00916E","blue":"#1D4ED8",
+        "teal":"#0891B2","amber":"#D97706","purple":"#7C3AED","coral":"#EA580C",
+        "gray":"#6B7280","grid":"#F3F4F6","bg":"#FFFFFF",
+    }
+    PALETTE_10 = ["#C8102E","#0A2240","#00916E","#1D4ED8","#D97706",
+                  "#7C3AED","#0891B2","#EA580C","#059669","#DB2777"]
 
-    def pct_delta(cur, prev): return f"{abs((cur-prev)/prev*100):.1f}% vs prev year" if prev else "—"
+    def _layout(title="", height=300, legend_h=True, **kw):
+        base = dict(
+            title=dict(text=title, font=dict(size=13, color=C["navy"])),
+            height=height, margin=dict(l=10,r=10,t=40,b=30),
+            plot_bgcolor=C["bg"], paper_bgcolor=C["bg"],
+            xaxis=dict(gridcolor=C["grid"], tickfont=dict(size=10)),
+            yaxis=dict(gridcolor=C["grid"], tickfont=dict(size=10)),
+            legend=dict(orientation="h" if legend_h else "v",
+                        y=1.12 if legend_h else 1, font=dict(size=10)),
+            hovermode="x unified",
+        )
+        base.update(kw)
+        return base
 
-    for col, label, val, unit, delta, pos in [
-        (c1,"Total Energy 2023",  f"{e_val:.1f}M",  "GJ",         pct_delta(e_val,e_prev),  e_val<e_prev),
-        (c2,"Total CO₂ 2023",    f"{co2_val:.2f}M","T.CO₂",      pct_delta(co2_val,co2_prev), co2_val<co2_prev),
-        (c3,"CO₂ Intensity",     f"{ck_val:.3f}",  "T.CO₂/T",   pct_delta(ck_val,ck_prev),  ck_val<ck_prev),
-        (c4,"Renewable Elec",    f"{r_val:.1f}%",  "of total elec", pct_delta(r_val,r_prev), r_val>r_prev),
-        (c5,"Waste Recovery",    f"{w_val:.1f}%",  "of total waste",pct_delta(w_val,w_prev), w_val>w_prev),
-    ]:
-        col.markdown(kpi_card_html(label, val, unit, delta, pos), unsafe_allow_html=True)
+    def _line(x, y, name, color, dash="solid", width=2, fill=None, fill_color=None, marker_size=4):
+        kw = dict(x=x, y=y, name=name, mode="lines+markers",
+                  line=dict(color=color, width=width, dash=dash),
+                  marker=dict(size=marker_size, color=color),
+                  hovertemplate="%{y:.2f}<extra>" + name + "</extra>")
+        if fill:
+            kw["fill"] = fill
+            kw["fillcolor"] = fill_color or "rgba(128,128,128,.08)"
+        return go.Scatter(**kw)
+
+    df = _CONSOLIDATED_DF
+    has_wide = (not df.empty and "Row_Label" not in df.columns)
+
+    def _sector(col, divisor=1):
+        if has_wide and col in df.columns:
+            return (df.groupby("Year")[col].sum() / divisor).reindex(yrs_int)
+        return None
+
+    def _sector_mean(col):
+        if has_wide and col in df.columns:
+            return df.groupby("Year")[col].mean().reindex(yrs_int)
+        return None
+
+    def _co_series(company, col, divisor=1):
+        if has_wide and col in df.columns:
+            s = df[df["Company"]==company].set_index("Year")[col] / divisor
+            return s.reindex(yrs_int)
+        return None
+
+    def _safe(series, fallback):
+        if series is None:
+            return fallback
+        return [(float(v) if (v == v and v is not None) else fallback[i])
+                for i, v in enumerate(series.values)]
+
+    companies = sorted(df["Company"].unique().tolist()) if has_wide else []
+
+    energy_total  = _safe(_sector("Total energy", 1e6),            LONG_DATA["energy"])
+    co2_total     = _safe(_sector("Total CO2", 1e6),               LONG_DATA["co2"])
+    scope1_total  = _safe(_sector("Total CO2 - Scope 1", 1e6),     LONG_DATA["scope1"])
+    scope2_total  = _safe(_sector("Total CO2 - Scope 2", 1e6),     LONG_DATA["scope2"])
+    water_total   = _safe(_sector("Water intake", 1e6),            LONG_DATA["water"])
+    energy_kpi    = _safe(_sector_mean("Total energy - KPI"),      LONG_DATA["energy_kpi"])
+    co2_kpi       = _safe(_sector_mean("Total CO2 - KPI"),         LONG_DATA["co2_kpi"])
+    water_kpi_v   = _safe(_sector_mean("Water intake - KPI"),      [7.0]*15)
+    renew_pct     = _safe(_sector_mean("Renewable_Electricity_Share_%"), LONG_DATA["renew_pct"])
+    waste_recov   = _safe(_sector_mean("Waste_Recovery_Rate_%"),   LONG_DATA["waste_recov"])
+    iso_cert      = _safe(_sector_mean("ISO_Certification_%"),     [93.0]*15)
+    waste_total_v = _safe(_sector("Total Waste"),                  [v*330000 for v in LONG_DATA["prod"]])
+    waste_recov_a = _safe(_sector("Waste Recovered"),              [v*280000 for v in LONG_DATA["prod"]])
+
+    # ── Headline KPI strip ─────────────────────────────────────────────────────
+    def _delta(cur, prv, good_if_down=True):
+        if prv and prv != 0:
+            pct = (cur - prv) / abs(prv) * 100
+            good = (pct < 0) == good_if_down
+            arrow = "▼" if pct < 0 else "▲"
+            col = "#00916E" if good else "#C8102E"
+            return f'<span style="color:{col};font-size:11px">{arrow} {abs(pct):.1f}%</span>'
+        return '<span style="font-size:11px;color:#9CA3AF">—</span>'
+
+    kpi_items = [
+        ("Total Energy 2023",   f"{energy_total[-1]:.1f}M",  "GJ",        _delta(energy_total[-1], energy_total[-2], True)),
+        ("Total CO₂ 2023",      f"{co2_total[-1]:.2f}M",    "T.CO₂",     _delta(co2_total[-1], co2_total[-2], True)),
+        ("CO₂ Intensity",       f"{co2_kpi[-1]:.3f}",       "T.CO₂/T",   _delta(co2_kpi[-1], co2_kpi[-2], True)),
+        ("Renewable Electricity",f"{renew_pct[-1]:.1f}%",   "of elec",   _delta(renew_pct[-1], renew_pct[-2], False)),
+        ("Waste Recovery",      f"{waste_recov[-1]:.1f}%",  "of waste",  _delta(waste_recov[-1], waste_recov[-2], False)),
+    ]
+    kpi_cols = st.columns(5)
+    for i, (label, val, unit, delta_html) in enumerate(kpi_items):
+        kpi_cols[i].markdown(
+            f'''<div style="border:0.5px solid #E5E7EB;border-radius:8px;
+                padding:12px 14px;background:#fff">
+            <div style="font-size:11px;color:#6B7280;margin-bottom:3px">{label}</div>
+            <div style="font-size:21px;font-weight:600;color:#0A2240;line-height:1.1">{val}</div>
+            <div style="font-size:11px;color:#9CA3AF">{unit}</div>
+            <div style="margin-top:3px">{delta_html}</div>
+            </div>''', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    def mkchart(title, traces, height=280):
-        fig = go.Figure()
-        for t in traces: fig.add_trace(t)
-        fig.update_layout(margin=dict(l=10,r=10,t=36,b=10), height=height,
-            title=dict(text=title, font=dict(size=13, color="#374151")),
-            legend=dict(font=dict(size=11)),
-            plot_bgcolor="#fff", paper_bgcolor="#fff",
-            xaxis=dict(gridcolor="#F3F4F6"), yaxis=dict(gridcolor="#F3F4F6"))
-        return fig
+    # ── Tabs — clients see General only; DSS sees all 4 ──────────────────────
+    is_dss_user = st.session_state.get("is_dss", False)
 
-    col_l, col_r = st.columns(2)
-    with col_l:
-        fig = mkchart("Total energy consumption (M GJ)", [
-            go.Scatter(x=yrs, y=LONG_DATA["energy"], mode="lines+markers",
-                name="Total energy", line=dict(color="#00916E", width=2),
-                fill="tozeroy", fillcolor="rgba(0,145,110,.08)", marker=dict(size=4))])
-        st.plotly_chart(fig, use_container_width=True)
+    if is_dss_user:
+        tab_gen, tab_p12, tab_p3, tab_p4 = st.tabs([
+            "General",
+            "Pathway 1 & 2  —  Energy & CO₂",
+            "Pathway 3  —  Water",
+            "Pathway 4  —  Waste & Environment",
+        ])
+    else:
+        # Client employees: sector aggregates only, no competitor data
+        st.info(
+            "📊 Showing TIP sector aggregates. "
+            "Pathway-level analysis with individual company breakdowns "
+            "is available to dss+ analysts only.",
+            icon=None,
+        )
+        tab_gen = st.tabs(["General"])[0]
+        tab_p12 = None
+        tab_p3  = None
+        tab_p4  = None
 
-    with col_r:
-        fig = mkchart("CO₂ emissions — Scope 1 vs Scope 2 (M T.CO₂)", [
-            go.Scatter(x=yrs, y=LONG_DATA["scope1"], mode="lines", name="Scope 1",
-                line=dict(color="#DC2626", width=2), fill="tozeroy", fillcolor="rgba(220,38,38,.12)"),
-            go.Scatter(x=yrs, y=LONG_DATA["scope2"], mode="lines", name="Scope 2",
-                line=dict(color="#1D4ED8", width=2), fill="tozeroy", fillcolor="rgba(29,78,216,.12)")])
-        st.plotly_chart(fig, use_container_width=True)
+    # ── TAB 1: GENERAL ──────────────────────────────────────────────────────────
+    with tab_gen:
+        st.caption("Core environmental KPIs for CSR / sustainability reporting — sector totals 2009–2023")
 
-    col_l2, col_r2 = st.columns(2)
-    with col_l2:
-        fig = mkchart("Energy & CO₂ intensity KPIs", [
-            go.Scatter(x=yrs, y=LONG_DATA["energy_kpi"], mode="lines+markers",
-                name="Energy KPI (GJ/T)", line=dict(color="#7C3AED", width=2), marker=dict(size=4)),
-            go.Scatter(x=yrs, y=LONG_DATA["co2_kpi"], mode="lines+markers",
-                name="CO₂ KPI (T/T)",    line=dict(color="#EA580C", width=2, dash="dot"),
-                marker=dict(size=4), yaxis="y2")])
-        fig.update_layout(yaxis2=dict(overlaying="y", side="right", gridcolor="#F3F4F6",
-            title="CO₂ KPI", showgrid=False), yaxis_title="Energy KPI")
-        st.plotly_chart(fig, use_container_width=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            f = go.Figure([_line(yrs, energy_total, "Total energy (M GJ)", C["green"],
+                fill="tozeroy", fill_color="rgba(0,145,110,.08)")])
+            f.update_layout(**_layout("Total energy consumption (M GJ)", 260))
+            st.plotly_chart(f, use_container_width=True)
+        with c2:
+            f = go.Figure([
+                _line(yrs, scope1_total, "Scope 1", C["red"],
+                    fill="tozeroy", fill_color="rgba(200,16,46,.10)"),
+                _line(yrs, scope2_total, "Scope 2", C["blue"],
+                    fill="tozeroy", fill_color="rgba(29,78,216,.10)"),
+            ])
+            f.update_layout(**_layout("CO₂ emissions — Scope 1 vs Scope 2 (M T.CO₂)", 260))
+            st.plotly_chart(f, use_container_width=True)
 
-    with col_r2:
-        fig = go.Figure()
-        colors = {"Natural Gas":"#F59E0B","Electricity":"#3B82F6","Fuel Oil":"#EF4444",
-                  "LPG":"#8B5CF6","Coal":"#6B7280","Other":"#D1D5DB"}
-        for fuel, vals in FUEL_MIX.items():
-            fig.add_trace(go.Bar(x=yrs, y=vals, name=fuel,
-                marker_color=colors.get(fuel,"#ccc"), marker_line_width=0))
-        fig.update_layout(barmode="stack",
-            title=dict(text="Fuel mix evolution (%)", font=dict(size=13, color="#374151")),
-            legend=dict(font=dict(size=10)), height=280, margin=dict(l=10,r=10,t=36,b=10),
-            yaxis=dict(range=[0,100], ticksuffix="%", gridcolor="#F3F4F6"),
-            plot_bgcolor="#fff", paper_bgcolor="#fff", xaxis=dict(tickangle=-45))
-        st.plotly_chart(fig, use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            f = go.Figure()
+            fuel_colors = {"Natural Gas":"#F59E0B","Electricity":"#3B82F6",
+                           "Fuel Oil":"#EF4444","LPG":"#8B5CF6","Coal":"#6B7280","Other":"#D1D5DB"}
+            for fuel, vals in FUEL_MIX.items():
+                f.add_trace(go.Bar(x=yrs, y=vals, name=fuel,
+                    marker_color=fuel_colors.get(fuel,"#ccc"), marker_line_width=0,
+                    hovertemplate=f"{fuel}: %{{y:.1f}}%<extra></extra>"))
+            f.update_layout(**_layout("Fuel mix evolution (%)", 260,
+                barmode="stack",
+                yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
+            st.plotly_chart(f, use_container_width=True)
+        with c4:
+            f = go.Figure([_line(yrs, water_total, "Water withdrawals (M m³)", C["teal"],
+                fill="tozeroy", fill_color="rgba(8,145,178,.08)")])
+            f.update_layout(**_layout("Water withdrawals (M m³)", 260))
+            st.plotly_chart(f, use_container_width=True)
 
-    col_l3, col_m3, col_r3 = st.columns(3)
-    with col_l3:
-        fig = mkchart("Water withdrawals (M m³)", [
-            go.Scatter(x=yrs, y=LONG_DATA["water"], mode="lines+markers",
-                name="Water", line=dict(color="#0EA5E9", width=2),
-                fill="tozeroy", fillcolor="rgba(14,165,233,.08)", marker=dict(size=3))], height=230)
-        st.plotly_chart(fig, use_container_width=True)
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            f = go.Figure(go.Bar(x=yrs, y=renew_pct,
+                marker_color=["rgba(0,145,110,.9)" if i>=12 else "rgba(0,145,110,.4)" for i in range(len(yrs))],
+                hovertemplate="%{y:.1f}%<extra>Renewable</extra>"))
+            f.update_layout(**_layout("Renewable electricity share (%)", 230,
+                yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
+            st.plotly_chart(f, use_container_width=True)
+        with c6:
+            f = go.Figure()
+            f.add_trace(go.Bar(x=yrs, y=waste_recov, name="Recovery %",
+                marker_color="rgba(0,145,110,.75)", marker_line_width=0))
+            f.add_trace(go.Bar(x=yrs, y=[100-v for v in waste_recov],
+                name="Elimination %", marker_color="rgba(200,16,46,.35)", marker_line_width=0))
+            f.update_layout(**_layout("Waste recovery rate (%)", 230,
+                barmode="stack", yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
+            st.plotly_chart(f, use_container_width=True)
+        with c7:
+            f = go.Figure(go.Bar(x=yrs, y=iso_cert,
+                marker_color="rgba(10,34,64,.7)", marker_line_width=0,
+                hovertemplate="%{y:.1f}%<extra>ISO 14001</extra>"))
+            f.update_layout(**_layout("ISO 14001 certification rate (%)", 230,
+                yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
+            st.plotly_chart(f, use_container_width=True)
 
-    with col_m3:
-        fig = go.Figure(go.Bar(x=yrs, y=LONG_DATA["renew_pct"],
-            marker_color=["rgba(0,145,110,.9)" if i>=12 else "rgba(0,145,110,.4)" for i in range(15)],
-            marker_line_width=0))
-        fig.update_layout(title=dict(text="Renewable electricity (%)", font=dict(size=13, color="#374151")),
-            height=230, margin=dict(l=10,r=10,t=36,b=10),
-            yaxis=dict(range=[0,100], ticksuffix="%", gridcolor="#F3F4F6"),
-            plot_bgcolor="#fff", paper_bgcolor="#fff")
-        st.plotly_chart(fig, use_container_width=True)
+        # ── Client-visible: own company vs sector average ─────────────────────
+        if not is_dss_user:
+            client_co = st.session_state.get("user_company", "")
+            if has_wide and client_co and client_co in df["Company"].values:
+                st.markdown("---")
+                st.markdown(f"##### {client_co} — your performance vs TIP sector average")
+                st.caption("Showing your company data alongside anonymous sector benchmarks. "
+                           "No individual competitor data is disclosed.")
 
-    with col_r3:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=yrs, y=LONG_DATA["waste_recov"], name="Recovery %", marker_color="rgba(0,145,110,.7)"))
-        fig.add_trace(go.Bar(x=yrs, y=[100-v for v in LONG_DATA["waste_recov"]], name="Elimination %", marker_color="rgba(220,38,38,.4)"))
-        fig.update_layout(barmode="stack",
-            title=dict(text="Waste recovery rate (%)", font=dict(size=13, color="#374151")),
-            height=230, margin=dict(l=10,r=10,t=36,b=10),
-            yaxis=dict(range=[0,100], ticksuffix="%", gridcolor="#F3F4F6"),
-            plot_bgcolor="#fff", paper_bgcolor="#fff", legend=dict(font=dict(size=10)))
-        st.plotly_chart(fig, use_container_width=True)
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    _s_co  = _co_series(client_co, "Total energy - KPI")
+                    if _s_co is not None:
+                        _co_vals = [float(v) if not np.isnan(float(v)) else None for v in _s_co.values]
+                        _f = go.Figure()
+                        _f.add_trace(go.Scatter(x=yrs, y=energy_kpi, name="TIP sector avg",
+                            mode="lines", line=dict(color="#9CA3AF", width=2, dash="dot"),
+                            hovertemplate="Sector avg: %{y:.2f}<extra></extra>"))
+                        _f.add_trace(go.Scatter(x=yrs, y=_co_vals,
+                            name=client_co.split()[0], mode="lines+markers",
+                            line=dict(color=C["navy"], width=2),
+                            marker=dict(size=4),
+                            hovertemplate=f"{client_co.split()[0]}: %{{y:.2f}} GJ/T<extra></extra>"))
+                        _f.update_layout(**_layout("Energy intensity — your company vs sector (GJ/T)", 240))
+                        st.plotly_chart(_f, use_container_width=True)
+
+                with _c2:
+                    _s_co2 = _co_series(client_co, "Total CO2 - KPI")
+                    if _s_co2 is not None:
+                        _co2_vals = [float(v) if not np.isnan(float(v)) else None for v in _s_co2.values]
+                        _f2 = go.Figure()
+                        _f2.add_trace(go.Scatter(x=yrs, y=co2_kpi, name="TIP sector avg",
+                            mode="lines", line=dict(color="#9CA3AF", width=2, dash="dot"),
+                            hovertemplate="Sector avg: %{y:.3f}<extra></extra>"))
+                        _f2.add_trace(go.Scatter(x=yrs, y=_co2_vals,
+                            name=client_co.split()[0], mode="lines+markers",
+                            line=dict(color=C["red"], width=2),
+                            marker=dict(size=4),
+                            hovertemplate=f"{client_co.split()[0]}: %{{y:.3f}} T.CO₂/T<extra></extra>"))
+                        _f2.update_layout(**_layout("CO₂ intensity — your company vs sector (T.CO₂/T)", 240))
+                        st.plotly_chart(_f2, use_container_width=True)
+
+                _c3, _c4 = st.columns(2)
+                with _c3:
+                    _sw = _co_series(client_co, "Water intake - KPI")
+                    if _sw is not None:
+                        _w_vals = [float(v) if not np.isnan(float(v)) else None for v in _sw.values]
+                        _fw = go.Figure()
+                        _fw.add_trace(go.Scatter(x=yrs, y=water_kpi_v, name="TIP sector avg",
+                            mode="lines", line=dict(color="#9CA3AF", width=2, dash="dot")))
+                        _fw.add_trace(go.Scatter(x=yrs, y=_w_vals,
+                            name=client_co.split()[0], mode="lines+markers",
+                            line=dict(color=C["teal"], width=2), marker=dict(size=4)))
+                        _fw.update_layout(**_layout("Water intensity — your company vs sector (m³/T)", 240))
+                        st.plotly_chart(_fw, use_container_width=True)
+
+                with _c4:
+                    _sr = _co_series(client_co, "Waste_Recovery_Rate_%")
+                    if _sr is None: _sr = _co_series(client_co, "Recovery Rate")
+                    if _sr is not None:
+                        _r_vals = [float(v) if not np.isnan(float(v)) else None for v in _sr.values]
+                        _fr = go.Figure()
+                        _fr.add_trace(go.Scatter(x=yrs, y=waste_recov, name="TIP sector avg",
+                            mode="lines", line=dict(color="#9CA3AF", width=2, dash="dot")))
+                        _fr.add_trace(go.Scatter(x=yrs, y=_r_vals,
+                            name=client_co.split()[0], mode="lines+markers",
+                            line=dict(color=C["green"], width=2), marker=dict(size=4)))
+                        _fr.update_layout(**_layout("Waste recovery rate — your company vs sector (%)", 240,
+                            yaxis=dict(ticksuffix="%", gridcolor=C["grid"])))
+                        st.plotly_chart(_fr, use_container_width=True)
+
+    # ── TAB 2: PATHWAY 1 & 2 — DSS EMPLOYEES ONLY ────────────────────────────
+    if is_dss_user and tab_p12 is not None:
+     with tab_p12:
+        st.markdown("##### Pathway 1 — Energy consumption & intensity")
+        st.caption("KPI 1: Total energy (GJ) · Energy intensity (GJ / metric T of production)")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            f = go.Figure([_line(yrs, energy_total, "Total energy (M GJ)", C["green"],
+                fill="tozeroy", fill_color="rgba(0,145,110,.08)")])
+            f.update_layout(**_layout("Sector total energy (M GJ)", 270))
+            st.plotly_chart(f, use_container_width=True)
+        with c2:
+            f = go.Figure([_line(yrs, energy_kpi, "Energy intensity (GJ/T)", C["purple"])])
+            f.add_hrect(y0=8.0, y1=9.5, fillcolor="rgba(0,145,110,.07)", line_width=0,
+                annotation_text="Target range", annotation_font_size=10)
+            f.update_layout(**_layout("Energy intensity — GJ per metric ton", 270))
+            st.plotly_chart(f, use_container_width=True)
+
+        if has_wide and companies:
+            rows = []
+            for co in companies:
+                s = _co_series(co, "Total energy - KPI")
+                if s is not None:
+                    v09 = float(s.iloc[0])  if not np.isnan(float(s.iloc[0]))  else None
+                    v23 = float(s.iloc[-1]) if not np.isnan(float(s.iloc[-1])) else None
+                    if v09 and v23:
+                        rows.append({"Company": co.split()[0], "2009": v09, "2023": v23})
+            if rows:
+                f = go.Figure()
+                names = [r["Company"] for r in rows]
+                f.add_trace(go.Bar(name="2009", x=names, y=[r["2009"] for r in rows],
+                    marker_color="rgba(10,34,64,.4)", marker_line_width=0))
+                f.add_trace(go.Bar(name="2023", x=names, y=[r["2023"] for r in rows],
+                    marker_color=C["navy"], marker_line_width=0))
+                f.update_layout(**_layout("Energy intensity (GJ/T) — 2009 vs 2023 by company",
+                    260, barmode="group",
+                    yaxis=dict(title="GJ/metric T", gridcolor=C["grid"])))
+                st.plotly_chart(f, use_container_width=True)
+
+        st.divider()
+        st.markdown("##### Pathway 2 — CO₂ emissions & intensity")
+        st.caption("KPI 2: Total CO₂ Scope 1+2 (T.CO₂) · CO₂ intensity (T.CO₂ / metric T)")
+
+        c3, c4 = st.columns(2)
+        with c3:
+            f = go.Figure()
+            f.add_trace(go.Scatter(x=yrs, y=scope1_total, name="Scope 1",
+                fill="tozeroy", fillcolor="rgba(200,16,46,.15)",
+                line=dict(color=C["red"], width=2)))
+            combined = [s1+s2 for s1,s2 in zip(scope1_total, scope2_total)]
+            f.add_trace(go.Scatter(x=yrs, y=combined, name="Scope 1+2",
+                fill="tonexty", fillcolor="rgba(29,78,216,.12)",
+                line=dict(color=C["blue"], width=2)))
+            f.update_layout(**_layout("CO₂ — Scope 1 & 2 stacked (M T.CO₂)", 270))
+            st.plotly_chart(f, use_container_width=True)
+        with c4:
+            f = go.Figure([_line(yrs, co2_kpi, "CO₂ intensity (T.CO₂/T)", C["red"])])
+            f.add_hrect(y0=0.55, y1=0.70, fillcolor="rgba(0,145,110,.07)", line_width=0,
+                annotation_text="Target range", annotation_font_size=10)
+            f.update_layout(**_layout("CO₂ intensity — T.CO₂ per metric ton", 270))
+            st.plotly_chart(f, use_container_width=True)
+
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            s1l, s2l = scope1_total[-1], scope2_total[-1]
+            f = go.Figure(go.Pie(
+                labels=["Scope 1","Scope 2"], values=[s1l, s2l], hole=0.55,
+                marker_colors=[C["red"], C["blue"]], textfont_size=12,
+                hovertemplate="%{label}: %{value:.3f}M<extra></extra>"))
+            f.update_layout(**_layout("Scope 1 vs Scope 2 — 2023", 240, legend_h=False))
+            st.plotly_chart(f, use_container_width=True)
+        with c6:
+            if companies:
+                co_names, co_vals = [], []
+                for co in companies:
+                    s = _co_series(co, "Total CO2 - KPI")
+                    if s is not None:
+                        v = float(s.iloc[-1])
+                        if not np.isnan(v):
+                            co_names.append(co.split()[0]); co_vals.append(v)
+                if co_names:
+                    pairs = sorted(zip(co_vals, co_names))
+                    sv, sn = zip(*pairs)
+                    f = go.Figure(go.Bar(x=list(sv), y=list(sn), orientation="h",
+                        marker_color=[C["green"] if v < 0.70 else C["red"] for v in sv],
+                        marker_line_width=0,
+                        hovertemplate="%{x:.3f} T.CO₂/T<extra>%{y}</extra>"))
+                    f.update_layout(**_layout("CO₂ intensity by company — 2023", 240,
+                        legend_h=False,
+                        xaxis=dict(title="T.CO₂/metric T", gridcolor=C["grid"])))
+                    st.plotly_chart(f, use_container_width=True)
+        with c7:
+            if companies:
+                import pandas as _pd
+                yoy_rows = []
+                for co in companies:
+                    s = _co_series(co, "Total CO2 - KPI")
+                    if s is not None:
+                        v09 = float(s.iloc[0]);  v23 = float(s.iloc[-1])
+                        if not (np.isnan(v09) or np.isnan(v23)):
+                            yoy_rows.append({"Company": co.split()[0],
+                                "2009": f"{v09:.3f}", "2023": f"{v23:.3f}",
+                                "Change": f"{(v23-v09)/v09*100:+.1f}%"})
+                if yoy_rows:
+                    st.markdown("**CO₂ intensity 2009 → 2023**")
+                    st.dataframe(_pd.DataFrame(yoy_rows).set_index("Company"),
+                        use_container_width=True, height=220)
+
+    # ── TAB 3: PATHWAY 3 — DSS EMPLOYEES ONLY ────────────────────────────────
+    if is_dss_user and tab_p3 is not None:
+     with tab_p3:
+        st.markdown("##### Pathway 3 — Water withdrawals & intensity")
+        st.caption("KPI 3: Total water intake (m³) · Water intensity (m³ / metric T of production)")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            f = go.Figure([_line(yrs, water_total, "Water withdrawals (M m³)", C["teal"],
+                fill="tozeroy", fill_color="rgba(8,145,178,.08)")])
+            f.update_layout(**_layout("Sector water withdrawals (M m³)", 280))
+            st.plotly_chart(f, use_container_width=True)
+        with c2:
+            f = go.Figure([_line(yrs, water_kpi_v, "Water intensity (m³/T)", C["teal"])])
+            f.add_hrect(y0=5.5, y1=7.5, fillcolor="rgba(0,145,110,.07)", line_width=0,
+                annotation_text="Target range", annotation_font_size=10)
+            f.update_layout(**_layout("Water intensity — m³ per metric ton", 280))
+            st.plotly_chart(f, use_container_width=True)
+
+        if has_wide and companies:
+            f = go.Figure()
+            for i, co in enumerate(companies):
+                s = _co_series(co, "Water intake - KPI")
+                if s is not None:
+                    vals = [float(v) if not np.isnan(float(v)) else None for v in s.values]
+                    f.add_trace(go.Scatter(x=yrs, y=vals, name=co.split()[0],
+                        mode="lines+markers",
+                        line=dict(color=PALETTE_10[i % 10], width=1.5),
+                        marker=dict(size=3),
+                        hovertemplate=f"{co.split()[0]}: %{{y:.2f}} m³/T<extra></extra>"))
+            f.add_trace(go.Scatter(x=yrs, y=water_kpi_v, name="Sector avg",
+                mode="lines", line=dict(color="#000", width=2, dash="dot")))
+            f.update_layout(**_layout(
+                "Water intensity (m³/T) — per company vs sector average", 310, legend_h=False))
+            st.plotly_chart(f, use_container_width=True)
+
+            c3, c4 = st.columns(2)
+            with c3:
+                co_wkpi = {}
+                for co in companies:
+                    s = _co_series(co, "Water intake - KPI")
+                    if s is not None:
+                        v = float(s.iloc[-1])
+                        if not np.isnan(v): co_wkpi[co.split()[0]] = v
+                if co_wkpi:
+                    pairs = sorted(co_wkpi.items(), key=lambda x: x[1])
+                    names, vals = zip(*pairs)
+                    f = go.Figure(go.Bar(x=list(vals), y=list(names), orientation="h",
+                        marker_color=[C["green"] if v<7.0 else C["amber"] for v in vals],
+                        marker_line_width=0,
+                        hovertemplate="%{x:.2f} m³/T<extra>%{y}</extra>"))
+                    f.update_layout(**_layout("Water intensity ranking — 2023 (m³/T)",
+                        260, legend_h=False))
+                    st.plotly_chart(f, use_container_width=True)
+            with c4:
+                if "Water intake" in df.columns and "Production" in df.columns:
+                    yr_df = df[df["Year"]==2023].dropna(subset=["Water intake","Production"])
+                    if not yr_df.empty:
+                        f = go.Figure()
+                        for idx, (_, row) in enumerate(yr_df.iterrows()):
+                            f.add_trace(go.Scatter(
+                                x=[row["Production"]/1e6], y=[row["Water intake"]/1e6],
+                                name=str(row["Company"]).split()[0],
+                                mode="markers+text",
+                                text=[str(row["Company"]).split()[0]],
+                                textposition="top center",
+                                marker=dict(size=12, color=PALETTE_10[idx % 10])))
+                        f.update_layout(**_layout("Water vs production — 2023", 260,
+                            legend_h=False,
+                            xaxis=dict(title="Production (M T)", gridcolor=C["grid"]),
+                            yaxis=dict(title="Water (M m³)", gridcolor=C["grid"])))
+                        st.plotly_chart(f, use_container_width=True)
+
+    # ── TAB 4: PATHWAY 4 — DSS EMPLOYEES ONLY ────────────────────────────────
+    if is_dss_user and tab_p4 is not None:
+     with tab_p4:
+        st.markdown("##### Pathway 4 — Waste management & environmental certification")
+        st.caption("KPI 4a: Total waste & recovery rate · KPI 4b: ISO 14001 site certification")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            f = go.Figure()
+            f.add_trace(go.Bar(x=yrs, y=waste_recov_a, name="Recovered (T)",
+                marker_color="rgba(0,145,110,.75)", marker_line_width=0,
+                hovertemplate="Recovered: %{y:,.0f} T<extra></extra>"))
+            f.add_trace(go.Bar(x=yrs,
+                y=[t-r for t,r in zip(waste_total_v, waste_recov_a)],
+                name="Eliminated (T)", marker_color="rgba(200,16,46,.4)", marker_line_width=0,
+                hovertemplate="Eliminated: %{y:,.0f} T<extra></extra>"))
+            f.update_layout(**_layout("Waste — recovery vs elimination (metric T)", 280,
+                barmode="stack", yaxis=dict(gridcolor=C["grid"])))
+            st.plotly_chart(f, use_container_width=True)
+        with c2:
+            f = go.Figure(go.Scatter(x=yrs, y=waste_recov, name="Recovery rate",
+                fill="tozeroy", fillcolor="rgba(0,145,110,.10)",
+                line=dict(color=C["green"], width=2),
+                hovertemplate="Recovery: %{y:.1f}%<extra></extra>"))
+            f.update_layout(**_layout("Waste recovery rate — sector average (%)", 280,
+                yaxis=dict(range=[50,100], ticksuffix="%", gridcolor=C["grid"])))
+            st.plotly_chart(f, use_container_width=True)
+
+        if has_wide and companies:
+            c3, c4 = st.columns(2)
+            with c3:
+                co_wr = {}
+                for co in companies:
+                    s = _co_series(co, "Waste_Recovery_Rate_%")
+                    if s is None: s = _co_series(co, "Recovery Rate")
+                    if s is not None:
+                        v = float(s.iloc[-1])
+                        if not np.isnan(v): co_wr[co.split()[0]] = v
+                if co_wr:
+                    pairs = sorted(co_wr.items(), key=lambda x: x[1], reverse=True)
+                    names, vals = zip(*pairs)
+                    f = go.Figure(go.Bar(x=list(names), y=list(vals),
+                        marker_color=[C["green"] if v>=80 else C["amber"] for v in vals],
+                        marker_line_width=0,
+                        hovertemplate="%{y:.1f}%<extra>%{x}</extra>"))
+                    f.add_hline(y=80, line_dash="dot", line_color=C["navy"],
+                        annotation_text="80% target", annotation_font_size=10)
+                    f.update_layout(**_layout("Waste recovery by company — 2023 (%)", 260,
+                        yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
+                    st.plotly_chart(f, use_container_width=True)
+            with c4:
+                f = go.Figure(go.Bar(x=yrs, y=iso_cert,
+                    marker_color="rgba(10,34,64,.75)", marker_line_width=0,
+                    hovertemplate="%{y:.1f}%<extra>ISO 14001</extra>"))
+                f.add_hline(y=100, line_dash="dot", line_color=C["green"],
+                    annotation_text="100% target", annotation_font_size=10)
+                f.update_layout(**_layout("ISO 14001 certification rate — sector (%)", 260,
+                    yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
+                st.plotly_chart(f, use_container_width=True)
+
+            import pandas as _pd2
+            iso_rows = {}
+            for co in companies:
+                s = _co_series(co, "ISO_Certification_%")
+                if s is not None:
+                    iso_rows[co.split()[0]] = [
+                        round(float(v),1) if not np.isnan(float(v)) else 0.0
+                        for v in s.values]
+            if iso_rows:
+                heat_df = _pd2.DataFrame(iso_rows, index=yrs).T
+                f = go.Figure(go.Heatmap(
+                    z=heat_df.values.tolist(),
+                    x=heat_df.columns.tolist(),
+                    y=heat_df.index.tolist(),
+                    colorscale=[[0,"#FEF2F2"],[0.5,"#FDE68A"],[1,"#ECFDF5"]],
+                    text=[[f"{v:.0f}%" for v in row] for row in heat_df.values],
+                    texttemplate="%{text}", textfont=dict(size=9),
+                    zmin=0, zmax=100,
+                    hovertemplate="%{y} %{x}: %{z:.1f}%<extra></extra>",
+                    colorbar=dict(title="% certified", ticksuffix="%")))
+                f.update_layout(**_layout(
+                    "ISO 14001 certification (% of sites) per company — all years",
+                    220 + len(iso_rows)*18, legend_h=False,
+                    margin=dict(l=100,r=30,t=40,b=30),
+                    xaxis=dict(tickangle=-45, gridcolor=C["grid"]),
+                    yaxis=dict(gridcolor=C["grid"])))
+                st.plotly_chart(f, use_container_width=True)
 
 
 # ─────────────────────────────────────────────────────────

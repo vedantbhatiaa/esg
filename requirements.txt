@@ -1,27 +1,27 @@
 # TIP ESG Platform — Python dependencies
 # Install: pip install -r requirements.txt
 
-# Frontend
+# ── Frontend ──────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
 
-# Data
+# ── Data ──────────────────────────────────────────────────────────────────────
 pandas>=2.0.0
 numpy>=1.24.0
 openpyxl>=3.1.0
+pyarrow>=14.0.0          # required for .to_parquet() / .read_parquet() (audit trail)
 
-# Parquet support (required for audit trail versioning)
-# M8 FIX: pyarrow was missing; pandas .to_parquet() / .read_parquet() require it
-pyarrow>=14.0.0
-
-# Charts
+# ── Charts ────────────────────────────────────────────────────────────────────
 plotly>=5.18.0
 
-# File locking (prevents concurrent CSV write corruption — H1 fix)
+# ── File locking (prevents concurrent CSV write corruption) ───────────────────
 filelock>=3.13.0
 
-# Microsoft 365 / Azure OpenAI
+# ── Microsoft 365 / Azure ─────────────────────────────────────────────────────
 msal>=1.28.0
 requests>=2.31.0
 
-# Utilities
+# ── Chatbot ───────────────────────────────────────────────────────────────────
+duckduckgo-search>=5.3.0  # web search for analytical ESG questions (no API key)
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0

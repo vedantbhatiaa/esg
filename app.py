@@ -16,7 +16,17 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import html as _html          # H3: HTML-escape user-derived values before unsafe_allow_html
+import logging
 from filelock import FileLock  # H1: advisory lock for concurrent CSV writes
+
+import config as cfg           # central config — all paths, year bounds, secrets
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+_log = logging.getLogger("esg_app")
 
 from formula_engine import (
     TemplateInputs, calculate, validate_submission,
@@ -210,6 +220,18 @@ COMPANIES = _COMPANIES if _COMPANIES else [
     "ThetaDrive NV", "IotaTire PLC",
 ]
 
+# ── Year bounds — dynamic from real data, config-driven fallback ─────────────
+# cfg.refresh_year_bounds() updates cfg.DATA_YEAR_START / DATA_YEAR_END in-place
+cfg.refresh_year_bounds(_CONSOLIDATED_DF)
+HIST_YEARS = cfg.hist_years()   # e.g. [2009..2022]
+CURR_YEAR  = cfg.curr_year()    # e.g. 2023
+LONG_YEARS = cfg.long_years()   # e.g. [2009..2023]
+
+# ── Client auth mapping — loaded from config (secrets.toml or env var) ───────
+# In production set CLIENTS_JSON in secrets.toml. Demo fallback in config.py.
+CLIENTS = cfg.load_clients()
+DSS_DOMAIN = cfg.DSS_EMAIL_DOMAIN
+
 # -- Static fallback HIST_RAW (used only if no company selected yet) -----------
 HIST_RAW: dict[str, list] = {
     "total_sites":   [38,39,40,40,41,42,43,44,46,48,51,51,52,52],
@@ -290,7 +312,7 @@ def _build_long_data() -> tuple[dict, dict]:
                 }
                 return live, static_fuel
             except Exception as e:
-                print(f"[app] Sector DF error: {e}")
+                _log.warning("[app] Sector DF error: %s", e)
         return static_long, static_fuel
 
     # Wide format -- compute directly from master DataFrame
@@ -359,7 +381,7 @@ def _build_long_data() -> tuple[dict, dict]:
         return live, live_fuel if any(sum(v) > 0 for v in live_fuel.values()) else static_fuel
 
     except Exception as e:
-        print(f"[app] Wide DF live computation error: {e}")
+        _log.warning("[app] Wide DF live computation error: %s", e)
         return static_long, static_fuel
 
 
@@ -572,7 +594,7 @@ def show_login():
 
             if st.button("Sign in", type="primary", use_container_width=True):
                 email_l   = email.strip().lower()
-                is_dss    = "@consultdss.com" in email_l
+                is_dss    = DSS_DOMAIN in email_l
                 is_client = email_l in CLIENTS
                 if not is_dss and not is_client:
                     st.error("Email not recognised. Try employee@consultdss.com or verdatyres@tip-reporting.com")
@@ -1024,7 +1046,7 @@ def _save_submission_to_csv(inp, out) -> str:
     # Timeout=10s: if another process holds the lock and crashes, we don't
     # block forever.  The PermissionError branch below still handles Excel locks.
     lock_path = csv_path.with_suffix(".lock")
-    with FileLock(str(lock_path), timeout=10):
+    with FileLock(str(lock_path), timeout=cfg.FILELOCK_TIMEOUT):
         existing = _load_best_existing()
         mask     = ~((existing["Company"] == inp.company) & (existing["Year"] == inp.year))
         existing = existing[mask]
@@ -1425,15 +1447,13 @@ def _update_tip_members_file(master_path: "Path", tip_master_path: "Path") -> No
     try:
         master_df = pd.read_csv(master_path)
     except Exception as e:
-        print(f"[tip_members] Could not read master to rebuild tip members: {e}")
+        _log.error("[tip_members] Could not read master to rebuild tip members: %s", e)
         return
 
-    # In the current dataset all companies are TIP members, so TIP aggregate
-    # is identical to master — but strip all-zero electricity country columns.
     try:
         _drop_zero_elec_cols(master_df).to_csv(tip_master_path, index=False)
     except Exception as e:
-        print(f"[tip_members] Could not write: {e}")
+        _log.error("[tip_members] Could not write TIP members file: %s", e)
 
 
 
@@ -1508,7 +1528,7 @@ def _save_electricity_to_master(company: str, year: int) -> str:
     try:
         # H1 FIX: use the same advisory lock as the KPI save path
         lock_path = csv_path.with_suffix(".lock")
-        with FileLock(str(lock_path), timeout=10):
+        with FileLock(str(lock_path), timeout=cfg.FILELOCK_TIMEOUT):
             master.to_csv(csv_path, index=False)
     except PermissionError:
         return "Master CSV is open in Excel — close it and try again."

@@ -1,4 +1,4 @@
-# ── Python ────────────────────────────────────────────────────────────────────
+# ── Python bytecode ───────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -15,32 +15,17 @@ venv/
 env/
 ENV/
 
-# ── Environment / secrets ──────────────────────────────────────────────────────
-# H4 FIX: .env must never be committed — it contains Azure credentials
+# ── Secrets — NEVER commit real credentials ───────────────────────────────────
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
 
-# ── Jupyter notebooks — strip outputs before committing ───────────────────────
-# H6 FIX: committed notebooks can contain real client data in cell outputs.
-# Use `nbstripout` as a pre-commit hook (pip install nbstripout; nbstripout --install)
-*.ipynb
 
-# ── Data storage — real client ESG data must NEVER enter version control ──────
-# H4 FIX: the data_storage/ tree is excluded entirely.
-# Seed/sample data lives in data_storage/sample/ and is explicitly allowed below.
-data_storage/master/
-data_storage/members/
-data_storage/versions/
-data_storage/reports/
-data_storage/raw/
+# ── Advisory lock files (transient — created by filelock during CSV writes) ───
+*.lock
 
-# Allow the folder scaffolding to exist but not the files inside
-!data_storage/
-!data_storage/sample/
-!data_storage/sample/**
-
-# ── Mock storage (dev artefact) ───────────────────────────────────────────────
+# ── Mock storage (local dev artefact, not real data) ─────────────────────────
 mock_storage/
 
 # ── OS artefacts ──────────────────────────────────────────────────────────────
@@ -56,7 +41,3 @@ desktop.ini
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
-*.lock
-
-# Allow the filelock advisory lock files in tmp — they are transient
-!data_storage/*.lock

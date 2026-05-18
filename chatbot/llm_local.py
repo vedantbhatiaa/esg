@@ -19,12 +19,17 @@ Speed improvements:
 from __future__ import annotations
 import os
 import json
+import logging
 import requests
 from typing import Optional, Generator
 
-OLLAMA_BASE_URL      = "http://localhost:11434"
-OLLAMA_DEFAULT_MODEL = "phi3"
-HF_DEFAULT_MODEL     = "mistralai/Mistral-7B-Instruct-v0.3"
+import config as cfg
+
+logger = logging.getLogger(__name__)
+
+OLLAMA_BASE_URL      = cfg.OLLAMA_BASE_URL       # "http://localhost:11434" or from secrets
+OLLAMA_DEFAULT_MODEL = cfg.OLLAMA_DEFAULT_MODEL   # "phi3" or from secrets
+HF_DEFAULT_MODEL     = cfg.HF_DEFAULT_MODEL       # mistral or from secrets
 
 
 def _get_secret(key: str, default: str = "") -> str:
@@ -33,8 +38,8 @@ def _get_secret(key: str, default: str = "") -> str:
         val = st.secrets.get(key, "")
         if val:
             return str(val)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[llm_local] _get_secret(%s) streamlit read failed: %s", key, e)
     return os.environ.get(key, default)
 
 
@@ -157,11 +162,11 @@ class LocalLLMEngine:
         payload = {
             "model":    model,
             "messages": full_messages,
-            "stream":   True,   # ← streaming enabled
+            "stream":   True,
             "options":  {
-                "temperature": 0.3,
-                "num_predict": 500,
-                "num_ctx":     2048,
+                "temperature": cfg.OLLAMA_TEMPERATURE,
+                "num_predict": cfg.OLLAMA_NUM_PREDICT,
+                "num_ctx":     cfg.OLLAMA_NUM_CTX,
             },
         }
         try:
@@ -169,7 +174,7 @@ class LocalLLMEngine:
                 f"{self.ollama_url}/api/chat",
                 json=payload,
                 stream=True,
-                timeout=300,
+                timeout=cfg.OLLAMA_TIMEOUT,
             )
             if resp.status_code != 200:
                 yield f"❌ Ollama error {resp.status_code}: {resp.text[:200]}"
@@ -224,13 +229,17 @@ class LocalLLMEngine:
             "model":    model,
             "messages": full_messages,
             "stream":   False,
-            "options":  {"temperature": 0.3, "num_predict": 500, "num_ctx": 2048},
+            "options":  {
+                "temperature": cfg.OLLAMA_TEMPERATURE,
+                "num_predict": cfg.OLLAMA_NUM_PREDICT,
+                "num_ctx":     cfg.OLLAMA_NUM_CTX,
+            },
         }
         try:
             resp = requests.post(
                 f"{self.ollama_url}/api/chat",
                 json=payload,
-                timeout=300,
+                timeout=cfg.OLLAMA_TIMEOUT,
             )
             if resp.status_code == 500:
                 return "❌ Ollama returned an error. Try a shorter question."

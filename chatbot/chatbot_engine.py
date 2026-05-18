@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import re
-import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -23,27 +22,41 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 
+import logging
+
 from chatbot.llm_local import LocalLLMEngine
 from chatbot.web_search import ESGWebSearch
+import config as cfg
 
-MASTER_CSV = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
-LOG_DIR    = Path("data_storage/chat_logs")
+logger = logging.getLogger(__name__)
+
+MASTER_CSV = cfg.MASTER_CSV   # single source of truth — no hardcoded paths
+LOG_DIR    = cfg.LOGS_DIR
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Short system prompt — local models need brevity ───────────────────────────
-SYSTEM_PROMPT = """You are an ESG data analyst at dss+ consulting, analysing tire manufacturer KPIs (2009-2023) for the WBCSD Tire Industry Project (TIP).
 
-Companies: VerdaTyres Corp, AlphaTread Ltd, BetaRubber Inc, GammaTire SA, DeltaGrip GmbH, EpsilonWheel Co, ZetaTrac LLC, EtaRoad AG, ThetaDrive NV, IotaTire PLC.
-
-When asked to create a chart, output ONLY this JSON block (replace values):
-```chart_spec
-{"chart_type":"line","title":"Chart title","x_col":"Year","y_cols":["Total CO2"],"companies":["all"],"year_range":[2009,2023],"color_by":"Company"}
-```
-chart_type: line, bar, grouped_bar, area, scatter
-y_cols must be exact column names from the data summary provided.
-
-For analysis questions: Key Finding → Trend → External Factors → Recommendation.
-Be concise. Use numbers from the data provided."""
+def _build_system_prompt(companies: list[str], year_start: int, year_end: int) -> str:
+    """
+    Build the LLM system prompt dynamically from real data.
+    Company names and year bounds are never hardcoded — they come from the
+    loaded DataFrame so the prompt is always accurate after data updates.
+    """
+    co_list = ", ".join(companies) if companies else "TIP member companies"
+    return (
+        f"You are an ESG data analyst at dss+ consulting, analysing tire manufacturer "
+        f"KPIs ({year_start}–{year_end}) for the WBCSD Tire Industry Project (TIP).\n\n"
+        f"Companies: {co_list}.\n\n"
+        "When asked to create a chart, output ONLY this JSON block (replace values):\n"
+        "```chart_spec\n"
+        '{"chart_type":"line","title":"Chart title","x_col":"Year",'
+        '"y_cols":["Total CO2"],"companies":["all"],'
+        f'"year_range":[{year_start},{year_end}],"color_by":"Company"}}\n'
+        "```\n"
+        "chart_type: line, bar, grouped_bar, area, scatter\n"
+        "y_cols must be exact column names from the data summary provided.\n\n"
+        "For analysis questions: Key Finding → Trend → External Factors → Recommendation.\n"
+        "Be concise. Use numbers from the data provided."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,7 +301,7 @@ class GraphBuilder:
             fig.update_yaxes(showgrid=True, gridcolor="#E5E7EB")
             return fig
         except Exception as e:
-            print(f"[GraphBuilder] {e}")
+            logger.warning("[GraphBuilder] Chart build error: %s", e)
             return None
 
 
@@ -298,31 +311,39 @@ class GraphBuilder:
 class ChatLogger:
     def __init__(self, username: str):
         safe = username.replace(" ", "_").replace("@", "_").replace(".", "_")[:20]
-        uid  = hashlib.md5(username.encode()).hexdigest()[:8]
+        # SHA-256 is the standard; MD5 is cryptographically broken even for non-secret use
+        import hashlib
+        uid  = hashlib.sha256(username.encode()).hexdigest()[:8]
         week = datetime.now().strftime("%Y-W%V")
         self.path = LOG_DIR / f"{safe}_{uid}_{week}.jsonl"
 
     def log(self, question: str, answer: str,
             query_type: str = "factual", had_chart: bool = False) -> None:
         entry = {
-            "ts": datetime.now().isoformat(),
-            "question": question,
-            "answer": answer[:1500],
+            "ts":         datetime.now().isoformat(),
+            "question":   question,
+            "answer":     answer[:1500],
             "query_type": query_type,
-            "had_chart": had_chart,
+            "had_chart":  had_chart,
         }
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning("[ChatLogger] Could not write log: %s", e)
 
     @staticmethod
-    def purge_old_logs(days: int = 8) -> None:
-        cutoff = datetime.now() - timedelta(days=days)
+    def purge_old_logs(days: int = None) -> None:
+        """Remove log files older than `days` days. Default from config."""
+        retention = days if days is not None else cfg.LOG_RETENTION_DAYS
+        cutoff = datetime.now() - timedelta(days=retention)
         for p in LOG_DIR.glob("*.jsonl"):
             try:
                 if datetime.fromtimestamp(p.stat().st_mtime) < cutoff:
                     p.unlink()
-            except Exception:
-                pass
+                    logger.info("[ChatLogger] Purged old log: %s", p.name)
+            except Exception as e:
+                logger.warning("[ChatLogger] Could not purge %s: %s", p.name, e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -337,12 +358,26 @@ class ESGChatbot:
         self.copilot       = LocalLLMEngine()
         self.search        = ESGWebSearch()
         self.history: list = []
-        self.system_prompt = SYSTEM_PROMPT  # exposed for streaming UI
-        ChatLogger.purge_old_logs(days=8)
-        self.logger        = ChatLogger(username)
+
+        # Build system prompt dynamically from actual data — no hardcoded company names
+        self._rebuild_system_prompt()
+
+        ChatLogger.purge_old_logs()   # uses cfg.LOG_RETENTION_DAYS
+        self.logger = ChatLogger(username)
+
+    def _rebuild_system_prompt(self) -> None:
+        """Regenerate SYSTEM_PROMPT from current data context. Call after data reload."""
+        companies  = self.context.companies()
+        year_start = cfg.DATA_YEAR_START
+        year_end   = cfg.DATA_YEAR_END
+        if not companies:
+            # Fallback if data isn't loaded yet — will be rebuilt on first chat()
+            companies = []
+        self.system_prompt = _build_system_prompt(companies, year_start, year_end)
 
     def reload_data(self):
         self.context.reload()
+        self._rebuild_system_prompt()  # keep prompt in sync with new data
 
     def chat(self, question: str) -> "ChatResponse":
         query_type = self.classifier.classify(question)

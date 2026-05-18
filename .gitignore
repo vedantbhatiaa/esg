@@ -1,0 +1,62 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Environment / secrets ──────────────────────────────────────────────────────
+# H4 FIX: .env must never be committed — it contains Azure credentials
+.env
+.env.*
+!.env.example
+
+# ── Jupyter notebooks — strip outputs before committing ───────────────────────
+# H6 FIX: committed notebooks can contain real client data in cell outputs.
+# Use `nbstripout` as a pre-commit hook (pip install nbstripout; nbstripout --install)
+*.ipynb
+
+# ── Data storage — real client ESG data must NEVER enter version control ──────
+# H4 FIX: the data_storage/ tree is excluded entirely.
+# Seed/sample data lives in data_storage/sample/ and is explicitly allowed below.
+data_storage/master/
+data_storage/members/
+data_storage/versions/
+data_storage/reports/
+data_storage/raw/
+
+# Allow the folder scaffolding to exist but not the files inside
+!data_storage/
+!data_storage/sample/
+!data_storage/sample/**
+
+# ── Mock storage (dev artefact) ───────────────────────────────────────────────
+mock_storage/
+
+# ── OS artefacts ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+*.lock
+
+# Allow the filelock advisory lock files in tmp — they are transient
+!data_storage/*.lock

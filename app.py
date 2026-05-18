@@ -15,6 +15,8 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+import html as _html          # H3: HTML-escape user-derived values before unsafe_allow_html
+from filelock import FileLock  # H1: advisory lock for concurrent CSV writes
 
 from formula_engine import (
     TemplateInputs, calculate, validate_submission,
@@ -363,6 +365,11 @@ def _build_long_data() -> tuple[dict, dict]:
 
 LONG_DATA, FUEL_MIX = _build_long_data()
 
+# L2 FIX: track whether analysis charts are showing real or fallback data.
+# Surfaced as a warning banner in page_analysis() so analysts never mistake
+# synthetic demo numbers for real client submissions.
+_USING_FALLBACK_DATA = _CONSOLIDATED_DF.empty
+
 CLIENTS = {
     "verdatyres@tip-reporting.com":   "VerdaTyres Corp",
     "alphatread@tip-reporting.com":   "AlphaTread Ltd",
@@ -497,13 +504,15 @@ def get_hist_outputs():
 
 
 def kpi_card_html(label, value, unit, delta, delta_positive=True):
+    # H3 FIX: escape every caller-supplied string before injecting into HTML
+    e = _html.escape
     delta_cls = "delta-pos" if delta_positive else "delta-neg"
     arrow = "▼" if delta_positive else "▲"
     return f"""<div class="kpi-card">
-        <div class="label">{label}</div>
-        <div class="value">{value}</div>
-        <div class="unit">{unit}</div>
-        <div class="delta {delta_cls}">{arrow} {delta}</div>
+        <div class="label">{e(str(label))}</div>
+        <div class="value">{e(str(value))}</div>
+        <div class="unit">{e(str(unit))}</div>
+        <div class="delta {delta_cls}">{arrow} {e(str(delta))}</div>
     </div>"""
 
 
@@ -520,9 +529,11 @@ def band_html(label, val, q25, median, q75, unit, lower_better=True):
         top_cls = "chip-top" if val >= q75 else "chip-mid" if val >= median else "chip-bot"
         top_lbl = "Top 25%"  if val >= q75 else "Average"  if val >= median else "Below avg"
     val_str = f"{val:.3f}" if isinstance(val, float) and val < 10 else fmt_num(val)
+    # H3 FIX: escape label before injecting into HTML
+    e = _html.escape
     return f"""
     <div class="band-row-wrap">
-      <div class="band-lbl">{label}</div>
+      <div class="band-lbl">{e(str(label))}</div>
       <div class="band-track">
         <div class="band-seg" style="left:0%;width:25%;background:#D1FAE5;border-radius:4px 0 0 4px"></div>
         <div class="band-seg" style="left:25%;width:50%;background:#FEF3C7"></div>
@@ -592,10 +603,12 @@ def show_sidebar():
         """, unsafe_allow_html=True)
 
         if not st.session_state.is_dss:
+            # H3 FIX: escape company name before HTML injection
+            _safe_co = _html.escape(st.session_state.user_company)
             st.markdown(f"""
             <div style="margin:10px 12px 0;padding:10px 12px;background:rgba(255,255,255,.06);border-radius:8px">
               <div style="color:rgba(255,255,255,.4);font-size:10px;text-transform:uppercase;letter-spacing:.6px">Company</div>
-              <div style="color:#fff;font-size:13px;font-weight:500;margin-top:3px">{st.session_state.user_company}</div>
+              <div style="color:#fff;font-size:13px;font-weight:500;margin-top:3px">{_safe_co}</div>
             </div>""", unsafe_allow_html=True)
 
         st.markdown('<div style="padding:12px 8px 4px;color:rgba(255,255,255,.3);font-size:10px;text-transform:uppercase;letter-spacing:.7px">Data & Reports</div>', unsafe_allow_html=True)
@@ -623,14 +636,19 @@ def show_sidebar():
                         st.rerun()
 
         st.markdown("---")
-        name_init = "".join(p[0].upper() for p in st.session_state.user_name.split()[:2])
-        role_lbl  = "dss+ Employee" if st.session_state.is_dss else f"Client · {st.session_state.user_company}"
+        # H3 FIX: escape all user-derived values before HTML injection
+        name_init = _html.escape(
+            "".join(p[0].upper() for p in st.session_state.user_name.split()[:2])
+        )
+        _safe_name = _html.escape(st.session_state.user_name)
+        role_lbl   = "dss+ Employee" if st.session_state.is_dss else f"Client · {st.session_state.user_company}"
+        _safe_role = _html.escape(role_lbl)
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:9px">
           <div style="width:32px;height:32px;border-radius:50%;background:#00916E;color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0">{name_init}</div>
           <div>
-            <div style="color:#fff;font-size:13px;font-weight:500">{st.session_state.user_name}</div>
-            <div style="color:rgba(255,255,255,.4);font-size:11px">{role_lbl}</div>
+            <div style="color:#fff;font-size:13px;font-weight:500">{_safe_name}</div>
+            <div style="color:rgba(255,255,255,.4);font-size:11px">{_safe_role}</div>
           </div>
         </div>""", unsafe_allow_html=True)
         if st.button("Sign out", use_container_width=True):
@@ -1001,48 +1019,54 @@ def _save_submission_to_csv(inp, out) -> str:
         return _align(best)
 
     # ── 1. Build combined DataFrame ──────────────────────────────────────────
-    existing = _load_best_existing()
-    mask     = ~((existing["Company"] == inp.company) & (existing["Year"] == inp.year))
-    existing = existing[mask]
-    combined = pd.concat([existing, new_row], ignore_index=True)
-    combined = combined.sort_values(["Company", "Year"]).reset_index(drop=True)
+    # H1 FIX: advisory file lock held for the full read-modify-write cycle.
+    # Prevents data corruption if two analysts save simultaneously.
+    # Timeout=10s: if another process holds the lock and crashes, we don't
+    # block forever.  The PermissionError branch below still handles Excel locks.
+    lock_path = csv_path.with_suffix(".lock")
+    with FileLock(str(lock_path), timeout=10):
+        existing = _load_best_existing()
+        mask     = ~((existing["Company"] == inp.company) & (existing["Year"] == inp.year))
+        existing = existing[mask]
+        combined = pd.concat([existing, new_row], ignore_index=True)
+        combined = combined.sort_values(["Company", "Year"]).reset_index(drop=True)
 
-    n_records   = len(combined)
-    n_companies = combined["Company"].nunique()
+        n_records   = len(combined)
+        n_companies = combined["Company"].nunique()
 
-    # ── 2. Save version Parquet BEFORE touching master (audit trail first) ───
-    version_filename = _save_version_parquet(inp, combined)
+        # ── 2. Save version Parquet BEFORE touching master (audit trail first) ───
+        version_filename = _save_version_parquet(inp, combined)
 
-    # ── 3. Write master CSV, then sync all dependent files ───────────────────
-    try:
-        # Master CSV keeps all country columns (even all-zero) as the full schema.
-        # Derived outputs (member files, TIP aggregate) strip all-zero country cols.
-        combined.to_csv(csv_path, index=False)
-        # Sync TIP members aggregate
-        tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
-        _update_tip_members_file(csv_path, tip_master_path)
-        # Sync per-company member files
-        _sync_company_member_files(combined)
-        # Sync CONSOLIDATED_DUMMY Excel
-        _sync_consolidate_excel(combined)
-        return (f"✅ Saved {inp.company} — {inp.year}. "
-                f"Master: {n_records} records across {n_companies} companies. "
-                f"Version: {version_filename}")
-    except PermissionError:
-        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"ESG_MASTER_{inp.company.replace(' ','_')}_{inp.year}_{ts}.csv"
-        backup_path = csv_path.parent / backup_name
+        # ── 3. Write master CSV, then sync all dependent files ───────────────────
         try:
-            combined.to_csv(backup_path, index=False)
-            return (
-                f"⚠️ Master file open in Excel — saved backup: **{backup_name}**\n"
-                f"Version snapshot: {version_filename}\n"
-                f"Close Excel and click Save again."
-            )
-        except Exception as e2:
-            return f"❌ Save failed (file locked AND backup failed): {e2}"
-    except Exception as e:
-        return f"❌ Save failed: {e}"
+            # Master CSV keeps all country columns (even all-zero) as the full schema.
+            # Derived outputs (member files, TIP aggregate) strip all-zero country cols.
+            combined.to_csv(csv_path, index=False)
+            # Sync TIP members aggregate
+            tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
+            _update_tip_members_file(csv_path, tip_master_path)
+            # Sync per-company member files
+            _sync_company_member_files(combined)
+            # Sync CONSOLIDATED_DUMMY Excel
+            _sync_consolidate_excel(combined)
+            return (f"✅ Saved {inp.company} — {inp.year}. "
+                    f"Master: {n_records} records across {n_companies} companies. "
+                    f"Version: {version_filename}")
+        except PermissionError:
+            ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"ESG_MASTER_{inp.company.replace(' ','_')}_{inp.year}_{ts}.csv"
+            backup_path = csv_path.parent / backup_name
+            try:
+                combined.to_csv(backup_path, index=False)
+                return (
+                    f"⚠️ Master file open in Excel — saved backup: **{backup_name}**\n"
+                    f"Version snapshot: {version_filename}\n"
+                    f"Close Excel and click Save again."
+                )
+            except Exception as e2:
+                return f"❌ Save failed (file locked AND backup failed): {e2}"
+        except Exception as e:
+            return f"❌ Save failed: {e}"
 
 
 def page_entry():
@@ -1257,7 +1281,7 @@ def render_template_table():
           Tire Industry Project — Key Performance Indicators
         </div>
         <div style="font-size:26px;font-weight:800;color:#00916E;margin-top:5px;letter-spacing:-.4px">
-          {company}
+          {_html.escape(company)}
         </div>
         <div style="font-size:12px;color:#9CA3AF;margin-top:4px">Corporate units · ESG KPI Template — {rep_year}</div>
       </div>
@@ -1482,7 +1506,10 @@ def _save_electricity_to_master(company: str, year: int) -> str:
         return f"No KPI rows found for {company}. Save KPI data first."
 
     try:
-        master.to_csv(csv_path, index=False)
+        # H1 FIX: use the same advisory lock as the KPI save path
+        lock_path = csv_path.with_suffix(".lock")
+        with FileLock(str(lock_path), timeout=10):
+            master.to_csv(csv_path, index=False)
     except PermissionError:
         return "Master CSV is open in Excel — close it and try again."
 
@@ -1796,6 +1823,16 @@ def page_analysis():
     data_src = "live consolidated data" if not _CONSOLIDATED_DF.empty else "built-in demo data"
     st.markdown("## Analysis & Trends")
     st.caption(f"Sector aggregated across all TIP member companies · Source: {data_src}")
+
+    # L2 FIX: warn clearly when no real data is loaded — prevents analysts or
+    # auditors from mistaking illustrative fallback numbers for real submissions.
+    if _USING_FALLBACK_DATA:
+        st.warning(
+            "⚠️ No consolidated master CSV found — charts are showing illustrative "
+            "fallback data only. Run build_esg_master.py and save at least one "
+            "company submission to see real data here.",
+            icon=None,
+        )
 
     yrs     = [str(y) for y in LONG_YEARS]
     yrs_int = LONG_YEARS
@@ -2808,10 +2845,11 @@ def page_verification():
         title  = flag.message + (" — Approved" if resolved else "")
         detail = flag.detail
 
+        # H3 FIX: escape flag content before injecting into HTML
         st.markdown(f"""<div class="flag-card {fc}">
-          <div class="fc-icon {fi}">{icon}</div>
-          <div><div class="fc-title">{title}</div>
-               <div class="fc-detail">{detail}</div></div>
+          <div class="fc-icon {fi}">{_html.escape(icon)}</div>
+          <div><div class="fc-title">{_html.escape(title)}</div>
+               <div class="fc-detail">{_html.escape(detail)}</div></div>
         </div>""", unsafe_allow_html=True)
 
         if not resolved and flag.severity in ("warning","error"):

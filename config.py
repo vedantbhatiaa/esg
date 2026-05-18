@@ -29,11 +29,13 @@ def _secret(key: str, default: str = "") -> str:
     try:
         import streamlit as st
         val = st.secrets.get(key, "")
-        if val:
-            return str(val)
+        # Guard: val must be a plain string, not a mock object or proxy type
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
     except Exception:
         pass
-    return os.environ.get(key, default)
+    env_val = os.environ.get(key, "")
+    return env_val if env_val else default
 
 
 # ── Root paths ────────────────────────────────────────────────────────────────

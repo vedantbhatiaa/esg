@@ -15,11 +15,14 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-import html as _html          # H3: HTML-escape user-derived values before unsafe_allow_html
+import html as _html
 import logging
-from filelock import FileLock  # H1: advisory lock for concurrent CSV writes
+import os
+from pathlib import Path
+from datetime import datetime, date
+from filelock import FileLock
 
-import config as cfg           # central config — all paths, year bounds, secrets
+import config as cfg
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -45,12 +48,76 @@ _CONSOLIDATED_DF = dl.load_consolidated()
 _COMPANIES       = dl.get_companies(_CONSOLIDATED_DF)
 _SECTOR_DF       = dl.load_sector_aggregated()
 
+
+def _write_verification_status(company: str, year: int, status: str) -> None:
+    """
+    Persist DSS+ verification status for a company+year to a CSV file.
+    Status values: 'Verified', 'Pending', 'Flagged'.
+    Client home page reads this file to show the verification chip.
+    """
+    from pathlib import Path
+    import csv, os
+
+    vcsv = Path("data_storage/verifications.csv")
+    vcsv.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    if vcsv.exists():
+        with open(vcsv, newline="") as f:
+            for row in csv.DictReader(f):
+                if not (row.get("Company","").strip() == company and
+                        str(row.get("Year","")).strip() == str(year)):
+                    rows.append(row)   # keep other company/year rows
+
+    rows.append({"Company": company, "Year": str(year), "Status": status,
+                 "UpdatedBy": "dss+ Analyst"})
+
+    with open(vcsv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["Company","Year","Status","UpdatedBy"])
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _reload_consolidated_df() -> bool:
+    """
+    Force-reload the consolidated master CSV from disk and update ALL module-level
+    globals that depend on it.  Call this immediately after any successful save so
+    that every subsequent page in the same Streamlit session sees the new data.
+    """
+    global _CONSOLIDATED_DF, _COMPANIES, _SECTOR_DF, _USING_FALLBACK_DATA
+    try:
+        from pathlib import Path
+        csv_path = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
+        fresh = pd.DataFrame()
+
+        # Try storage client
+        try:
+            from storage import StorageClient
+            fresh = StorageClient.instance().load_master()
+        except Exception:
+            pass
+
+        # Direct CSV fallback
+        if fresh.empty and csv_path.exists():
+            fresh = pd.read_csv(csv_path)
+
+        if not fresh.empty and "Company" in fresh.columns and "Year" in fresh.columns:
+            _CONSOLIDATED_DF     = fresh
+            _COMPANIES           = dl.get_companies(fresh)
+            _SECTOR_DF           = dl.load_sector_aggregated()
+            _USING_FALLBACK_DATA = False
+            st.session_state["_df_version"] = st.session_state.get("_df_version", 0) + 1
+            return True
+    except Exception:
+        pass
+    return False
+
 # ─────────────────────────────────────────────────────────
 # PAGE CONFIG & GLOBAL CSS
 # ─────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="TIP ESG Platform · dss+",
-    page_icon=None,
+    page_title="TIP ESG Platform",
+    page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -188,6 +255,16 @@ st.markdown("""
 .ai-body  { padding:12px 14px; font-size:13px; color:#374151; line-height:1.8; }
 </style>
 """, unsafe_allow_html=True)
+
+# ── Animation system & design tokens ─────────────────────────────────────────
+from ui_components import (
+    inject_global_css, kpi_card_html, skeleton_card_html, skeleton_chart_html,
+    status_chip_html, section_header_html, empty_state_html, co_card_html,
+    apply_chart_animation, chart_layout_defaults, sparkline_html,
+    GREEN, AMBER, RED, NAVY, BG, BORDER, TEXT, MUTED,
+    CAT_CO2, CAT_ENERGY, CAT_WATER, CAT_WASTE, CAT_RENEW,
+)
+inject_global_css()
 
 # ─────────────────────────────────────────────────────────
 # CONSTANTS
@@ -491,51 +568,50 @@ _VALID_TEMPLATE_FIELDS = {
 
 def _get_fresh_hist(company: str = None) -> dict:
     """
-    Always load company historical data fresh from _CONSOLIDATED_DF.
-    Because _CONSOLIDATED_DF is reloaded from disk on every Streamlit rerun,
-    this automatically reflects any saves (including updates to previous years)
-    without requiring a manual reload or re-running the stepper.
-    Falls back to session state cache, then HIST_RAW if company is unknown.
+    Load company historical data for ALL available years from _CONSOLIDATED_DF.
+    Includes the current year if a row exists (e.g. after a save).
+    Falls back to HIST_RAW (static demo data) when company is unknown.
     """
     co = company or st.session_state.get("reporting_company") or st.session_state.get("user_company") or ""
     if co and not _CONSOLIDATED_DF.empty:
         hist = dl.get_company_hist(_CONSOLIDATED_DF, co)
         if hist:
-            return dl.get_hist_raw(hist, HIST_YEARS)
-    # Fallback: session state (set during company setup), then static defaults
+            # Use ALL years present in the DB, not just the pre-2023 window
+            all_years = sorted(dl.get_years(_CONSOLIDATED_DF, co) or [])
+            return dl.get_hist_raw(hist, all_years) if all_years else dl.get_hist_raw(hist, HIST_YEARS)
     return st.session_state.get("live_hist_raw") or HIST_RAW
 
 
 def get_hist_outputs():
-    # Always use fresh data from _CONSOLIDATED_DF so any saved updates
-    # (including changes to previous years) are immediately visible.
+    """
+    Return list of (year, TemplateInputs, TemplateOutputs) for ALL years in the DB.
+    Always reads from _CONSOLIDATED_DF so any saved update is immediately visible.
+    """
     company = (st.session_state.get("reporting_company") or
                st.session_state.get("user_company") or "")
+
+    # Get all years available for this company in the live data
+    if company and not _CONSOLIDATED_DF.empty:
+        all_years = sorted(dl.get_years(_CONSOLIDATED_DF, company) or [])
+    else:
+        all_years = HIST_YEARS
+
     _hist = _get_fresh_hist(company)
-    outs = []
-    for i, yr in enumerate(HIST_YEARS):
-        # Only pass keys that are valid TemplateInputs fields
+    outs  = []
+    for i, yr in enumerate(all_years):
         fields = {
             k: _hist[k][i]
             for k in _hist
-            if i < len(_hist[k]) and k in _VALID_TEMPLATE_FIELDS
+            if i < len(_hist.get(k, [])) and k in _VALID_TEMPLATE_FIELDS
         }
         inp = TemplateInputs(company=company, year=yr, **fields)
         outs.append((yr, inp, calculate(inp)))
     return outs
 
 
-def kpi_card_html(label, value, unit, delta, delta_positive=True):
-    # H3 FIX: escape every caller-supplied string before injecting into HTML
-    e = _html.escape
-    delta_cls = "delta-pos" if delta_positive else "delta-neg"
-    arrow = "▼" if delta_positive else "▲"
-    return f"""<div class="kpi-card">
-        <div class="label">{e(str(label))}</div>
-        <div class="value">{e(str(value))}</div>
-        <div class="unit">{e(str(unit))}</div>
-        <div class="delta {delta_cls}">{arrow} {e(str(delta))}</div>
-    </div>"""
+
+# kpi_card_html is imported from ui_components (see import block above).
+# The old local definition has been removed to avoid shadowing the import.
 
 
 def band_html(label, val, q25, median, q75, unit, lower_better=True):
@@ -572,108 +648,203 @@ def band_html(label, val, q25, median, q75, unit, lower_better=True):
 # LOGIN
 # ─────────────────────────────────────────────────────────
 def show_login():
-    col1, col2, col3 = st.columns([1, 1.4, 1])
-    with col2:
-        st.markdown("""
-        <div style="text-align:center;margin-bottom:28px">
-          <div style="display:inline-flex;align-items:center;gap:8px;margin-bottom:4px">
-            <div style="width:10px;height:10px;border-radius:50%;background:#00916E;display:inline-block"></div>
-            <span style="font-size:22px;font-weight:700;color:#0A2240">TIP ESG Platform</span>
-          </div>
-          <div style="font-size:13px;color:#6B7280">Tire Industry Project · Powered by dss+</div>
-        </div>
-        """, unsafe_allow_html=True)
+    # ── Dark page background ───────────────────────────────────────────────────
+    st.markdown("""<style>
+    [data-testid="stApp"]  { background:#1a1b6b !important; }
+    [data-testid="stHeader"]{ display:none !important; }
+    .main                  { background:transparent !important; }
+    .block-container       { max-width:520px !important; padding:80px 24px 40px !important; margin:auto !important; }
+    /* Card appearance for the whole block-container */
+    .block-container > div {
+        background:#f0f1f7 !important;
+        border-radius:16px !important;
+        padding:38px 40px 32px !important;
+        box-shadow:0 25px 70px rgba(0,0,0,.45) !important;
+    }
+    /* Input field styling */
+    [data-testid="stTextInput"] input {
+        background:#fff !important; border:1px solid #dde0f0 !important;
+        border-radius:7px !important; padding:11px 14px !important;
+        font-size:14px !important; color:#1a1b6b !important;
+    }
+    [data-testid="stTextInput"] label {
+        font-size:10px !important; font-weight:700 !important;
+        letter-spacing:.9px !important; color:#8b90a0 !important;
+        text-transform:uppercase !important;
+    }
+    /* Sign-in button */
+    [data-testid="stButton"] > button[kind="primary"] {
+        background:#111827 !important; color:#fff !important;
+        border:none !important; border-radius:8px !important;
+        font-size:15px !important; font-weight:500 !important;
+        padding:13px !important; letter-spacing:.1px !important;
+    }
+    [data-testid="stButton"] > button[kind="primary"]:hover {
+        background:#1f2937 !important;
+    }
+    /* Radio tabs look */
+    [data-testid="stRadio"] > div {
+        background:#e5e6ef; border-radius:8px; padding:4px;
+        display:flex; gap:4px;
+    }
+    [data-testid="stRadio"] label {
+        flex:1; text-align:center; padding:7px 12px;
+        border-radius:6px; font-size:13px; font-weight:500;
+        color:#6b7280; cursor:pointer;
+    }
+    [data-testid="stRadio"] [aria-checked="true"] + div {
+        background:#fff !important;
+    }
+    </style>""", unsafe_allow_html=True)
 
-        with st.container(border=True):
-            st.markdown("### Sign in to your workspace")
-            st.caption("dss+ employees use @consultdss.com · TIP member companies use their company email")
+    # ── Logo ──────────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="margin-bottom:4px">
+      <span style="font-size:34px;font-weight:800;color:#dc2626;font-style:italic;letter-spacing:-1px">dss</span><span
+            style="font-size:34px;font-weight:800;color:#1a1b6b;font-style:italic;letter-spacing:-1px">+</span>
+    </div>
+    <div style="font-size:10px;font-weight:600;color:#9ca3af;letter-spacing:2.5px;margin-bottom:28px">
+      PROTECT · TRANSFORM · SUSTAIN
+    </div>""", unsafe_allow_html=True)
 
-            email    = st.text_input("Email address", value="employee@consultdss.com",
-                                     placeholder="you@consultdss.com or you@company.com")
-            password = st.text_input("Password", type="password", value="demo1234")
+    # ── Role tabs ─────────────────────────────────────────────────────────────
+    role = st.radio("", ["TIP Client Company", "dss+ Analyst"],
+                    horizontal=True, key="login_role",
+                    label_visibility="collapsed")
+    st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
 
-            if st.button("Sign in", type="primary", use_container_width=True):
-                email_l   = email.strip().lower()
-                is_dss    = DSS_DOMAIN in email_l
-                is_client = email_l in CLIENTS
-                if not is_dss and not is_client:
-                    st.error("Email not recognised. Try employee@consultdss.com or verdatyres@tip-reporting.com")
-                else:
-                    name_parts = email.split("@")[0].replace(".", " ").split()
-                    name       = " ".join(p.capitalize() for p in name_parts)
-                    st.session_state.authenticated = True
-                    st.session_state.user_email    = email_l
-                    st.session_state.user_name     = name
-                    st.session_state.is_dss        = is_dss
-                    st.session_state.user_company  = "All Companies" if is_dss else CLIENTS[email_l]
-                    st.session_state.page          = "entry"
-                    st.rerun()
+    # Auto-switch email to correct default when role changes
+    _prev_role = st.session_state.get("_login_prev_role")
+    if _prev_role != role:
+        st.session_state["_login_prev_role"] = role
+        st.session_state["login_email"] = (
+            "verdatyres@tip-reporting.com"
+            if role == "TIP Client Company"
+            else "employee@consultdss.com"
+        )
 
-            st.caption("Demo: employee@consultdss.com (dss+ analyst) · verdatyres@tip-reporting.com (client, any password)")
+    # ── Fields ────────────────────────────────────────────────────────────────
+    email    = st.text_input("EMAIL ADDRESS", key="login_email")
+    password = st.text_input("PASSWORD", type="password", value="demo1234", key="login_pw")
+    st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+
+    # ── Sign-in button ─────────────────────────────────────────────────────────
+    if st.button("Sign in to workspace", type="primary",
+                 use_container_width=True, key="login_btn"):
+        email_l   = email.strip().lower()
+        is_dss    = DSS_DOMAIN in email_l
+        is_client = email_l in CLIENTS
+        if not is_dss and not is_client:
+            st.error("Email not recognised. Use the demo credentials below.")
+        else:
+            name_parts = email.split("@")[0].replace(".", " ").split()
+            name       = " ".join(p.capitalize() for p in name_parts)
+            st.session_state.authenticated = True
+            st.session_state.user_email    = email_l
+            st.session_state.user_name     = name
+            st.session_state.is_dss        = is_dss
+            st.session_state.user_company  = "All Companies" if is_dss else CLIENTS[email_l]
+            st.session_state.page          = "portfolio" if is_dss else "home"
+            st.rerun()
+
+    # ── Demo credentials ──────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="text-align:center;margin-top:18px;font-size:11px;color:#9ca3af;line-height:1.7">
+      Demo: verdatyres@tip-reporting.com (Client) ·<br>
+      analyst@consultdss.com (dss+)
+    </div>""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────
-# SIDEBAR
+# SIDEBAR — two-shell navigation
 # ─────────────────────────────────────────────────────────
+def _nav_item(page_id: str, label: str) -> None:
+    """Render one sidebar nav item. Active item is highlighted green."""
+    active = st.session_state.page == page_id
+    if active:
+        st.markdown(
+            f'<div style="background:rgba(22,163,74,0.85);border-radius:7px;'
+            f'padding:8px 14px;margin-bottom:2px;color:#fff;font-size:13px;'
+            f'font-weight:600">{label}</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        if st.sidebar.button(label, key=f"nav_{page_id}", use_container_width=True):
+            st.session_state.page = page_id
+            st.rerun()
+
+
 def show_sidebar():
     with st.sidebar:
-        st.markdown(f"""
-        <div style="padding:18px 16px 14px;border-bottom:1px solid rgba(255,255,255,.1)">
-          <div style="color:#fff;font-size:15px;font-weight:700">TIP ESG Platform</div>
-          <div style="color:rgba(255,255,255,.4);font-size:11px;margin-top:3px">dss+ · Tire Industry Project</div>
+        # ── Logo ─────────────────────────────────────────────────────────────
+        st.markdown("""
+        <div style="padding:16px 14px 12px;border-bottom:1px solid rgba(255,255,255,.08)">
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="width:10px;height:10px;border-radius:50%;background:#16A34A;flex-shrink:0"></div>
+            <div>
+              <div style="color:#fff;font-size:14px;font-weight:700;letter-spacing:-.2px">TIP ESG Platform</div>
+              <div style="color:rgba(255,255,255,.35);font-size:10px;margin-top:1px">dss+ · Tire Industry Project</div>
+            </div>
+          </div>
         </div>
         """, unsafe_allow_html=True)
 
+        # ── Company badge (client only) ───────────────────────────────────────
         if not st.session_state.is_dss:
-            # H3 FIX: escape company name before HTML injection
             _safe_co = _html.escape(st.session_state.user_company)
             st.markdown(f"""
-            <div style="margin:10px 12px 0;padding:10px 12px;background:rgba(255,255,255,.06);border-radius:8px">
-              <div style="color:rgba(255,255,255,.4);font-size:10px;text-transform:uppercase;letter-spacing:.6px">Company</div>
-              <div style="color:#fff;font-size:13px;font-weight:500;margin-top:3px">{_safe_co}</div>
+            <div style="margin:10px 10px 0;padding:8px 12px;background:rgba(255,255,255,.06);
+                border-radius:8px;border:1px solid rgba(255,255,255,.08)">
+              <div style="color:rgba(255,255,255,.35);font-size:9px;text-transform:uppercase;
+                  letter-spacing:.6px">Your Company</div>
+              <div style="color:#fff;font-size:13px;font-weight:500;margin-top:2px">{_safe_co}</div>
             </div>""", unsafe_allow_html=True)
 
-        st.markdown('<div style="padding:12px 8px 4px;color:rgba(255,255,255,.3);font-size:10px;text-transform:uppercase;letter-spacing:.7px">Data & Reports</div>', unsafe_allow_html=True)
+        # ── CLIENT navigation ─────────────────────────────────────────────────
+        if not st.session_state.is_dss:
+            _nav_item("home",         "Home")
+            _nav_item("dashboard",    "My Dashboard")
+            _nav_item("my_records",   "My Records")
+            _nav_item("benchmarking", "Benchmarks")
+            _nav_item("reports",      "Reports")
+            _nav_item("entry",        "Submit Data")
+            _nav_item("settings",     "Settings")
 
-        for page_id, label in [("entry","KPI Data Entry"),("analysis","Analysis"),("benchmarking","Benchmarking")]:
-            active = st.session_state.page == page_id
-            if active:
-                st.markdown(f"""<div style="background:rgba(0,145,110,0.85);border-radius:8px;padding:9px 12px;
-                    margin-bottom:2px;color:#fff;font-size:13.5px;font-weight:600;">{label}</div>""", unsafe_allow_html=True)
-            else:
-                if st.sidebar.button(label, key=f"nav_{page_id}", use_container_width=True):
-                    st.session_state.page = page_id
-                    st.rerun()
+        # ── DSS+ INTERNAL navigation ──────────────────────────────────────────
+        else:
+            _nav_item("portfolio",      "Portfolio")
+            _nav_item("company_data",   "Company Data")
+            _nav_item("verification",   "Verification Queue")
+            _nav_item("analysis",       "Analysis")
+            _nav_item("benchmarking",   "Benchmarks")
+            _nav_item("readiness",      "AI Assistant")
+            _nav_item("doc_library",    "Document Library")
+            _nav_item("sector_reports", "Sector Reports")
+            _nav_item("admin",          "Admin")
+            _nav_item("settings",       "Settings")
+            # Submit Data hidden for now — restore by uncommenting:
+            # _nav_item("entry", "Submit Data")
 
-        if st.session_state.is_dss:
-            st.markdown('<div style="padding:12px 8px 4px;color:rgba(255,255,255,.3);font-size:10px;text-transform:uppercase;letter-spacing:.7px;margin-top:8px">dss+ Internal</div>', unsafe_allow_html=True)
-            for page_id, label in [("verification","Verification"),("readiness","AI Readiness")]:
-                active = st.session_state.page == page_id
-                if active:
-                    st.markdown(f"""<div style="background:rgba(0,145,110,0.85);border-radius:8px;padding:9px 12px;
-                        margin-bottom:2px;color:#fff;font-size:13.5px;font-weight:600;">{label}</div>""", unsafe_allow_html=True)
-                else:
-                    if st.sidebar.button(label, key=f"nav_{page_id}", use_container_width=True):
-                        st.session_state.page = page_id
-                        st.rerun()
-
+        # ── User footer ───────────────────────────────────────────────────────
         st.markdown("---")
-        # H3 FIX: escape all user-derived values before HTML injection
-        name_init = _html.escape(
+        name_init  = _html.escape(
             "".join(p[0].upper() for p in st.session_state.user_name.split()[:2])
         )
         _safe_name = _html.escape(st.session_state.user_name)
-        role_lbl   = "dss+ Employee" if st.session_state.is_dss else f"Client · {st.session_state.user_company}"
+        role_lbl   = "dss+ Analyst" if st.session_state.is_dss else f"Client · {st.session_state.user_company}"
         _safe_role = _html.escape(role_lbl)
         st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:9px">
-          <div style="width:32px;height:32px;border-radius:50%;background:#00916E;color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0">{name_init}</div>
+        <div style="display:flex;align-items:center;gap:9px;padding:0 2px">
+          <div style="width:30px;height:30px;border-radius:50%;background:#16A34A;color:#fff;
+              font-size:11px;font-weight:700;display:flex;align-items:center;
+              justify-content:center;flex-shrink:0">{name_init}</div>
           <div>
             <div style="color:#fff;font-size:13px;font-weight:500">{_safe_name}</div>
-            <div style="color:rgba(255,255,255,.4);font-size:11px">{_safe_role}</div>
+            <div style="color:rgba(255,255,255,.4);font-size:10px">{_safe_role}</div>
           </div>
         </div>""", unsafe_allow_html=True)
-        if st.button("Sign out", use_container_width=True):
+        st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+        if st.button("Sign out", use_container_width=True, key="signout_btn"):
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
@@ -1071,7 +1242,20 @@ def _save_submission_to_csv(inp, out) -> str:
             _sync_company_member_files(combined)
             # Sync CONSOLIDATED_DUMMY Excel
             _sync_consolidate_excel(combined)
-            return (f"✅ Saved {inp.company} — {inp.year}. "
+
+            # ── CRITICAL: update the in-memory globals so all pages in this
+            #    session immediately see the new data without requiring a restart.
+            global _CONSOLIDATED_DF, _COMPANIES, _SECTOR_DF, _USING_FALLBACK_DATA
+            _CONSOLIDATED_DF     = combined.copy()
+            _COMPANIES           = dl.get_companies(combined)
+            _USING_FALLBACK_DATA = False
+            try:
+                _SECTOR_DF = dl.load_sector_aggregated()
+            except Exception:
+                pass
+            st.cache_data.clear()
+
+            return (f"Saved {inp.company} — {inp.year}. "
                     f"Master: {n_records} records across {n_companies} companies. "
                     f"Version: {version_filename}")
         except PermissionError:
@@ -1092,200 +1276,289 @@ def _save_submission_to_csv(inp, out) -> str:
 
 
 def page_entry():
-    rep_year = st.session_state.get("reporting_year", CURR_YEAR)
-    st.markdown(f"## {'KPI Data Entry' if not st.session_state.template_done else f'ESG KPI Template — {rep_year}'}")
+    """
+    Submit Data — single scrolling page with all 6 sections.
+    For the current/latest year shows blank fields (new entry).
+    For previous years shows existing records pre-filled.
+    After Submit → redirects to My Records.
+    CLIENT SIDE ONLY.
+    """
+    company   = st.session_state.user_company
+    comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    all_yrs   = sorted(dl.get_years(_CONSOLIDATED_DF, company) or [])
 
-    if st.session_state.template_done:
-        col_a, col_b = st.columns([5, 1])
-        with col_b:
-            if st.button("Edit Inputs"):
-                st.session_state.template_done      = False
-                st.session_state.step               = 0
-                st.session_state.company_setup_done = False
-                st.rerun()
+    # ── Header: company name + year dropdown ──────────────────────────────────
+    h1, h2, _ = st.columns([2, 1, 2])
+    with h1:
+        st.markdown(f"""
+        <div style="font-size:22px;font-weight:800;color:{TEXT};margin-top:4px">
+          {_html.escape(company)}</div>
+        <div style="font-size:12px;color:{MUTED}">ESG KPI Data Entry</div>
+        """, unsafe_allow_html=True)
+    with h2:
+        yr_options = sorted(list(set(all_yrs + [CURR_YEAR])), reverse=True)
+        sel_yr = st.selectbox("", yr_options, key="entry_year_sel",
+                              label_visibility="collapsed")
 
-        # -- Save to database panel ------------------------------------------
-        _save_company = st.session_state.get("reporting_company") or st.session_state.get("user_company", "")
-        _save_year    = st.session_state.get("reporting_year", CURR_YEAR)
-        with st.expander(f"💾  Save {_save_company} {_save_year} to master database", expanded=False):
-            st.markdown(
-                f"Saves **KPI data** (Main Data Input) **and Electricity by Country** for "
-                f"**{_save_company} — {_save_year}** into the master CSV and TIP members file.  "
-                f"Existing record for this company and year will be overwritten."
-            )
-            col_sv1, col_sv2 = st.columns([3, 1])
-            with col_sv2:
-                if st.button("Save to database", type="primary", use_container_width=True, key="save_db_btn"):
-                    _save_inp, _save_out = get_current_outputs()
-                    # Step 1: Save KPI data
-                    _msg_kpi = _save_submission_to_csv(_save_inp, _save_out)
-                    # Step 2: Save electricity-by-country data (if any entered)
-                    _msg_elec = ""
-                    if st.session_state.get("elec_data") is not None:
-                        _msg_elec = _save_electricity_to_master(_save_company, _save_year)
-                    # Show combined result
-                    if _msg_kpi.startswith("✅"):
-                        st.success("✅ Saved successfully — added to your database.")
-                    else:
-                        st.error(_msg_kpi)
-            with col_sv1:
-                pass
+    is_new = sel_yr not in all_yrs
+    if is_new:
+        st.info(f"Entering new data for **{sel_yr}** — pre-filled with projected values based on last year's trend")
+    else:
+        st.info(f"Editing existing data for **{sel_yr}** (pre-filled from database)")
 
-        tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
-            "Main Data Input", "Electricity by Country", "Waste", "Qualitative Data", "Conversion Tables",
-        ])
-        with tab_main:  render_template_table()
-        with tab_elec:  render_electricity_tab()
-        with tab_waste: render_waste_tab()
-        with tab_qual:  render_qualitative_tab()
-        with tab_conv:  render_conversion_tab()
-        return
+    # ── Pre-fill: existing data or projection from prior year ─────────────────
+    existing = dl.get_step_data(comp_hist, sel_yr) if (comp_hist and not is_new) else {}
 
-    # -- Company Setup Pre-Step -------------------------------------------------
-    if not st.session_state.company_setup_done:
-        with st.container(border=True):
-            st.markdown("### Step 0 of 6 — Company Setup")
-            st.caption("Select your company and reporting year. Historical data will be pre-loaded from the consolidated dataset.")
-            st.divider()
+    if is_new and comp_hist:
+        # Use most recent available year as projection baseline
+        prior_yr   = max(all_yrs) if all_yrs else sel_yr - 1
+        prior_data = dl.get_step_data(comp_hist, prior_yr)
+        # Compute a simple linear projection: prior + avg YoY change over last 3 years
+        def _projected(key, default=0.0):
+            recent_yrs = sorted([y for y in all_yrs if y >= prior_yr - 3], reverse=True)
+            if len(recent_yrs) >= 2:
+                vals = [float(dl.get_step_data(comp_hist, y).get(key, 0)) for y in recent_yrs]
+                vals = [v for v in vals if v > 0]
+                if len(vals) >= 2:
+                    avg_change = (vals[0] - vals[-1]) / max(len(vals) - 1, 1)
+                    return max(0.0, float(vals[0]) + avg_change)
+            return float(prior_data.get(key, default))
+        _num = _projected
+    else:
+        def _num(key, default=0.0):
+            return float(existing.get(key, default))
 
-            col1, col2 = st.columns(2)
-            with col1:
-                company_options = COMPANIES if COMPANIES else ["(No data loaded)"]
-                login_company   = st.session_state.user_company
-                default_idx     = 0
-                if login_company and login_company in company_options:
-                    default_idx = company_options.index(login_company)
+    # Use year-scoped keys so switching year always reloads from DB (no stale form state)
+    _yk = f"_{sel_yr}"  # key suffix per year
 
-                sel_company = st.selectbox("Company name", options=company_options,
-                                           index=default_idx,
-                                           help="Select the TIP member company for this submission.")
-                emp_name = st.text_input("Employee name (for records)",
-                                         value=st.session_state.user_name,
-                                         placeholder="Full name of person completing this submission")
+    # ── Scrolling form sections ───────────────────────────────────────────────
+    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
-            with col2:
-                avail_years = sorted(
-                    [int(y) for y in _CONSOLIDATED_DF["Year"].dropna().unique()]
-                    if not _CONSOLIDATED_DF.empty else [2023], reverse=True
-                )
-                rep_year_sel = st.selectbox(
-                    "Reporting year (data you are submitting)",
-                    options=avail_years + ([max(avail_years)+1] if avail_years else [2024]),
-                    index=0,
-                    help="The calendar year the KPI data covers.",
-                )
-                n_hist = len([y for y in avail_years if y < rep_year_sel])
-                st.info(f"**{sel_company}** has **{n_hist} years** of historical data available (through {max(avail_years) if avail_years else '—'}).")
-
-            st.divider()
-            if st.button("Load historical data and start entry", type="primary"):
-                hist      = dl.get_company_hist(_CONSOLIDATED_DF, sel_company)
-                prev_data = dl.get_step_data(hist, rep_year_sel - 1)
-                hist_raw  = dl.get_hist_raw(hist, HIST_YEARS)
-                kpi_hints = dl.get_kpi_hints(_CONSOLIDATED_DF, sel_company, rep_year_sel - 1)
-
-                st.session_state.reporting_company  = sel_company
-                st.session_state.reporting_year     = rep_year_sel
-                st.session_state.employee_name      = emp_name
-                st.session_state.company_hist       = hist
-                st.session_state.live_hist_raw      = hist_raw
-                st.session_state.kpi_hints          = kpi_hints
-
-                if prev_data:
-                    for field, val in prev_data.items():
-                        if field in st.session_state.step_data:
-                            st.session_state.step_data[field] = val
-
-                st.session_state.company_setup_done = True
-                st.rerun()
-        return
-
-    # -- Stepper ----------------------------------------------------------------
-    render_stepper_bar()
-    _hist    = _get_fresh_hist()   # always fresh — reflects any saved updates
-    _prev_yr = st.session_state.get("reporting_year", CURR_YEAR) - 1
-    step     = st.session_state.step
-    name, desc = STEP_META[step]
-    fields   = STEP_FIELDS[step]
-
-    with st.container(border=True):
-        st.markdown(f"### Step {step+1} of {len(STEP_META)} — {name}")
-        st.caption(desc)
-
-        # Prior-year KPI reference hints
-        kpi_hints = st.session_state.get("kpi_hints", {})
-        if kpi_hints:
-            sel_co    = st.session_state.get("reporting_company", "")
-            hint_parts = []
-            if step == 2 and "water_kpi"  in kpi_hints: hint_parts.append(f"Water KPI {_prev_yr}: **{kpi_hints['water_kpi']:.2f} m³/T**")
-            if step in (3,4) and "energy_kpi" in kpi_hints: hint_parts.append(f"Energy KPI {_prev_yr}: **{kpi_hints['energy_kpi']:.2f} GJ/T**")
-            if step == 4 and "co2_kpi"    in kpi_hints: hint_parts.append(f"CO2 KPI {_prev_yr}: **{kpi_hints['co2_kpi']:.3f} T/T**")
-            if step == 0 and "iso_pct"    in kpi_hints: hint_parts.append(f"ISO certified {_prev_yr}: **{kpi_hints['iso_pct']*100:.1f}%**")
-            if hint_parts:
-                st.info(f"{sel_co} prior-year reference — " + " · ".join(hint_parts))
+    with st.form("entry_scroll_form", clear_on_submit=False):
+        # ── Section 1: ISO 14001 ──────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="border-left:3px solid {GREEN};padding:4px 0 4px 12px;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:700;color:{TEXT}">
+            1.  ISO 14001 Certification</div>
+          <div style="font-size:11px;color:{MUTED}">Number of sites and certified sites</div>
+        </div>""", unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        total_sites = c1.number_input("Total no. of sites", min_value=0,
+                                       value=int(_num("total_sites")), step=1, key=f"e_sites{_yk}")
+        iso_sites   = c2.number_input("ISO 14001 certified sites", min_value=0,
+                                       value=int(_num("iso_sites")), step=1, key=f"e_iso{_yk}")
+        iso_pct     = round(iso_sites / max(total_sites, 1) * 100, 1)
+        c3.metric("% Certified", f"{iso_pct}%")
 
         st.divider()
-        inp, out = get_current_outputs()
-        n_cols   = 2 if len(fields) > 3 else 1
-        cols_list = st.columns(n_cols)
 
-        for idx, fdef in enumerate(fields):
-            key, label, sublabel = fdef[0], fdef[1], fdef[2] or ""
-            hist_vals = _hist.get(key, [])
-            hist_val  = hist_vals[-1] if hist_vals else None
-            with cols_list[idx % n_cols]:
-                if sublabel:
-                    st.caption(sublabel)
-                val = st.number_input(label,
-                                      value=float(st.session_state.step_data.get(key, 0)),
-                                      step=1.0, format="%.0f", key=f"input_{key}")
-                st.session_state.step_data[key] = val
-                if hist_val:
-                    st.caption(f"{_prev_yr} reference: {fmt_num(hist_val)}")
-
-        # Live preview
-        st.divider()
-        inp2, out2 = get_current_outputs()
-        if step == 0:
-            st.metric("% ISO Certified", f"{out2.pct_certified*100:.1f}%")
-        elif step == 1:
-            st.metric("Production entered", fmt_num(inp2.production) + " metric T")
-        elif step == 2:
-            c1, c2 = st.columns(2)
-            c1.metric("Water withdrawals",  fmt_num(inp2.water_withdrawals) + " m³")
-            c2.metric("Water intensity KPI", f"{out2.water_kpi:.2f} m³/T")
-        elif step == 3:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total electricity",   fmt_num(out2.total_electricity) + " GJ")
-            c2.metric("Total energy",         fmt_num(out2.total_energy) + " GJ")
-            c3.metric("Energy intensity KPI", f"{out2.energy_kpi:.2f} GJ/T")
-        elif step == 4:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Scope 1 CO₂", fmt_num(out2.total_co2_scope1) + " T")
-            c2.metric("Scope 2 CO₂", fmt_num(out2.total_co2_scope2) + " T")
-            c3.metric("CO₂ intensity KPI", f"{out2.co2_kpi:.3f} T/T")
-        elif step == 5:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Waste elimination", fmt_num(out2.waste_elimination) + " T")
-            c2.metric("Recovery rate",     f"{out2.waste_recovery_pct*100:.1f}%")
-            c3.metric("Waste check",       "Consistent" if out2.check_waste else "Inconsistent")
+        # ── Section 2: Production ─────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="border-left:3px solid {CAT_CO2};padding:4px 0 4px 12px;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:700;color:{TEXT}">
+            2.  Production Volume</div>
+          <div style="font-size:11px;color:{MUTED}">Annual tire/rubber production in metric tonnes</div>
+        </div>""", unsafe_allow_html=True)
+        production = st.number_input("Production (metric T)", min_value=0.0,
+                                      value=_num("production"), step=1000.0,
+                                      format="%.0f", key=f"e_prod{_yk}")
 
         st.divider()
-        nav_l, nav_r = st.columns(2)
-        with nav_l:
-            if step > 0 and st.button("Previous step"):
-                st.session_state.step -= 1; st.rerun()
-        with nav_r:
-            if step < len(STEP_META) - 1:
-                if st.button("Save & Continue", type="primary"):
-                    st.session_state.step += 1; st.rerun()
-            else:
-                if st.button("Generate Template", type="primary"):
-                    st.session_state.template_done = True; st.rerun()
+
+        # ── Section 3: Water ──────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="border-left:3px solid {CAT_WATER};padding:4px 0 4px 12px;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:700;color:{TEXT}">
+            3.  Water Withdrawals</div>
+          <div style="font-size:11px;color:{MUTED}">Total water intake from all sources (m³)</div>
+        </div>""", unsafe_allow_html=True)
+        water_withdrawals = st.number_input("Water withdrawals (m³)", min_value=0.0,
+                                             value=_num("water_withdrawals"), step=100.0,
+                                             format="%.0f", key=f"e_water{_yk}")
+
+        st.divider()
+
+        # ── Section 4: Energy ─────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="border-left:3px solid {CAT_ENERGY};padding:4px 0 4px 12px;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:700;color:{TEXT}">
+            4.  Energy Consumption</div>
+          <div style="font-size:11px;color:{MUTED}">Electricity and fuel consumption (GJ)</div>
+        </div>""", unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        renew_elec  = c1.number_input("Renewable elec. purchased (GJ)", min_value=0.0,
+                                       value=_num("renew_elec_purchased"), step=100.0, format="%.0f", key=f"e_re{_yk}")
+        nonrenew_elec = c2.number_input("Non-renewable elec. (GJ)", min_value=0.0,
+                                         value=_num("nonrenew_elec_purchased"), step=100.0, format="%.0f", key=f"e_nre{_yk}")
+        self_gen    = c3.number_input("Self-generated elec. (GJ)", min_value=0.0,
+                                       value=_num("self_gen_elec"), step=100.0, format="%.0f", key=f"e_sg{_yk}")
+        c1b, c2b, c3b = st.columns(3)
+        nat_gas     = c1b.number_input("Natural Gas (GJ LHV)", min_value=0.0,
+                                        value=_num("nat_gas"), step=100.0, format="%.0f", key=f"e_ng{_yk}")
+        coal_sub    = c2b.number_input("Coal (GJ LHV)", min_value=0.0,
+                                        value=_num("coal_sub"), step=100.0, format="%.0f", key=f"e_coal{_yk}")
+        diesel      = c3b.number_input("Diesel (GJ LHV)", min_value=0.0,
+                                        value=_num("diesel"), step=100.0, format="%.0f", key=f"e_diesel{_yk}")
+        c1c, c2c, c3c = st.columns(3)
+        biomass     = c1c.number_input("Biomass (GJ LHV)", min_value=0.0,
+                                        value=_num("biomass"), step=100.0, format="%.0f", key=f"e_bio{_yk}")
+        purchased_steam = c2c.number_input("Purchased Steam (GJ)", min_value=0.0,
+                                            value=_num("purchased_steam"), step=100.0, format="%.0f", key=f"e_ps{_yk}")
+        sold_electricity = c3c.number_input("Sold Electricity (GJ)", min_value=0.0,
+                                             value=_num("sold_electricity"), step=100.0, format="%.0f", key=f"e_se{_yk}")
+
+        st.divider()
+
+        # ── Section 5: CO₂ ────────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="border-left:3px solid {RED};padding:4px 0 4px 12px;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:700;color:{TEXT}">
+            5.  CO₂ Emissions — Scope 2 Steam</div>
+          <div style="font-size:11px;color:{MUTED}">
+            Scope 1 is auto-calculated from fuel inputs. Enter Scope 2 steam separately.</div>
+        </div>""", unsafe_allow_html=True)
+        co2_scope2_steam = st.number_input("CO₂ Scope 2 Steam (T.CO₂)", min_value=0.0,
+                                            value=_num("co2_scope2_steam"), step=10.0,
+                                            format="%.0f", key=f"e_s2s{_yk}")
+
+        st.divider()
+
+        # ── Section 6: Waste ──────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="border-left:3px solid {CAT_WASTE};padding:4px 0 4px 12px;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:700;color:{TEXT}">
+            6.  Waste Management</div>
+          <div style="font-size:11px;color:{MUTED}">Total waste generated and recovered (metric T)</div>
+        </div>""", unsafe_allow_html=True)
+        c1w, c2w = st.columns(2)
+        waste_total    = c1w.number_input("Total waste (metric T)", min_value=0.0,
+                                           value=_num("waste_total"), step=10.0, format="%.0f", key=f"e_wt{_yk}")
+        waste_recovery = c2w.number_input("Waste recovered (metric T)", min_value=0.0,
+                                           value=_num("waste_recovery"), step=10.0, format="%.0f", key=f"e_wr{_yk}")
+        if waste_recovery > waste_total > 0:
+            st.error("⚠ Waste recovered cannot exceed total waste.")
+
+        # ── Submit button ─────────────────────────────────────────────────────
+        st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
+        submitted = st.form_submit_button("Submit Data", type="primary",
+                                          use_container_width=True)
+
+    if submitted:
+        inp = TemplateInputs(
+            company=company, year=sel_yr,
+            total_sites=total_sites, iso_sites=iso_sites,
+            production=production, water_withdrawals=water_withdrawals,
+            renew_elec_purchased=renew_elec, nonrenew_elec_purchased=nonrenew_elec,
+            self_gen_elec=self_gen, purchased_steam=purchased_steam,
+            sold_electricity=sold_electricity, nat_gas=nat_gas,
+            coal_sub=coal_sub, diesel=diesel, biomass=biomass,
+            co2_scope2_steam=co2_scope2_steam,
+            waste_total=waste_total, waste_recovery=waste_recovery,
+        )
+        out = calculate(inp)
+
+        # 1. Update session state fully — both old step_data dict AND new _codata_inp
+        new_step_data = {
+            fld: getattr(inp, fld)
+            for fld in _VALID_TEMPLATE_FIELDS
+        }
+        st.session_state.step_data          = new_step_data   # keeps get_current_outputs() in sync
+        st.session_state["_codata_inp"]     = inp             # used by render_template_table
+        st.session_state["_codata_out"]     = out
+        st.session_state.reporting_company  = company
+        st.session_state.reporting_year     = sel_yr
+        st.session_state.template_done      = True
+        st.session_state.company_setup_done = True
+        st.session_state.step               = 6
+        for fld in _VALID_TEMPLATE_FIELDS:
+            st.session_state[fld] = getattr(inp, fld)
+
+        # 2. Save → master CSV + parquet version + sync TIP files + updates _CONSOLIDATED_DF global
+        msg = _save_submission_to_csv(inp, out)
+        st.session_state["_last_save_msg"] = msg
+        st.session_state.page = "my_records"
+        st.rerun()
 
 
-# ─────────────────────────────────────────────────────────
-# TEMPLATE TABLE
+def page_my_records():
+    """
+    My Records — view and save all historical KPI data.
+    Shows the full template table with all 5 sheets.
+    Has Submit & Save button top-right.
+    Versioning (parquet) + master CSV sync on every save.
+    CLIENT SIDE ONLY.
+    """
+    company   = st.session_state.user_company
+    comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    all_yrs   = sorted(dl.get_years(_CONSOLIDATED_DF, company) or [CURR_YEAR], reverse=True)
+
+    # ── Header: title + year dropdown + Save button ───────────────────────────
+    h_title, h_yr, h_btn = st.columns([3, 1, 1])
+    with h_title:
+        st.markdown(section_header_html(
+            "My Records",
+            f"{company} · Historical KPI data",
+        ), unsafe_allow_html=True)
+    with h_yr:
+        sel_yr = st.selectbox("Year", all_yrs, key="myrec_year",
+                               label_visibility="collapsed")
+    with h_btn:
+        save_clicked = st.button("💾  Submit & Save", type="primary",
+                                  use_container_width=True, key="myrec_save_btn")
+
+    # Show message from Submit Data redirect
+    if "_last_save_msg" in st.session_state:
+        st.success(f"✅ {st.session_state.pop('_last_save_msg')}")
+
+    # ── Load data for selected year — use in-memory _CONSOLIDATED_DF  ──────────
+    # _CONSOLIDATED_DF is updated in-memory by _save_submission_to_csv so it
+    # always reflects the latest saved data without needing a disk re-read.
+    st.session_state.reporting_company  = company
+    st.session_state.reporting_year     = sel_yr
+
+    fresh_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    step_data  = dl.get_step_data(fresh_hist, sel_yr) if fresh_hist else {}
+    valid_flds = {f.name for f in TemplateInputs.__dataclass_fields__.values()}
+    clean      = {k: v for k, v in step_data.items() if k in valid_flds}
+
+    if clean:
+        for k, v in clean.items():
+            st.session_state[k] = v
+        inp = TemplateInputs(company=company, year=sel_yr, **clean)
+        out = calculate(inp)
+    else:
+        inp = TemplateInputs(company=company, year=sel_yr)
+        out = calculate(inp)
+
+    # Keep both step_data dict AND _codata_inp in sync
+    st.session_state.step_data          = {fld: getattr(inp, fld) for fld in _VALID_TEMPLATE_FIELDS}
+    st.session_state["_codata_inp"]     = inp
+    st.session_state["_codata_out"]     = out
+    st.session_state.template_done      = True
+    st.session_state.company_setup_done = True
+    st.session_state.step               = 6
+
+    # ── Save & sync on button click ───────────────────────────────────────────
+    if save_clicked:
+        msg = _save_submission_to_csv(inp, out)   # updates globals in-place
+        st.success(f"✅ {msg}")
+        st.rerun()   # force re-render so table shows updated values
+
+    # ── All 5 template sheets as tabs ─────────────────────────────────────────
+    tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
+        "Main Data Input",
+        "Electricity by Country",
+        "Waste",
+        "Qualitative Data",
+        "Conversion Tables",
+    ])
+    with tab_main: render_template_table()
+    with tab_elec: render_electricity_tab()
+    with tab_waste: render_waste_tab()
+    with tab_qual: render_qualitative_tab()
+    with tab_conv: render_conversion_tab()
+
+
 # ─────────────────────────────────────────────────────────
 def render_template_table():
     company  = st.session_state.get("reporting_company") or st.session_state.get("user_company") or "TIP Member Company"
@@ -1317,8 +1590,22 @@ def render_template_table():
 
     st.info("Template generated from your inputs. Blue cells = company input, grey italic = auto-calculated formula.")
 
-    inp, out = get_current_outputs()
-    hist     = get_hist_outputs()
+    # ── Data sources — all from _CONSOLIDATED_DF so saves are immediately visible ──
+    hist = get_hist_outputs()   # ALL years including current year
+
+    # For the current reporting year prefer _codata_inp (freshest — set right after save)
+    if (st.session_state.get("_codata_inp") is not None and
+            getattr(st.session_state["_codata_inp"], "year", None) == rep_year):
+        inp = st.session_state["_codata_inp"]
+        out = st.session_state["_codata_out"]
+    else:
+        inp, out = _load_company_year_outputs(company, rep_year)
+
+    # Always ensure current year is in hist with the freshest values
+    hist = sorted(
+        [(yr, hi, ho) for yr, hi, ho in hist if yr != rep_year] + [(rep_year, inp, out)],
+        key=lambda t: t[0],
+    )
 
     ROWS = [
         ("section","ISO 14001",None,None,None),
@@ -1377,32 +1664,56 @@ def render_template_table():
         if rtype == "section":
             row = {"Indicator": f"▸ {label}", "Unit": ""}
             for yr, hi, ho in hist: row[str(yr)] = ""
-            row[str(rep_year)] = ""; row["YoY %"] = ""
-            data.append({"_type":"section","_row":row}); continue
+            row["YoY %"] = ""
+            data.append({"_type": "section", "_row": row})
+            continue
 
         row = {"Indicator": label, "Unit": unit or ""}
-        hist_nums = []
+        prev_num = None
         for yr, hi, ho in hist:
             v = getattr(hi, key, None) if key else None
-            if v is None and fn: v = fn(hi, ho)
+            if v is None and fn:
+                v = fn(hi, ho)
             try:
                 row[str(yr)] = f"{int(round(float(v))):,}"
             except (TypeError, ValueError):
                 row[str(yr)] = str(v) if v else "—"
-            try: hist_nums.append(float(str(v).replace(",","").replace("%","").replace("—","0")))
-            except: hist_nums.append(0)
+            try:
+                prev_num = float(str(v).replace(",", "").replace("%", "").replace("—", "0"))
+            except:
+                pass
 
+        # YoY % uses the last two available values
         cv = getattr(inp, key, None) if key else None
-        if cv is None and fn: cv = fn(inp, out)
-        row[str(rep_year)] = (f"{float(cv):,.0f}" if isinstance(cv,(int,float)) and not isinstance(cv,str) else (cv if cv else "—"))
+        if cv is None and fn:
+            cv = fn(inp, out)
+        curr_num = None
+        try:
+            curr_num = float(str(cv).replace(",", "").replace("%", "").replace("—", "0"))
+        except:
+            pass
+
+        # Find the previous year's value for YoY
+        if len(hist) >= 2:
+            prev_yr, prev_hi, prev_ho = hist[-2]
+            pv = getattr(prev_hi, key, None) if key else None
+            if pv is None and fn:
+                pv = fn(prev_hi, prev_ho)
+            try:
+                prev_num = float(str(pv).replace(",", "").replace("%", "").replace("—", "0"))
+            except:
+                prev_num = None
 
         try:
-            cn  = float(str(cv).replace(",","").replace("%",""))
-            pn  = hist_nums[-1] if hist_nums else 0
-            yoy = (cn - pn) / abs(pn) * 100 if pn else None
-            row["YoY %"] = f"{yoy:+.1f}%" if yoy is not None else "—"
-        except: row["YoY %"] = "—"
-        data.append({"_type":rtype,"_row":row,"_key":key,"_label":label})
+            if curr_num is not None and prev_num:
+                yoy = (curr_num - prev_num) / abs(prev_num) * 100
+                row["YoY %"] = f"{yoy:+.1f}%"
+            else:
+                row["YoY %"] = "—"
+        except:
+            row["YoY %"] = "—"
+
+        data.append({"_type": rtype, "_row": row, "_key": key, "_label": label})
 
     all_rows  = [d["_row"]  for d in data]
     all_types = [d["_type"] for d in data]
@@ -1844,15 +2155,28 @@ def page_analysis():
     st.markdown("## Analysis & Trends")
     st.caption(f"Sector aggregated across all TIP member companies · Source: {data_src}")
 
-    # L2 FIX: warn clearly when no real data is loaded — prevents analysts or
-    # auditors from mistaking illustrative fallback numbers for real submissions.
     if _USING_FALLBACK_DATA:
-        st.warning(
-            "⚠️ No consolidated master CSV found — charts are showing illustrative "
-            "fallback data only. Run build_esg_master.py and save at least one "
-            "company submission to see real data here.",
-            icon=None,
-        )
+        st.warning("⚠️ No consolidated master CSV found — charts show illustrative fallback data.", icon=None)
+
+    # ── DSS+: company overlay selector ──────────────────────────────────────────
+    overlay_company = None
+    overlay_year    = None
+    if st.session_state.get("is_dss", False) and not _CONSOLIDATED_DF.empty:
+        companies_in_db = dl.get_companies(_CONSOLIDATED_DF) or COMPANIES
+        co_options  = ["All Companies"] + companies_in_db   # no "None" option
+        oc_col, oy_col, _ = st.columns([2, 1, 3])
+        with oc_col:
+            overlay_sel = st.selectbox("Company", co_options, key="analysis_overlay_co")
+        with oy_col:
+            if overlay_sel != "All Companies":
+                ov_yrs = dl.get_years(_CONSOLIDATED_DF, overlay_sel) or [CURR_YEAR]
+                overlay_year    = st.selectbox("Year", sorted(ov_yrs, reverse=True),
+                                               key="analysis_overlay_yr")
+                overlay_company = overlay_sel
+            else:
+                # Show latest available year for sector label
+                overlay_year = CURR_YEAR
+        st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
     yrs     = [str(y) for y in LONG_YEARS]
     yrs_int = LONG_YEARS
@@ -1930,7 +2254,7 @@ def page_analysis():
     waste_total_v = _safe(_sector("Total Waste"),                  [v*330000 for v in LONG_DATA["prod"]])
     waste_recov_a = _safe(_sector("Waste Recovered"),              [v*280000 for v in LONG_DATA["prod"]])
 
-    # ── Headline KPI strip ─────────────────────────────────────────────────────
+    # ── Headline KPI strip — dynamic: company data or sector totals ──────────────
     def _delta(cur, prv, good_if_down=True):
         if prv and prv != 0:
             pct = (cur - prv) / abs(prv) * 100
@@ -1940,13 +2264,51 @@ def page_analysis():
             return f'<span style="color:{col};font-size:11px">{arrow} {abs(pct):.1f}%</span>'
         return '<span style="font-size:11px;color:#9CA3AF">—</span>'
 
-    kpi_items = [
-        ("Total Energy 2023",   f"{energy_total[-1]:.1f}M",  "GJ",        _delta(energy_total[-1], energy_total[-2], True)),
-        ("Total CO₂ 2023",      f"{co2_total[-1]:.2f}M",    "T.CO₂",     _delta(co2_total[-1], co2_total[-2], True)),
-        ("CO₂ Intensity",       f"{co2_kpi[-1]:.3f}",       "T.CO₂/T",   _delta(co2_kpi[-1], co2_kpi[-2], True)),
-        ("Renewable Electricity",f"{renew_pct[-1]:.1f}%",   "of elec",   _delta(renew_pct[-1], renew_pct[-2], False)),
-        ("Waste Recovery",      f"{waste_recov[-1]:.1f}%",  "of waste",  _delta(waste_recov[-1], waste_recov[-2], False)),
-    ]
+    latest_yr = yrs_int[-1] if yrs_int else CURR_YEAR
+
+    if overlay_company:
+        # Company-specific KPI boxes
+        ov_inp, ov_out = _load_company_year_outputs(overlay_company, overlay_year)
+        ov_rt = max(ov_inp.renew_elec_purchased + ov_inp.nonrenew_elec_purchased
+                    + ov_inp.self_gen_elec, 1)
+        ov_renew = ov_inp.renew_elec_purchased / ov_rt * 100
+
+        # Prior year for delta
+        ov_hist   = dl.get_company_hist(_CONSOLIDATED_DF, overlay_company)
+        ov_prev_out = None
+        if overlay_year - 1 in dl.get_years(_CONSOLIDATED_DF, overlay_company):
+            _, ov_prev_out = _load_company_year_outputs(overlay_company, overlay_year - 1)
+
+        def _co_delta(cur, prev_val, good_if_down=True):
+            return _delta(cur, prev_val, good_if_down) if prev_val else _delta(cur, None)
+
+        kpi_items = [
+            (f"Total Energy {overlay_year}", f"{ov_inp.nat_gas + ov_inp.nonrenew_elec_purchased + ov_inp.renew_elec_purchased:.0f}",
+             "GJ",
+             _co_delta(ov_out.total_energy, ov_prev_out.total_energy if ov_prev_out else None)),
+            (f"Total CO₂ {overlay_year}", f"{ov_out.total_co2:,.0f}", "T.CO₂",
+             _co_delta(ov_out.total_co2, ov_prev_out.total_co2 if ov_prev_out else None)),
+            ("CO₂ Intensity",  f"{ov_out.co2_kpi:.3f}", "T.CO₂/T",
+             _co_delta(ov_out.co2_kpi, ov_prev_out.co2_kpi if ov_prev_out else None)),
+            ("Renewable Electricity", f"{ov_renew:.1f}%", "of elec",
+             _co_delta(ov_renew, None, False)),
+            ("Waste Recovery", f"{ov_out.waste_recovery_pct*100:.1f}%", "of waste",
+             _co_delta(ov_out.waste_recovery_pct, ov_prev_out.waste_recovery_pct if ov_prev_out else None, False)),
+        ]
+    else:
+        # Sector aggregate KPI boxes (dynamic from real data)
+        kpi_items = [
+            (f"Total Energy {latest_yr}", f"{energy_total[-1]:.1f}M", "GJ",
+             _delta(energy_total[-1], energy_total[-2] if len(energy_total) > 1 else None, True)),
+            (f"Total CO₂ {latest_yr}", f"{co2_total[-1]:.2f}M", "T.CO₂",
+             _delta(co2_total[-1], co2_total[-2] if len(co2_total) > 1 else None, True)),
+            ("CO₂ Intensity", f"{co2_kpi[-1]:.3f}", "T.CO₂/T",
+             _delta(co2_kpi[-1], co2_kpi[-2] if len(co2_kpi) > 1 else None, True)),
+            ("Renewable Electricity", f"{renew_pct[-1]:.1f}%", "of elec",
+             _delta(renew_pct[-1], renew_pct[-2] if len(renew_pct) > 1 else None, False)),
+            ("Waste Recovery", f"{waste_recov[-1]:.1f}%", "of waste",
+             _delta(waste_recov[-1], waste_recov[-2] if len(waste_recov) > 1 else None, False)),
+        ]
     kpi_cols = st.columns(5)
     for i, (label, val, unit, delta_html) in enumerate(kpi_items):
         kpi_cols[i].markdown(
@@ -1985,23 +2347,46 @@ def page_analysis():
 
     # ── TAB 1: GENERAL ──────────────────────────────────────────────────────────
     with tab_gen:
-        st.caption("Core environmental KPIs for CSR / sustainability reporting — sector totals 2009–2023")
+        lbl_pfx = f"({overlay_company.split()[0]})" if overlay_company else "(Sector)"
+        st.caption(f"Core environmental KPIs — {lbl_pfx} totals {yrs_int[0]}–{yrs_int[-1]}")
+
+        # Compute company overlay series if needed
+        def _ov_series(col, divisor=1):
+            if overlay_company and has_wide and col in df.columns:
+                s = df[df["Company"]==overlay_company].set_index("Year")[col] / divisor
+                return _safe(s.reindex(yrs_int), [None]*len(yrs_int))
+            return None
+
+        ov_energy = _ov_series("Total energy", 1e6)
+        ov_co2    = _ov_series("Total CO2",    1e6)
+        ov_sc1    = _ov_series("Total CO2 - Scope 1", 1e6)
+        ov_sc2    = _ov_series("Total CO2 - Scope 2", 1e6)
+        ov_water  = _ov_series("Water intake", 1e6)
+        ov_renew  = _ov_series("Renewable_Electricity_Share_%")
+
+        # Use company data directly when overlay selected (replace sector total)
+        plot_energy = ov_energy if overlay_company else energy_total
+        plot_co2    = ov_co2    if overlay_company else co2_total
+        plot_sc1    = ov_sc1    if overlay_company else scope1_total
+        plot_sc2    = ov_sc2    if overlay_company else scope2_total
+        plot_water  = ov_water  if overlay_company else water_total
 
         c1, c2 = st.columns(2)
         with c1:
-            f = go.Figure([_line(yrs, energy_total, "Total energy (M GJ)", C["green"],
+            e_lbl = "M GJ" if not overlay_company else "GJ (÷1M)"
+            f = go.Figure([_line(yrs, plot_energy, f"Total energy ({e_lbl})", C["green"],
                 fill="tozeroy", fill_color="rgba(0,145,110,.08)")])
-            f.update_layout(**_layout("Total energy consumption (M GJ)", 260))
-            st.plotly_chart(f, use_container_width=True)
+            f.update_layout(**_layout(f"Total energy consumption (M GJ)", 260))
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "13"))
         with c2:
             f = go.Figure([
-                _line(yrs, scope1_total, "Scope 1", C["red"],
+                _line(yrs, plot_sc1, "Scope 1", C["red"],
                     fill="tozeroy", fill_color="rgba(200,16,46,.10)"),
-                _line(yrs, scope2_total, "Scope 2", C["blue"],
+                _line(yrs, plot_sc2, "Scope 2", C["blue"],
                     fill="tozeroy", fill_color="rgba(29,78,216,.10)"),
             ])
             f.update_layout(**_layout("CO₂ emissions — Scope 1 vs Scope 2 (M T.CO₂)", 260))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "14"))
 
         c3, c4 = st.columns(2)
         with c3:
@@ -2015,12 +2400,12 @@ def page_analysis():
             f.update_layout(**_layout("Fuel mix evolution (%)", 260,
                 barmode="stack",
                 yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "15"))
         with c4:
-            f = go.Figure([_line(yrs, water_total, "Water withdrawals (M m³)", C["teal"],
+            f = go.Figure([_line(yrs, plot_water, "Water withdrawals (M m³)", C["teal"],
                 fill="tozeroy", fill_color="rgba(8,145,178,.08)")])
             f.update_layout(**_layout("Water withdrawals (M m³)", 260))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "16"))
 
         c5, c6, c7 = st.columns(3)
         with c5:
@@ -2029,7 +2414,7 @@ def page_analysis():
                 hovertemplate="%{y:.1f}%<extra>Renewable</extra>"))
             f.update_layout(**_layout("Renewable electricity share (%)", 230,
                 yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "17"))
         with c6:
             f = go.Figure()
             f.add_trace(go.Bar(x=yrs, y=waste_recov, name="Recovery %",
@@ -2038,14 +2423,14 @@ def page_analysis():
                 name="Elimination %", marker_color="rgba(200,16,46,.35)", marker_line_width=0))
             f.update_layout(**_layout("Waste recovery rate (%)", 230,
                 barmode="stack", yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "18"))
         with c7:
             f = go.Figure(go.Bar(x=yrs, y=iso_cert,
                 marker_color="rgba(10,34,64,.7)", marker_line_width=0,
                 hovertemplate="%{y:.1f}%<extra>ISO 14001</extra>"))
             f.update_layout(**_layout("ISO 14001 certification rate (%)", 230,
                 yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "19"))
 
         # ── Client-visible: own company vs sector average ─────────────────────
         if not is_dss_user:
@@ -2071,7 +2456,7 @@ def page_analysis():
                             marker=dict(size=4),
                             hovertemplate=f"{client_co.split()[0]}: %{{y:.2f}} GJ/T<extra></extra>"))
                         _f.update_layout(**_layout("Energy intensity — your company vs sector (GJ/T)", 240))
-                        st.plotly_chart(_f, use_container_width=True)
+                        st.plotly_chart(_f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "20"))
 
                 with _c2:
                     _s_co2 = _co_series(client_co, "Total CO2 - KPI")
@@ -2087,7 +2472,7 @@ def page_analysis():
                             marker=dict(size=4),
                             hovertemplate=f"{client_co.split()[0]}: %{{y:.3f}} T.CO₂/T<extra></extra>"))
                         _f2.update_layout(**_layout("CO₂ intensity — your company vs sector (T.CO₂/T)", 240))
-                        st.plotly_chart(_f2, use_container_width=True)
+                        st.plotly_chart(_f2, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "21"))
 
                 _c3, _c4 = st.columns(2)
                 with _c3:
@@ -2101,7 +2486,7 @@ def page_analysis():
                             name=client_co.split()[0], mode="lines+markers",
                             line=dict(color=C["teal"], width=2), marker=dict(size=4)))
                         _fw.update_layout(**_layout("Water intensity — your company vs sector (m³/T)", 240))
-                        st.plotly_chart(_fw, use_container_width=True)
+                        st.plotly_chart(_fw, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "22"))
 
                 with _c4:
                     _sr = _co_series(client_co, "Waste_Recovery_Rate_%")
@@ -2116,7 +2501,7 @@ def page_analysis():
                             line=dict(color=C["green"], width=2), marker=dict(size=4)))
                         _fr.update_layout(**_layout("Waste recovery rate — your company vs sector (%)", 240,
                             yaxis=dict(ticksuffix="%", gridcolor=C["grid"])))
-                        st.plotly_chart(_fr, use_container_width=True)
+                        st.plotly_chart(_fr, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "23"))
 
     # ── TAB 2: PATHWAY 1 & 2 — DSS EMPLOYEES ONLY ────────────────────────────
     if is_dss_user and tab_p12 is not None:
@@ -2129,13 +2514,13 @@ def page_analysis():
             f = go.Figure([_line(yrs, energy_total, "Total energy (M GJ)", C["green"],
                 fill="tozeroy", fill_color="rgba(0,145,110,.08)")])
             f.update_layout(**_layout("Sector total energy (M GJ)", 270))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "24"))
         with c2:
             f = go.Figure([_line(yrs, energy_kpi, "Energy intensity (GJ/T)", C["purple"])])
             f.add_hrect(y0=8.0, y1=9.5, fillcolor="rgba(0,145,110,.07)", line_width=0,
                 annotation_text="Target range", annotation_font_size=10)
             f.update_layout(**_layout("Energy intensity — GJ per metric ton", 270))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "25"))
 
         if has_wide and companies:
             rows = []
@@ -2156,7 +2541,7 @@ def page_analysis():
                 f.update_layout(**_layout("Energy intensity (GJ/T) — 2009 vs 2023 by company",
                     260, barmode="group",
                     yaxis=dict(title="GJ/metric T", gridcolor=C["grid"])))
-                st.plotly_chart(f, use_container_width=True)
+                st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "26"))
 
         st.divider()
         st.markdown("##### Pathway 2 — CO₂ emissions & intensity")
@@ -2173,13 +2558,13 @@ def page_analysis():
                 fill="tonexty", fillcolor="rgba(29,78,216,.12)",
                 line=dict(color=C["blue"], width=2)))
             f.update_layout(**_layout("CO₂ — Scope 1 & 2 stacked (M T.CO₂)", 270))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "27"))
         with c4:
             f = go.Figure([_line(yrs, co2_kpi, "CO₂ intensity (T.CO₂/T)", C["red"])])
             f.add_hrect(y0=0.55, y1=0.70, fillcolor="rgba(0,145,110,.07)", line_width=0,
                 annotation_text="Target range", annotation_font_size=10)
             f.update_layout(**_layout("CO₂ intensity — T.CO₂ per metric ton", 270))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "28"))
 
         c5, c6, c7 = st.columns(3)
         with c5:
@@ -2189,7 +2574,7 @@ def page_analysis():
                 marker_colors=[C["red"], C["blue"]], textfont_size=12,
                 hovertemplate="%{label}: %{value:.3f}M<extra></extra>"))
             f.update_layout(**_layout("Scope 1 vs Scope 2 — 2023", 240, legend_h=False))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "29"))
         with c6:
             if companies:
                 co_names, co_vals = [], []
@@ -2209,7 +2594,7 @@ def page_analysis():
                     f.update_layout(**_layout("CO₂ intensity by company — 2023", 240,
                         legend_h=False,
                         xaxis=dict(title="T.CO₂/metric T", gridcolor=C["grid"])))
-                    st.plotly_chart(f, use_container_width=True)
+                    st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "30"))
         with c7:
             if companies:
                 import pandas as _pd
@@ -2238,13 +2623,13 @@ def page_analysis():
             f = go.Figure([_line(yrs, water_total, "Water withdrawals (M m³)", C["teal"],
                 fill="tozeroy", fill_color="rgba(8,145,178,.08)")])
             f.update_layout(**_layout("Sector water withdrawals (M m³)", 280))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "31"))
         with c2:
             f = go.Figure([_line(yrs, water_kpi_v, "Water intensity (m³/T)", C["teal"])])
             f.add_hrect(y0=5.5, y1=7.5, fillcolor="rgba(0,145,110,.07)", line_width=0,
                 annotation_text="Target range", annotation_font_size=10)
             f.update_layout(**_layout("Water intensity — m³ per metric ton", 280))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "32"))
 
         if has_wide and companies:
             f = go.Figure()
@@ -2261,7 +2646,7 @@ def page_analysis():
                 mode="lines", line=dict(color="#000", width=2, dash="dot")))
             f.update_layout(**_layout(
                 "Water intensity (m³/T) — per company vs sector average", 310, legend_h=False))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "33"))
 
             c3, c4 = st.columns(2)
             with c3:
@@ -2280,7 +2665,7 @@ def page_analysis():
                         hovertemplate="%{x:.2f} m³/T<extra>%{y}</extra>"))
                     f.update_layout(**_layout("Water intensity ranking — 2023 (m³/T)",
                         260, legend_h=False))
-                    st.plotly_chart(f, use_container_width=True)
+                    st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "34"))
             with c4:
                 if "Water intake" in df.columns and "Production" in df.columns:
                     yr_df = df[df["Year"]==2023].dropna(subset=["Water intake","Production"])
@@ -2298,7 +2683,7 @@ def page_analysis():
                             legend_h=False,
                             xaxis=dict(title="Production (M T)", gridcolor=C["grid"]),
                             yaxis=dict(title="Water (M m³)", gridcolor=C["grid"])))
-                        st.plotly_chart(f, use_container_width=True)
+                        st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "35"))
 
     # ── TAB 4: PATHWAY 4 — DSS EMPLOYEES ONLY ────────────────────────────────
     if is_dss_user and tab_p4 is not None:
@@ -2318,7 +2703,7 @@ def page_analysis():
                 hovertemplate="Eliminated: %{y:,.0f} T<extra></extra>"))
             f.update_layout(**_layout("Waste — recovery vs elimination (metric T)", 280,
                 barmode="stack", yaxis=dict(gridcolor=C["grid"])))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "36"))
         with c2:
             f = go.Figure(go.Scatter(x=yrs, y=waste_recov, name="Recovery rate",
                 fill="tozeroy", fillcolor="rgba(0,145,110,.10)",
@@ -2326,7 +2711,7 @@ def page_analysis():
                 hovertemplate="Recovery: %{y:.1f}%<extra></extra>"))
             f.update_layout(**_layout("Waste recovery rate — sector average (%)", 280,
                 yaxis=dict(range=[50,100], ticksuffix="%", gridcolor=C["grid"])))
-            st.plotly_chart(f, use_container_width=True)
+            st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "37"))
 
         if has_wide and companies:
             c3, c4 = st.columns(2)
@@ -2349,7 +2734,7 @@ def page_analysis():
                         annotation_text="80% target", annotation_font_size=10)
                     f.update_layout(**_layout("Waste recovery by company — 2023 (%)", 260,
                         yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
-                    st.plotly_chart(f, use_container_width=True)
+                    st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "38"))
             with c4:
                 f = go.Figure(go.Bar(x=yrs, y=iso_cert,
                     marker_color="rgba(10,34,64,.75)", marker_line_width=0,
@@ -2358,7 +2743,7 @@ def page_analysis():
                     annotation_text="100% target", annotation_font_size=10)
                 f.update_layout(**_layout("ISO 14001 certification rate — sector (%)", 260,
                     yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
-                st.plotly_chart(f, use_container_width=True)
+                st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "39"))
 
             import pandas as _pd2
             iso_rows = {}
@@ -2386,46 +2771,49 @@ def page_analysis():
                     margin=dict(l=100,r=30,t=40,b=30),
                     xaxis=dict(tickangle=-45, gridcolor=C["grid"]),
                     yaxis=dict(gridcolor=C["grid"])))
-                st.plotly_chart(f, use_container_width=True)
+                st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "40"))
 
 
 # ─────────────────────────────────────────────────────────
 # PAGE 3 -- BENCHMARKING
 # ─────────────────────────────────────────────────────────
 def _compute_industry_scores(df, year):
-    """Compute median scores across all companies for a given year (for radar)."""
+    """Compute sector median scores (0–100, 100=best) for the 5 TIP KPIs."""
+    KPI_MAP = [
+        ("Total CO2 - KPI",              True,  0.55, 0.82),
+        ("Total energy - KPI",           True,  8.0,  10.5),
+        ("Water intake - KPI",           True,  5.5,  9.0),
+        ("Renewable_Electricity_Share_%", False, 0.0,  100.0),
+        ("Waste_Recovery_Rate_%",         False, 70.0, 100.0),
+    ]
     if df.empty or "Row_Label" in df.columns:
-        return [65, 70, 65, 74, 52, 74]
+        return [50.0] * 5
     yr_df = df[df["Year"] == year]
     if yr_df.empty:
-        return [65, 70, 65, 74, 52, 74]
+        # Try nearest year
+        nearest = df["Year"].dropna().unique()
+        if len(nearest):
+            yr_df = df[df["Year"] == nearest[abs(nearest - year).argmin()]]
+        if yr_df.empty:
+            return [50.0] * 5
     scores = []
-    kpi_map = [
-        ("Total CO2 - KPI",   True,  0.55, 0.82),
-        ("Total energy - KPI",True,  8.0,  10.5),
-        ("Water intake - KPI",True,  5.5,  9.0),
-        ("Total CO2 - KPI",   True,  0.55, 0.82),   # proxy for waste (reuse co2)
-        ("Renewable_Electricity_Share_%", False, 0.0, 100.0),
-    ]
-    for col, lower_better, best, worst in kpi_map:
-        if col in yr_df.columns:
-            med = float(yr_df[col].median())
-            span = abs(worst - best) if worst != best else 1
-            if lower_better:
-                s = max(0, min(100, (worst - med) / span * 100))
-            else:
-                s = max(0, min(100, (med - best) / span * 100))
-            scores.append(round(s, 1))
+    for col, lower_better, best, worst in KPI_MAP:
+        if col in yr_df.columns and yr_df[col].notna().any():
+            med  = float(yr_df[col].median())
+            span = abs(worst - best) or 1
+            s    = ((worst - med) / span * 100 if lower_better
+                    else (med - best) / span * 100)
+            scores.append(round(max(0, min(100, s)), 1))
         else:
-            scores.append(65)
-    scores += [74]   # H&S -- not in KPI set
+            scores.append(50.0)
     return scores
 
 
 def _load_company_year_outputs(company: str, year: int):
     """
     Load inputs and compute outputs for any company+year from the consolidated DB.
-    Returns (TemplateInputs, TemplateOutputs) or falls back to session state.
+    Returns (TemplateInputs, TemplateOutputs) — never falls back to session state
+    (session state belongs to the logged-in client, not the selected company).
     """
     hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
     if hist:
@@ -2434,8 +2822,9 @@ def _load_company_year_outputs(company: str, year: int):
         if sd_clean:
             inp = TemplateInputs(company=company, year=year, **sd_clean)
             return inp, calculate(inp)
-    # fallback to session state
-    return get_current_outputs()
+    # Neutral fallback — do NOT use session state (that's the logged-in client's data)
+    inp = TemplateInputs(company=company, year=year)
+    return inp, calculate(inp)
 
 
 def _compute_kpi_improvement(company: str, base_year: int, end_year: int) -> dict:
@@ -2466,227 +2855,790 @@ def _compute_kpi_improvement(company: str, base_year: int, end_year: int) -> dic
 
 
 
+
+def _chart_key(*args) -> str:
+    """Unique chart key that changes with company/year selection → forces animation replay."""
+    return "__".join(str(a).replace(" ","_") for a in args)
+
 def page_benchmarking():
-    st.markdown("## Peer Benchmarking")
+    """
+    Benchmarking — KPI-topic tabs (General, CO₂, Energy, Electricity, Water, Waste).
+    Client: no company selector (own company only).
+    DSS+: company dropdown.
+    No peer company names exposed in any chart.
+    PDF download available per tab.
+    """
+    from pdf_report import generate_executive_pdf, build_kpi_dict_from_outputs, REPORTLAB_OK
+    import io
 
-    # ── Company + year selector ──────────────────────────────────────────────
+    st.markdown(section_header_html("Benchmarking",
+        "Industry peer comparison · TIP sector quartiles"), unsafe_allow_html=True)
+
     companies_in_db = dl.get_companies(_CONSOLIDATED_DF) or COMPANIES
-    default_co = (st.session_state.get("reporting_company") or
-                  st.session_state.get("user_company") or companies_in_db[0])
-    if default_co not in companies_in_db:
-        default_co = companies_in_db[0]
+    is_dss = st.session_state.get("is_dss", False)
 
-    sel_col, yr_col, _ = st.columns([2, 1, 3])
-    with sel_col:
-        company = st.selectbox("Company", options=companies_in_db,
-                               index=companies_in_db.index(default_co),
-                               key="bench_company_sel")
-    with yr_col:
+    # ── Selectors ─────────────────────────────────────────────────────────────
+    if is_dss:
+        default_co = (st.session_state.get("reporting_company") or
+                      st.session_state.get("user_company") or companies_in_db[0])
+        if default_co not in companies_in_db: default_co = companies_in_db[0]
+        c1, c2, _ = st.columns([2, 1, 3])
+        with c1:
+            company = st.selectbox("Company", companies_in_db,
+                                   index=companies_in_db.index(default_co),
+                                   key="bench_company_dss")
+        with c2:
+            avail_yrs = dl.get_years(_CONSOLIDATED_DF, company) or [CURR_YEAR]
+            rep_year  = st.selectbox("Year", sorted(avail_yrs, reverse=True),
+                                     key="bench_year_dss")
+    else:
+        company   = st.session_state.user_company
         avail_yrs = dl.get_years(_CONSOLIDATED_DF, company) or [CURR_YEAR]
-        rep_year  = st.selectbox("Year", options=sorted(avail_yrs, reverse=True),
-                                 key="bench_year_sel")
+        c2, _     = st.columns([1, 4])
+        with c2:
+            rep_year = st.selectbox("Year", sorted(avail_yrs, reverse=True),
+                                    key="bench_year_client")
 
-    # ── Load real data for selected company+year from consolidated DB ─────────
+    # ── Load data ─────────────────────────────────────────────────────────────
     inp, out = _load_company_year_outputs(company, rep_year)
-    renew_val = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
-
-    bench_source = "live consolidated dataset" if not _CONSOLIDATED_DF.empty else "built-in demo data"
-    st.caption(f"Benchmarking uses the {bench_source} · {len(companies_in_db)} companies · quartiles from all TIP members.")
-    st.divider()
-
-    # ── Live quartiles from ALL companies for the reporting year ──────────────
     bench_kpis = dl.get_benchmark_kpis(_CONSOLIDATED_DF, rep_year)
+    renew_val  = (inp.renew_elec_purchased + inp.self_gen_elec) / max(out.total_electricity, 1) * 100
+    waste_pct  = out.waste_recovery_pct * 100
 
-    def live_bench(kpi_col, company_value, unit, lower_better):
-        vals = bench_kpis[kpi_col].dropna().values if (not bench_kpis.empty and kpi_col in bench_kpis.columns) else []
+    def live_bench(col, val, unit, lb):
+        vals = bench_kpis[col].dropna().values if (not bench_kpis.empty and col in bench_kpis.columns) else []
         if len(vals) >= 3:
-            q25 = float(np.percentile(vals, 25))
-            med = float(np.percentile(vals, 50))
-            q75 = float(np.percentile(vals, 75))
+            q25, med, q75 = (float(np.percentile(vals, p)) for p in [25, 50, 75])
+            lo,  hi       = float(np.percentile(vals, 10)), float(np.percentile(vals, 90))
         else:
-            q25 = company_value * 0.85; med = company_value; q75 = company_value * 1.15
-        return BenchmarkResult(kpi_col, company_value, q25, med, q75, unit, lower_better)
+            q25, med, q75, lo, hi = val*.85, val, val*1.15, val*.7, val*1.3
+        b = BenchmarkResult(col, val, q25, med, q75, unit, lb)
+        b._lo, b._hi, b._vals = lo, hi, vals
+        return b
 
-    benchmarks = [
-        live_bench("Total CO2 - KPI",             out.co2_kpi,                "T.CO2/T", True),
-        live_bench("Total energy - KPI",           out.energy_kpi,             "GJ/T",    True),
-        live_bench("Water intake - KPI",           out.water_kpi,              "m³/T",    True),
-        live_bench("Renewable_Electricity_Share_%",renew_val,                  "%",       False),
-        live_bench("waste_recovery_pct",           out.waste_recovery_pct*100, "%",       False),
+    BM = [
+        live_bench("Total CO2 - KPI",              out.co2_kpi,  "T.CO₂/T", True),
+        live_bench("Total energy - KPI",            out.energy_kpi,"GJ/T",   True),
+        live_bench("Water intake - KPI",            out.water_kpi, "m³/T",   True),
+        live_bench("Renewable_Electricity_Share_%", renew_val,     "%",      False),
+        live_bench("Waste_Recovery_Rate_%",         waste_pct,     "%",      False),
     ]
-    kpi_labels = ["CO₂ intensity","Energy intensity","Water intensity","Renewable electricity","Waste recovery rate"]
-    for b, lbl in zip(benchmarks, kpi_labels): b.kpi_name = lbl
+    KPI_NAMES = ["CO₂ Intensity","Energy Intensity","Water Intensity","Renewable Elec.","Waste Recovery"]
+    KPI_COLORS = [CAT_CO2, CAT_ENERGY, CAT_WATER, CAT_RENEW, CAT_WASTE]
+    for b, n in zip(BM, KPI_NAMES): b.kpi_name = n
 
-    col_l, col_r = st.columns(2)
-    with col_l:
-        with st.container(border=True):
-            st.markdown("#### Industry band positioning")
-            st.caption(f"{company} {rep_year} KPI vs all TIP member quartile ranges.")
-            st.markdown("""
-            <div style="display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap">
-              <span style="font-size:11px;display:flex;align-items:center;gap:4px;color:#6B7280">
-                <span style="width:12px;height:10px;background:#D1FAE5;border-radius:2px;display:inline-block"></span>Top 25%</span>
-              <span style="font-size:11px;display:flex;align-items:center;gap:4px;color:#6B7280">
-                <span style="width:12px;height:10px;background:#FEF3C7;border-radius:2px;display:inline-block"></span>Mid 50%</span>
-              <span style="font-size:11px;display:flex;align-items:center;gap:4px;color:#6B7280">
-                <span style="width:12px;height:10px;background:#FEE2E2;border-radius:2px;display:inline-block"></span>Bottom 25%</span>
+    # ── Enhanced KPI summary boxes with position bar ──────────────────────────
+    chip_cols = st.columns(5)
+    for i, (b, color) in enumerate(zip(BM, KPI_COLORS)):
+        # Position within sector range as 0–100
+        rng = max(b._hi - b._lo, 0.001)
+        pos = (b.company_value - b._lo) / rng   # 0=best for lb, 1=worst
+        pos_pct = (1 - pos) * 100 if b.lower_is_better else pos * 100  # 100=best always
+        pos_pct = max(0, min(100, pos_pct))
+        rank_col = GREEN if pos_pct >= 70 else (AMBER if pos_pct >= 40 else RED)
+        rank_lbl = ("Top quartile" if pos_pct >= 75 else
+                    "Above median" if pos_pct >= 50 else
+                    "Below median" if pos_pct >= 25 else "Bottom quartile")
+        with chip_cols[i]:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
+                padding:12px;animation:tipFadeIn 400ms ease-out {i*60}ms both">
+              <div style="font-size:9.5px;color:{MUTED};font-weight:600;text-transform:uppercase;
+                  letter-spacing:.5px;margin-bottom:6px">{b.kpi_name}</div>
+              <div style="font-size:22px;font-weight:700;color:{color};
+                  font-variant-numeric:tabular-nums;line-height:1">{b.company_value:.2f}</div>
+              <div style="font-size:9px;color:{MUTED};margin-bottom:8px">{b.unit}</div>
+              <div style="background:#F1F5F9;border-radius:4px;height:5px;overflow:hidden;margin-bottom:5px">
+                <div style="background:{rank_col};width:{pos_pct:.0f}%;height:100%;border-radius:4px;
+                    transition:width 1s ease"></div>
+              </div>
+              <div style="display:flex;justify-content:space-between;font-size:9px;color:{MUTED}">
+                <span>{"Worst" if b.lower_is_better else "Low"}</span>
+                <span style="color:{rank_col};font-weight:600">{rank_lbl}</span>
+                <span>{"Best" if b.lower_is_better else "High"}</span>
+              </div>
             </div>""", unsafe_allow_html=True)
-            bands_html = '<div class="band-container">'
-            for b in benchmarks:
-                bands_html += band_html(b.kpi_name, b.company_value, b.q25, b.median, b.q75, b.unit, b.lower_is_better)
-            bands_html += "</div>"
-            st.markdown(bands_html, unsafe_allow_html=True)
 
-    with col_r:
-        with st.container(border=True):
-            st.markdown("#### ESG profile — vs TIP industry median")
-            st.caption(f"Normalised 0–100 from actual quartile positions. {company} {rep_year} vs sector median.")
-            dims = ["CO₂ intensity","Energy efficiency","Water management","Waste recovery","Renewable energy","H&S performance"]
+    st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
 
-            company_scores = []
-            for b in benchmarks[:5]:
+    # ── Helpers ────────────────────────────────────────────────────────────────
+    comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    all_years = sorted(dl.get_years(_CONSOLIDATED_DF, company) or [rep_year])
+    from formula_engine import TemplateInputs as TI, calculate as calc
+    valid_flds = {f.name for f in TI.__dataclass_fields__.values()}
+
+    def _co_trend(field_key):
+        """Return dict year→value for a computed KPI across all years."""
+        result = {}
+        for y in all_years:
+            sd = dl.get_step_data(comp_hist, y)
+            sc = {k: v for k, v in sd.items() if k in valid_flds}
+            if not sc: continue
+            o  = calc(TI(company=company, year=y, **sc))
+            ii = TI(company=company, year=y, **sc)
+            rt = max(ii.renew_elec_purchased + ii.nonrenew_elec_purchased + ii.self_gen_elec, 1)
+            result[y] = {
+                "co2_kpi": o.co2_kpi, "energy_kpi": o.energy_kpi,
+                "water_kpi": o.water_kpi, "waste_pct": o.waste_recovery_pct*100,
+                "renew_pct": ii.renew_elec_purchased / rt * 100,
+                "nonrenew_pct": ii.nonrenew_elec_purchased / rt * 100,
+                "renew_gj": ii.renew_elec_purchased,
+                "nonrenew_gj": ii.nonrenew_elec_purchased,
+                "nat_gas": ii.nat_gas, "coal": ii.coal_sub,
+                "diesel": ii.diesel, "biomass": ii.biomass,
+                "water_m3": ii.water_withdrawals,
+                "waste_total": ii.waste_total, "waste_rec": ii.waste_recovery,
+                "scope1": o.total_co2_scope1, "scope2": o.total_co2_scope2,
+            }
+        return result
+
+    trend = _co_trend(None)
+    ys    = sorted(trend.keys())
+
+    def _sector_series(col):
+        """Sector mean, p25, p75 by year."""
+        if _CONSOLIDATED_DF.empty or col not in _CONSOLIDATED_DF.columns:
+            return {}, {}, {}
+        grp = _CONSOLIDATED_DF.groupby("Year")[col]
+        return (grp.mean().to_dict(), grp.quantile(.25).to_dict(),
+                grp.quantile(.75).to_dict())
+
+    def _anon_scatter(col, your_val, color, title, xlab, ylab, x_col=None):
+        """Scatter plot of all peer values — anonymous dots + your company highlighted."""
+        fig = go.Figure()
+        yr_df = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"] == rep_year]
+        if not yr_df.empty and col in yr_df.columns:
+            peer_vals = yr_df[yr_df["Company"] != company][col].dropna()
+            x_vals    = (yr_df[yr_df["Company"] != company][x_col].dropna()
+                         if x_col else pd.Series([None]*len(peer_vals)))
+            # Anonymous peers
+            for j, (idx, pv) in enumerate(peer_vals.items()):
+                xv = float(yr_df.loc[idx, x_col]) if x_col and idx in yr_df.index else j+1
+                fig.add_trace(go.Scatter(
+                    x=[xv], y=[pv], mode="markers",
+                    marker=dict(size=9, color="#CBD5E1",
+                                line=dict(color="white", width=1)),
+                    name=f"Peer {j+1}", showlegend=False,
+                    hovertemplate=f"Peer: {pv:.3f}<extra></extra>",
+                ))
+        # Your company
+        fig.add_trace(go.Scatter(
+            x=[your_val if not x_col else float(
+                _CONSOLIDATED_DF[(_CONSOLIDATED_DF["Company"]==company) &
+                (_CONSOLIDATED_DF["Year"]==rep_year)].get(x_col, pd.Series([your_val])).iloc[0])],
+            y=[your_val], mode="markers+text",
+            marker=dict(size=14, color=color, symbol="diamond",
+                        line=dict(color="white", width=2)),
+            text=[company.split()[0]], textposition="top center",
+            textfont=dict(size=10, color=color, family="Inter"),
+            name="You", showlegend=False,
+            hovertemplate=f"<b>You</b>: {your_val:.3f}<extra></extra>",
+        ))
+        fig.update_layout(**chart_layout_defaults(title, height=250, showlegend=False),
+                          xaxis=dict(title=dict(text=xlab), gridcolor="#F1F5F9"),
+                          yaxis=dict(title=dict(text=ylab), gridcolor="#F1F5F9"))
+        apply_chart_animation(fig)
+        return fig
+
+    def _trend_vs_sector(kpi_key, sec_col, label, color, show_quartiles=True):
+        """Company trend line vs sector IQR band with Q1/Median/Q3 reference lines."""
+        sec_mean, sec_q25, sec_q75 = _sector_series(sec_col)
+        yr_list = sorted(set(ys) | set(sec_mean.keys()))
+        fig = go.Figure()
+        # IQR band (Q1–Q3 shaded)
+        fig.add_trace(go.Scatter(
+            x=yr_list, y=[sec_q75.get(y) for y in yr_list],
+            fill=None, mode="lines", line=dict(width=0), showlegend=False,
+            name="Q3"))
+        fig.add_trace(go.Scatter(
+            x=yr_list, y=[sec_q25.get(y) for y in yr_list],
+            fill="tonexty", mode="lines", line=dict(width=0),
+            fillcolor=f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.12)",
+            name="Sector IQR (Q1–Q3)",
+        ))
+        if show_quartiles:
+            # Q1 line
+            fig.add_trace(go.Scatter(
+                x=yr_list, y=[sec_q25.get(y) for y in yr_list],
+                mode="lines", name="Q1 (25th pct)",
+                line=dict(color="#94A3B8", width=1, dash="dot"),
+                hovertemplate="Q1: %{y:.3f}<extra></extra>",
+            ))
+            # Sector median
+            fig.add_trace(go.Scatter(
+                x=yr_list, y=[sec_mean.get(y) for y in yr_list],
+                mode="lines", name="Sector Median",
+                line=dict(color="#64748B", width=1.5, dash="dashdot"),
+                hovertemplate="Median: %{y:.3f}<extra></extra>",
+            ))
+            # Q3 line
+            fig.add_trace(go.Scatter(
+                x=yr_list, y=[sec_q75.get(y) for y in yr_list],
+                mode="lines", name="Q3 (75th pct)",
+                line=dict(color="#94A3B8", width=1, dash="dot"),
+                hovertemplate="Q3: %{y:.3f}<extra></extra>",
+            ))
+        # Company line (always on top)
+        co_y = [trend[y][kpi_key] for y in ys if y in trend]
+        fig.add_trace(go.Scatter(
+            x=ys, y=co_y, mode="lines+markers",
+            name=company.split()[0],
+            line=dict(color=color, width=2.5),
+            marker=dict(size=6, color=color),
+            hovertemplate="%{y:.3f}<extra>" + company.split()[0] + "</extra>",
+        ))
+        fig.update_layout(**chart_layout_defaults(label, height=270),
+                          hovermode="x unified",
+                          yaxis=dict(gridcolor="#F1F5F9"),
+                          xaxis=dict(gridcolor="#F1F5F9"))
+        apply_chart_animation(fig)
+        return fig
+
+    def _pdf_download_btn(label: str, key: str, figs_data: list = None):
+        """
+        Generate a multi-section benchmarking PDF using matplotlib (no kaleido).
+        figs_data: list of (section_title, chart_type, *data_args) tuples.
+        """
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import pdf_charts_v2 as pc
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units    import mm
+            from reportlab.pdfgen       import canvas as rl_canvas
+            from reportlab.lib.utils    import ImageReader
+            import io as _io
+
+            W, H = A4; MARGIN = 14*mm; CW = W - 2*MARGIN
+            buf = _io.BytesIO()
+            c   = rl_canvas.Canvas(buf, pagesize=A4)
+
+            # Cover header
+            c.setFillColor((10/255, 34/255, 64/255))
+            c.rect(0, H - 26*mm, W, 26*mm, fill=1, stroke=0)
+            c.setFont("Helvetica-Bold", 13)
+            c.setFillColor((1,1,1))
+            c.drawString(MARGIN, H - 12*mm, f"{company}  ·  {rep_year}  —  {label} Benchmarking")
+            c.setFont("Helvetica", 8)
+            c.setFillColor((0.55, 0.65, 0.75))
+            c.drawString(MARGIN, H - 20*mm, "TIP ESG Platform  ·  dss+ consulting  ·  WBCSD Tire Industry Project")
+            cursor = H - 30*mm
+
+            def _embed(img_bytes, title="", h=62*mm):
+                nonlocal cursor
+                if cursor - h < MARGIN + 10*mm:
+                    c.showPage(); cursor = H - MARGIN
+                if title:
+                    c.setFont("Helvetica-Bold", 9); c.setFillColor((10/255,34/255,64/255))
+                    c.drawString(MARGIN, cursor - 5*mm, title); cursor -= 7*mm
+                reader = ImageReader(_io.BytesIO(img_bytes))
+                c.drawImage(reader, MARGIN, cursor - h, width=CW, height=h,
+                            preserveAspectRatio=True)
+                cursor -= h + 5*mm
+
+            if figs_data:
+                # Compute sector series once for trend charts
+                def _ss(col):
+                    if _CONSOLIDATED_DF.empty or col not in _CONSOLIDATED_DF.columns:
+                        return {}, {}, {}
+                    grp = _CONSOLIDATED_DF.groupby("Year")[col]
+                    return grp.mean().to_dict(), grp.quantile(.25).to_dict(), grp.quantile(.75).to_dict()
+
+                for item in figs_data:
+                    kind = item[0]
+                    if kind == "radar":
+                        _, dims, co_sc, sec_sc, co_name = item
+                        _embed(pc.radar_chart(dims, co_sc, sec_sc, co_name), "ESG Performance Radar")
+                    elif kind == "position_bar":
+                        _, names, positions, colors_list = item
+                        _embed(pc.position_bar(names, positions, colors_list), "Sector Percentile Position")
+                    elif kind == "improvement_table":
+                        _, rows = item
+                        # Simple text table
+                        if rows:
+                            c.setFont("Helvetica-Bold", 9)
+                            c.setFillColor((10/255,34/255,64/255))
+                            c.drawString(MARGIN, cursor - 4*mm, "Improvement Summary")
+                            cursor -= 7*mm
+                            c.setFont("Helvetica", 8)
+                            for row in rows:
+                                c.setFillColor((10/255,34/255,64/255))
+                                kpi_txt = str(row.get("KPI",""))
+                                val_txt = str(list(row.values())[-1])
+                                c.drawString(MARGIN, cursor - 4*mm, f"• {kpi_txt}: {val_txt}")
+                                cursor -= 5*mm
+                    elif kind == "line_vs_sector":
+                        _, sec_col, kpi_key, title_str, color = item
+                        sm, sq25, sq75 = _ss(sec_col)
+                        co_y = [trend.get(y, {}).get(kpi_key) for y in ys]
+                        _embed(pc.line_vs_sector(ys, co_y, sm, sq25, sq75,
+                               company.split()[0], title_str, color=color), title_str)
+                    elif kind == "stacked_area_scope":
+                        _, title_str = item
+                        _embed(pc.stacked_area(ys,
+                            {"Scope 1": [trend.get(y,{}).get("scope1",0) for y in ys],
+                             "Scope 2": [trend.get(y,{}).get("scope2",0) for y in ys]},
+                            title_str, color_dict={"Scope 1": pc.C["co2"], "Scope 2": "#94A3B8"}),
+                            title_str)
+                    elif kind == "energy_mix_bar":
+                        _, title_str = item
+                        fuel_map = {
+                            "Nat. Gas": [trend.get(y,{}).get("nat_gas",0) for y in ys],
+                            "Renew. Elec": [trend.get(y,{}).get("renew_gj",0) for y in ys],
+                            "Non-Renew.": [trend.get(y,{}).get("nonrenew_gj",0) for y in ys],
+                            "Coal":     [trend.get(y,{}).get("coal",0) for y in ys],
+                            "Diesel":   [trend.get(y,{}).get("diesel",0) for y in ys],
+                        }
+                        cmap = {"Nat. Gas":pc.C["energy"],"Renew. Elec":pc.C["green"],
+                                "Non-Renew.":"#94A3B8","Coal":"#475569","Diesel":"#78716C"}
+                        _embed(pc.stacked_bar(ys, fuel_map, title_str, color_dict=cmap), title_str)
+                    elif kind == "elec_mix_bar":
+                        _, title_str = item
+                        total_e = [max(trend.get(y,{}).get("renew_gj",0)+trend.get(y,{}).get("nonrenew_gj",0),1) for y in ys]
+                        _embed(pc.stacked_bar(ys, {
+                            "Renewable":     [trend.get(y,{}).get("renew_gj",0)/t*100 for y,t in zip(ys,total_e)],
+                            "Non-Renewable": [trend.get(y,{}).get("nonrenew_gj",0)/t*100 for y,t in zip(ys,total_e)],
+                        }, title_str, color_dict={"Renewable":pc.C["green"],"Non-Renewable":"#94A3B8"},
+                        pct_mode=True), title_str)
+                    elif kind == "water_bar":
+                        _, title_str = item
+                        _embed(pc.bar_chart(ys, [trend.get(y,{}).get("water_m3",0)/1e6 for y in ys],
+                               title_str, "M m³", color=pc.C["water"]), title_str)
+                    elif kind == "waste_area":
+                        _, title_str = item
+                        _embed(pc.area_with_target(ys, [trend.get(y,{}).get("waste_pct",0) for y in ys],
+                               title_str, "%", color=pc.C["waste"]), title_str)
+                    elif kind == "waste_bar":
+                        _, title_str = item
+                        _embed(pc.stacked_bar(ys, {
+                            "Total Waste": [trend.get(y,{}).get("waste_total",0) for y in ys],
+                            "Recovered":   [trend.get(y,{}).get("waste_rec",0)   for y in ys],
+                        }, title_str, color_dict={"Total Waste":"#E2E8F0","Recovered":pc.C["waste"]}),
+                        title_str)
+
+            c.save(); buf.seek(0); pdf_bytes = buf.read()
+            st.download_button(
+                f"⬇  Download {label} Report (PDF)",
+                data=pdf_bytes,
+                file_name=f"{company.replace(' ','_')}_{label.replace(' ','_')}_{rep_year}_Benchmark.pdf",
+                mime="application/pdf", key=key, use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"PDF generation failed: {e}. Make sure pdf_charts_v2.py and reportlab are installed.")
+
+    # ── Full combined PDF — all sections in one document ─────────────────────
+    def _full_bench_pdf():
+        """Generate one PDF with all 6 benchmark sections: General → Waste."""
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        try:
+            import pdf_charts_v2 as pc
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units    import mm
+            from reportlab.pdfgen       import canvas as rl_canvas
+            from reportlab.lib.utils    import ImageReader
+            import io as _io
+
+            W, H = A4; MARGIN = 14*mm; CW = W - 2*MARGIN
+            buf = _io.BytesIO()
+            cv  = rl_canvas.Canvas(buf, pagesize=A4)
+
+            def _cover():
+                cv.setFillColor((10/255, 34/255, 64/255))
+                cv.rect(0, H - 30*mm, W, 30*mm, fill=1, stroke=0)
+                cv.setFont("Helvetica-Bold", 14); cv.setFillColor((1,1,1))
+                cv.drawString(MARGIN, H - 13*mm, f"{company}  ·  ESG Benchmarking Report  ·  {rep_year}")
+                cv.setFont("Helvetica", 8); cv.setFillColor((.55,.65,.75))
+                cv.drawString(MARGIN, H-21*mm, "TIP ESG Platform  ·  dss+ consulting  ·  WBCSD Tire Industry Project")
+
+            def _section_title(cv, title, cursor):
+                cv.setFillColor((.94,.95,.98)); cv.rect(MARGIN, cursor-9*mm, CW, 9*mm, fill=1, stroke=0)
+                cv.setFillColor((10/255,34/255,64/255)); cv.rect(MARGIN, cursor-9*mm, 2.5, 9*mm, fill=1, stroke=0)
+                cv.setFont("Helvetica-Bold", 11); cv.setFillColor((10/255,34/255,64/255))
+                cv.drawString(MARGIN+5, cursor-6*mm, title)
+                return cursor - 11*mm
+
+            def _embed(cv, img_bytes, cursor, caption="", h=60*mm):
+                if cursor - h < MARGIN + 15*mm:
+                    cv.showPage(); _cover(); cursor = H - 34*mm
+                if caption:
+                    cv.setFont("Helvetica", 8); cv.setFillColor((.4,.4,.4))
+                    cv.drawString(MARGIN, cursor-4*mm, caption); cursor -= 6*mm
+                reader = ImageReader(_io.BytesIO(img_bytes))
+                cv.drawImage(reader, MARGIN, cursor-h, width=CW, height=h, preserveAspectRatio=True)
+                return cursor - h - 4*mm
+
+            def _ss(col):
+                if _CONSOLIDATED_DF.empty or col not in _CONSOLIDATED_DF.columns:
+                    return {},{},{}
+                grp = _CONSOLIDATED_DF.groupby("Year")[col]
+                return grp.mean().to_dict(), grp.quantile(.25).to_dict(), grp.quantile(.75).to_dict()
+
+            _cover()
+            cursor = H - 34*mm
+
+            # ── General ──────────────────────────────────────────────────────
+            cursor = _section_title(cv, "General — ESG Performance Overview", cursor)
+            dims = ["CO₂ Intensity","Energy Intensity","Water Intensity","Renewable Elec.","Waste Recovery"]
+            co_scores = []
+            for b in BM:
+                rng = max(b._hi - b._lo, 0.001)
+                raw = (b.company_value - b._lo) / rng
+                co_scores.append(max(0, min(100, (1-raw)*100 if b.lower_is_better else raw*100)))
+            sec_sc = _compute_industry_scores(_CONSOLIDATED_DF, rep_year)
+            cursor = _embed(cv, pc.radar_chart(dims, co_scores, sec_sc, company.split()[0]),
+                            cursor, "ESG Radar Profile — company vs sector median")
+            positions = [max(0,min(100,(1-(b.company_value-b._lo)/max(b._hi-b._lo,0.001))*100)) if b.lower_is_better
+                         else max(0,min(100,((b.company_value-b._lo)/max(b._hi-b._lo,0.001))*100)) for b in BM]
+            cursor = _embed(cv, pc.position_bar(
+                ["CO₂ Intensity","Energy Intensity","Water Intensity","Renewable Elec.","Waste Recovery"],
+                positions, [CAT_CO2, CAT_ENERGY, CAT_WATER, CAT_RENEW, CAT_WASTE]),
+                cursor, "Sector Percentile Position (100 = best)", h=45*mm)
+
+            # ── CO₂ ──────────────────────────────────────────────────────────
+            cursor = _section_title(cv, "CO₂ — Carbon Emissions & Intensity", cursor)
+            sm,sq25,sq75 = _ss("Total CO2 - KPI")
+            cursor = _embed(cv, pc.line_vs_sector(ys, [trend.get(y,{}).get("co2_kpi") for y in ys],
+                sm,sq25,sq75,company.split()[0],"CO₂ Intensity vs Sector (T.CO₂/T)",color=pc.C["co2"]),
+                cursor, "Company line vs sector IQR band · Q1/Median/Q3 shown")
+            cursor = _embed(cv, pc.stacked_area(ys,
+                {"Scope 1":[trend.get(y,{}).get("scope1",0) for y in ys],
+                 "Scope 2":[trend.get(y,{}).get("scope2",0) for y in ys]},
+                "Scope 1 vs Scope 2 (T.CO₂)",
+                color_dict={"Scope 1":pc.C["co2"],"Scope 2":"#94A3B8"}),
+                cursor, "Scope 1 = fuel combustion · Scope 2 = purchased energy")
+
+            # ── Energy ────────────────────────────────────────────────────────
+            cursor = _section_title(cv, "Energy — Intensity & Fuel Mix", cursor)
+            sm,sq25,sq75 = _ss("Total energy - KPI")
+            cursor = _embed(cv, pc.line_vs_sector(ys, [trend.get(y,{}).get("energy_kpi") for y in ys],
+                sm,sq25,sq75,company.split()[0],"Energy Intensity vs Sector (GJ/T)",color=pc.C["energy"]),
+                cursor)
+            cursor = _embed(cv, pc.stacked_bar(ys,
+                {"Nat. Gas":[trend.get(y,{}).get("nat_gas",0) for y in ys],
+                 "Renew. Elec":[trend.get(y,{}).get("renew_gj",0) for y in ys],
+                 "Diesel":[trend.get(y,{}).get("diesel",0) for y in ys],
+                 "Coal":[trend.get(y,{}).get("coal",0) for y in ys]},
+                "Energy Mix by Source (GJ)",
+                color_dict={"Nat. Gas":pc.C["energy"],"Renew. Elec":pc.C["green"],
+                            "Diesel":"#78716C","Coal":"#475569"}),
+                cursor, "Fuel mix evolution over all available years")
+
+            # ── Electricity ───────────────────────────────────────────────────
+            cursor = _section_title(cv, "Electricity — Renewable vs Non-Renewable", cursor)
+            total_e = [max(trend.get(y,{}).get("renew_gj",0)+trend.get(y,{}).get("nonrenew_gj",0),1) for y in ys]
+            cursor = _embed(cv, pc.stacked_bar(ys,
+                {"Renewable":[trend.get(y,{}).get("renew_gj",0)/t*100 for y,t in zip(ys,total_e)],
+                 "Non-Renewable":[trend.get(y,{}).get("nonrenew_gj",0)/t*100 for y,t in zip(ys,total_e)]},
+                "Electricity Mix (%)", pct_mode=True,
+                color_dict={"Renewable":pc.C["green"],"Non-Renewable":"#94A3B8"}), cursor)
+            sm,sq25,sq75 = _ss("Renewable_Electricity_Share_%")
+            cursor = _embed(cv, pc.line_vs_sector(ys,
+                [trend.get(y,{}).get("renew_pct") for y in ys],
+                sm,sq25,sq75,company.split()[0],"Renewable Electricity Share vs Sector (%)",color=pc.C["green"]),
+                cursor, "Share of electricity from renewable sources vs TIP sector quartiles")
+
+            # ── Water ─────────────────────────────────────────────────────────
+            cursor = _section_title(cv, "Water — Intensity & Withdrawals", cursor)
+            sm,sq25,sq75 = _ss("Water intake - KPI")
+            cursor = _embed(cv, pc.line_vs_sector(ys,
+                [trend.get(y,{}).get("water_kpi") for y in ys],
+                sm,sq25,sq75,company.split()[0],"Water Intensity vs Sector (m³/T)",color=pc.C["water"]),
+                cursor)
+            cursor = _embed(cv, pc.bar_chart(ys,
+                [trend.get(y,{}).get("water_m3",0)/1e6 for y in ys],
+                "Water Withdrawals (M m³)","M m³",color=pc.C["water"]), cursor)
+
+            # ── Waste ─────────────────────────────────────────────────────────
+            cursor = _section_title(cv, "Waste — Recovery Rate & Volumes", cursor)
+            sm,sq25,sq75 = _ss("Waste_Recovery_Rate_%")
+            cursor = _embed(cv, pc.area_with_target(ys,
+                [trend.get(y,{}).get("waste_pct",0) for y in ys],
+                "Waste Recovery Rate vs Sector (%)","% recovered",color=pc.C["waste"]),
+                cursor, "Target 90% shown · TIP sector IQR band")
+            cursor = _embed(cv, pc.stacked_bar(ys,
+                {"Total Waste":[trend.get(y,{}).get("waste_total",0) for y in ys],
+                 "Recovered":[trend.get(y,{}).get("waste_rec",0) for y in ys]},
+                "Total Waste vs Recovered (T)",
+                color_dict={"Total Waste":"#E2E8F0","Recovered":pc.C["waste"]}), cursor)
+
+            # Footer on last page
+            cv.setFillColor((.95,.96,.98)); cv.rect(0,0,W,11*mm,fill=1,stroke=0)
+            cv.setFont("Helvetica",6); cv.setFillColor((.4,.4,.4))
+            cv.drawString(MARGIN, 5*mm, "TIP ESG Platform · dss+ consulting · WBCSD Tire Industry Project · Methodology: GHG Protocol")
+            from datetime import date as _ddate
+            cv.drawRightString(W-MARGIN, 5*mm, f"Generated {_ddate.today():%d %b %Y} · {company} · {rep_year}")
+            cv.save(); buf.seek(0)
+            return buf.read()
+        except Exception as ex:
+            return None
+
+    _pdf_col, _ = st.columns([2, 4])
+    with _pdf_col:
+        _pdf_all = _full_bench_pdf()
+        if _pdf_all:
+            st.download_button(
+                "⬇  Download Full Benchmarking Report (PDF)",
+                data=_pdf_all,
+                file_name=f"{company.replace(' ','_')}_Benchmarking_{rep_year}.pdf",
+                mime="application/pdf", key="dl_full_bench",
+                use_container_width=True, type="primary",
+            )
+
+    # ── KPI Tabs ──────────────────────────────────────────────────────────────
+    tab_gen, tab_co2, tab_energy, tab_elec, tab_water, tab_waste = st.tabs([
+        "General", "CO₂", "Energy", "Electricity", "Water", "Waste"
+    ])
+
+    with tab_gen:
+        st.caption("Overall ESG performance profile vs sector")
+        c1, c2 = st.columns(2, gap="medium")
+        with c1:
+            # Radar — company vs sector median (no company names)
+            dims = ["CO₂ Intensity","Energy Intensity","Water Intensity",
+                    "Renewable Elec.","Waste Recovery"]
+            co_scores, sec_scores = [], []
+            for b in BM:
                 rng = max(b.q75 - b.q25, 0.001)
                 raw = (b.company_value - b.q25) / rng
-                company_scores.append(max(0, min(100, (1 - raw) * 100 if b.lower_is_better else raw * 100)))
-            company_scores += [75]   # H&S: not in KPI set, shown as neutral
+                co_scores.append(max(0, min(100, (1-raw)*100 if b.lower_is_better else raw*100)))
+            sec_scores = _compute_industry_scores(_CONSOLIDATED_DF, rep_year)
+            fig_rad = go.Figure()
+            fig_rad.add_trace(go.Scatterpolar(
+                r=co_scores + [co_scores[0]], theta=dims + [dims[0]],
+                fill="toself", name=company.split()[0],
+                line=dict(color=GREEN, width=2.5), fillcolor="rgba(22,163,74,0.15)",
+            ))
+            fig_rad.add_trace(go.Scatterpolar(
+                r=sec_scores + [sec_scores[0]], theta=dims + [dims[0]],
+                fill="toself", name="Sector Median",
+                line=dict(color="#94A3B8", width=1.5, dash="dot"),
+                fillcolor="rgba(148,163,184,0.08)",
+            ))
+            fig_rad.update_layout(
+                polar=dict(radialaxis=dict(range=[0,100],tickfont=dict(size=9)),
+                           angularaxis=dict(tickfont=dict(size=11, family="Inter"))),
+                height=340, margin=dict(l=50,r=50,t=30,b=30),
+                paper_bgcolor="rgba(0,0,0,0)", showlegend=True,
+                legend=dict(orientation="h", y=-0.08, font=dict(size=11)),
+                font=dict(family="Inter"),
+            )
+            apply_chart_animation(fig_rad)
+            st.plotly_chart(fig_rad, use_container_width=True, key=_chart_key(company, rep_year, "1"))
 
-            industry_scores = _compute_industry_scores(_CONSOLIDATED_DF, rep_year)
+        with c2:
+            # Quartile position bar chart for each KPI
+            fig_pos = go.Figure()
+            for j, (b, color) in enumerate(zip(BM, KPI_COLORS)):
+                rng = max(b._hi - b._lo, 0.001)
+                pos = (b.company_value - b._lo) / rng
+                pos_pct = (1 - pos)*100 if b.lower_is_better else pos*100
+                pos_pct = max(0, min(100, pos_pct))
+                fig_pos.add_trace(go.Bar(
+                    x=[pos_pct], y=[b.kpi_name], orientation="h",
+                    marker_color=color, marker_line_width=0,
+                    showlegend=False,
+                    hovertemplate=f"<b>{b.kpi_name}</b><br>Score: {pos_pct:.0f}/100<br>Value: {b.company_value:.3f} {b.unit}<extra></extra>",
+                ))
+            fig_pos.update_layout(
+                **chart_layout_defaults("Sector Percentile Position (100 = best)", height=260,
+                                        showlegend=False),
+                xaxis=dict(range=[0,100], ticksuffix="%", gridcolor="#F1F5F9"),
+                yaxis=dict(gridcolor="#F1F5F9"),
+                barmode="group",
+            )
+            apply_chart_animation(fig_pos)
+            st.plotly_chart(fig_pos, use_container_width=True, key=_chart_key(company, rep_year, "2"))
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatterpolar(
-                r=company_scores + [company_scores[0]], theta=dims + [dims[0]],
-                fill="toself", name=f"{company} {rep_year}",
-                line=dict(color="#00916E", width=2), fillcolor="rgba(0,145,110,.15)"))
-            fig.add_trace(go.Scatterpolar(
-                r=industry_scores + [industry_scores[0]], theta=dims + [dims[0]],
-                fill="toself", name=f"TIP median ({rep_year})",
-                line=dict(color="#9CA3AF", width=1.5, dash="dot"), fillcolor="rgba(156,163,175,.08)"))
-            fig.update_layout(
-                polar=dict(radialaxis=dict(range=[0, 100], tickfont=dict(size=9))),
-                showlegend=True, height=340, margin=dict(l=40, r=40, t=20, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            # Improvement table
+            base_yr = min(all_years)
+            impr = _compute_kpi_improvement(company, base_yr, rep_year)
+            impr_rows = [{"KPI": k, f"{base_yr}→{rep_year}": v} for k,v in impr.items()]
+            if impr_rows:
+                st.markdown(f"**Improvement since {base_yr}**")
+                st.dataframe(pd.DataFrame(impr_rows), hide_index=True,
+                             use_container_width=True)
 
-    # ── Improvement table: computed from real data for each year ──────────────
-    with st.container(border=True):
-        base_yr = min(dl.get_years(_CONSOLIDATED_DF, company) or [2009])
-        st.markdown(f"#### Improvement rate — {company} vs TIP sector average ({base_yr}→{rep_year})")
+        def _pos_score(b):
+            rng = max(b._hi - b._lo, 0.001)
+            raw = (b.company_value - b._lo) / rng
+            return max(0, min(100, (1-raw)*100 if b.lower_is_better else raw*100))
 
-        impr = _compute_kpi_improvement(company, base_yr, rep_year)
+        _pdf_download_btn("General Benchmarking", "dl_bench_gen", [
+            ("radar", ["CO₂ Intensity","Energy Intensity","Water Intensity",
+                       "Renewable Elec.","Waste Recovery"],
+             co_scores, sec_scores, company.split()[0]),
+            ("position_bar",
+             ["CO₂ Intensity","Energy Intensity","Water Intensity","Renewable Elec.","Waste Recovery"],
+             [_pos_score(BM[j]) for j in range(5)],
+             [CAT_CO2, CAT_ENERGY, CAT_WATER, CAT_RENEW, CAT_WASTE]),
+            ("improvement_table",
+             [{"KPI": k, f"{min(all_years)}→{rep_year}": v}
+              for k, v in _compute_kpi_improvement(company, min(all_years), rep_year).items()]),
+        ])
 
-        def _sector_impr(col_name):
-            if _CONSOLIDATED_DF.empty or "Row_Label" in _CONSOLIDATED_DF.columns:
-                return "N/A"
-            try:
-                df_col = _CONSOLIDATED_DF[[c for c in [col_name] if c in _CONSOLIDATED_DF.columns]]
-                if df_col.empty: return "N/A"
-                base = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"] == base_yr][col_name].mean()
-                end  = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"] == rep_year][col_name].mean()
-                if pd.notna(base) and pd.notna(end) and base != 0:
-                    return f"{(end - base) / abs(base) * 100:+.1f}%"
-            except Exception:
-                pass
-            return "N/A"
+    with tab_co2:
+        st.caption("CO₂ emissions intensity vs sector peers — Q1/Median/Q3 reference lines shown")
+        c1, c2 = st.columns(2, gap="medium")
+        fig_co2_trend = _trend_vs_sector("co2_kpi","Total CO2 - KPI",
+            "CO₂ Intensity Trend vs Sector (T.CO₂/T)", CAT_CO2)
+        with c1:
+            st.plotly_chart(fig_co2_trend, use_container_width=True, key=_chart_key(company,rep_year,"co2t"))
+        with c2:
+            fig_sc = go.Figure()
+            fig_sc.add_trace(go.Scatter(
+                x=ys, y=[trend[y]["scope2"] for y in ys],
+                name="Scope 2", stackgroup="scope", fill="tonexty",
+                mode="none", fillcolor="rgba(71,85,105,0.3)",
+            ))
+            fig_sc.add_trace(go.Scatter(
+                x=ys, y=[trend[y]["scope1"] for y in ys],
+                name="Scope 1", stackgroup="scope", fill="tonexty",
+                mode="none", fillcolor="rgba(71,85,105,0.6)",
+            ))
+            fig_sc.update_layout(**chart_layout_defaults("Scope 1 vs Scope 2 (T.CO₂)", height=270),
+                                  yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                                  xaxis=dict(gridcolor="#F1F5F9"),
+                                  hovermode="x unified")
+            apply_chart_animation(fig_sc)
+            st.plotly_chart(fig_sc, use_container_width=True, key=_chart_key(company, rep_year, "4"))
+        _pdf_download_btn("CO2", "dl_bench_co2", [
+            ("line_vs_sector", "Total CO2 - KPI", "co2_kpi",
+             "CO₂ Intensity Trend vs Sector (T.CO₂/T)", CAT_CO2),
+            ("stacked_area_scope", "Scope 1 vs Scope 2 (T.CO₂)"),
+        ])
 
-        impr_df = pd.DataFrame({
-            "KPI":                          list(impr.keys()),
-            f"Your improvement ({base_yr}→{rep_year})": list(impr.values()),
-            "TIP sector average": [
-                _sector_impr("Total CO2 - KPI"),
-                _sector_impr("Total energy - KPI"),
-                _sector_impr("Water intake - KPI"),
-                _sector_impr("Renewable_Electricity_Share_%"),
-                "N/A",
-            ],
-        })
+    with tab_energy:
+        st.caption("Energy intensity and consumption mix — Q1/Median/Q3 shown")
+        c1, c2 = st.columns(2, gap="medium")
+        fig_nrg_trend = _trend_vs_sector("energy_kpi","Total energy - KPI",
+            "Energy Intensity Trend vs Sector (GJ/T)", CAT_ENERGY)
+        with c1:
+            st.plotly_chart(fig_nrg_trend, use_container_width=True, key=_chart_key(company, rep_year, "5"))
+        with c2:
+            # Stacked bar energy sources
+            fuel_items = [
+                ("Natural Gas",[trend[y]["nat_gas"] for y in ys], CAT_ENERGY),
+                ("Coal",       [trend[y]["coal"]    for y in ys], "#475569"),
+                ("Diesel",     [trend[y]["diesel"]  for y in ys], "#78716C"),
+                ("Biomass",    [trend[y]["biomass"] for y in ys], CAT_RENEW),
+                ("Renew. Elec",[trend[y]["renew_gj"]for y in ys], "#0891B2"),
+            ]
+            fig_fuel = go.Figure()
+            for lbl, vals, col in fuel_items:
+                if any(v>0 for v in vals):
+                    fig_fuel.add_trace(go.Bar(name=lbl, x=ys, y=vals,
+                        marker_color=col, marker_line_width=0,
+                        hovertemplate=f"<b>{lbl}</b>: %{{y:,.0f}} GJ<extra></extra>"))
+            fig_fuel.update_layout(**chart_layout_defaults("Energy Mix by Source (GJ)", height=270),
+                                    barmode="stack", bargap=0.25,
+                                    yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                                    xaxis=dict(gridcolor="#F1F5F9"))
+            apply_chart_animation(fig_fuel)
+            st.plotly_chart(fig_fuel, use_container_width=True, key=_chart_key(company, rep_year, "6"))
+        _pdf_download_btn("Energy", "dl_bench_energy", [
+            ("line_vs_sector", "Total energy - KPI", "energy_kpi",
+             "Energy Intensity Trend vs Sector (GJ/T)", CAT_ENERGY),
+            ("energy_mix_bar", "Energy Mix by Source (GJ)"),
+        ])
 
-        def _style_impr(val):
-            if val == "N/A": return "color:#9CA3AF"
-            try:
-                num = float(str(val).replace("+","").replace("%",""))
-                return "color:#059669;font-weight:600" if num < 0 else (
-                       "color:#DC2626;font-weight:600" if num > 10 else "color:#D97706")
-            except: return ""
+    with tab_elec:
+        st.caption("Electricity sourcing — renewable vs non-renewable with sector quartiles")
+        c1, c2 = st.columns(2, gap="medium")
+        fig_elec = go.Figure()
+        total_e = [max(trend[y]["renew_gj"]+trend[y]["nonrenew_gj"],1) for y in ys]
+        fig_elec.add_trace(go.Bar(
+            x=ys, y=[trend[y]["renew_gj"]/t*100 for y,t in zip(ys,total_e)],
+            name="Renewable", marker_color=CAT_RENEW, marker_line_width=0,
+            hovertemplate="<b>%{x}</b><br>Renewable: %{y:.1f}%<extra></extra>",
+        ))
+        fig_elec.add_trace(go.Bar(
+            x=ys, y=[trend[y]["nonrenew_gj"]/t*100 for y,t in zip(ys,total_e)],
+            name="Non-Renewable", marker_color="#94A3B8", marker_line_width=0,
+            hovertemplate="<b>%{x}</b><br>Non-Renewable: %{y:.1f}%<extra></extra>",
+        ))
+        fig_elec.update_layout(**chart_layout_defaults("Electricity Mix (%)", height=270),
+                                barmode="stack", bargap=0.25,
+                                yaxis=dict(ticksuffix="%", range=[0,105], gridcolor="#F1F5F9"),
+                                xaxis=dict(gridcolor="#F1F5F9"))
+        apply_chart_animation(fig_elec)
+        fig_renew_trend = _trend_vs_sector("renew_pct","Renewable_Electricity_Share_%",
+            "Renewable Electricity Share vs Sector (%)", CAT_RENEW)
+        with c1:
+            st.plotly_chart(fig_elec, use_container_width=True, key=_chart_key(company, rep_year, "7"))
+        with c2:
+            st.plotly_chart(fig_renew_trend, use_container_width=True, key=_chart_key(company, rep_year, "8"))
+        _pdf_download_btn("Electricity", "dl_bench_elec", [
+            ("elec_mix_bar", "Electricity Mix (%)"),
+            ("line_vs_sector", "Renewable_Electricity_Share_%", "renew_pct",
+             "Renewable Electricity Share vs Sector (%)", CAT_RENEW),
+        ])
 
-        styled = impr_df.style.map(_style_impr, subset=[f"Your improvement ({base_yr}→{rep_year})", "TIP sector average"])
-        st.dataframe(styled, hide_index=True, use_container_width=True)
-        st.caption("For intensity KPIs (CO₂, Energy, Water): negative = improvement. "
-                   "For Renewable electricity: positive = improvement.")
+    with tab_water:
+        st.caption("Water withdrawals and intensity vs sector — Q1/Median/Q3 shown")
+        c1, c2 = st.columns(2, gap="medium")
+        fig_wtr_trend = _trend_vs_sector("water_kpi","Water intake - KPI",
+            "Water Intensity Trend vs Sector (m³/T)", CAT_WATER)
+        with c1:
+            st.plotly_chart(fig_wtr_trend, use_container_width=True, key=_chart_key(company, rep_year, "9"))
+        with c2:
+            # Withdrawals bar with intensity line
+            fig_wat = go.Figure()
+            fig_wat.add_trace(go.Bar(
+                x=ys, y=[trend[y]["water_m3"]/1e6 for y in ys],
+                name="Withdrawals (M m³)", marker_color=CAT_WATER, marker_line_width=0, opacity=0.8,
+                hovertemplate="<b>%{x}</b>: %{y:.2f} M m³<extra></extra>",
+            ))
+            fig_wat.add_trace(go.Scatter(
+                x=ys, y=[trend[y]["water_kpi"] for y in ys],
+                name="Intensity (m³/T)", yaxis="y2", mode="lines+markers",
+                line=dict(color="#0E7490", width=2.5), marker=dict(size=6,color="#0E7490"),
+                hovertemplate="Intensity: %{y:.2f}<extra></extra>",
+            ))
+            fig_wat.update_layout(
+                **chart_layout_defaults("Water Withdrawals & Intensity", height=270),
+                yaxis=dict(title=dict(text="M m³"), gridcolor="#F1F5F9"),
+                yaxis2=dict(title=dict(text="m³/T"), overlaying="y", side="right",
+                            gridcolor="#F1F5F9"),
+                hovermode="x unified",
+            )
+            apply_chart_animation(fig_wat)
+            st.plotly_chart(fig_wat, use_container_width=True, key=_chart_key(company, rep_year, "10"))
+        _pdf_download_btn("Water", "dl_bench_water", [
+            ("line_vs_sector", "Water intake - KPI", "water_kpi",
+             "Water Intensity Trend vs Sector (m³/T)", CAT_WATER),
+            ("water_bar", "Water Withdrawals (M m³)"),
+        ])
 
-    # ── KPI trend charts: company vs sector for ALL 5 KPIs ───────────────────
-    if not _CONSOLIDATED_DF.empty and "Row_Label" not in _CONSOLIDATED_DF.columns:
-        trend_kpis = [
-            ("Total CO2 - KPI",             "CO₂ intensity (T.CO₂/T)", "#EF4444"),
-            ("Total energy - KPI",          "Energy intensity (GJ/T)", "#F59E0B"),
-            ("Water intake - KPI",          "Water intensity (m³/T)",  "#3B82F6"),
-            ("Renewable_Electricity_Share_%","Renewable electricity (%)", "#00916E"),
-        ]
-        available = [(col, lbl, clr) for col, lbl, clr in trend_kpis if col in _CONSOLIDATED_DF.columns]
-
-        if available:
-            yrs_all = sorted(_CONSOLIDATED_DF["Year"].dropna().unique().astype(int).tolist())
-            comp_df = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Company"] == company]
-
-            n_charts = len(available)
-            chart_cols = st.columns(2)
-            for idx, (col, lbl, clr) in enumerate(available):
-                with chart_cols[idx % 2]:
-                    with st.container(border=True):
-                        st.markdown(f"**{lbl} — {company} vs peers**")
-                        s_mean = _CONSOLIDATED_DF.groupby("Year")[col].mean().reindex(yrs_all)
-                        s_min  = _CONSOLIDATED_DF.groupby("Year")[col].min().reindex(yrs_all)
-                        s_max  = _CONSOLIDATED_DF.groupby("Year")[col].max().reindex(yrs_all)
-                        c_vals = comp_df.set_index("Year")[col].reindex(yrs_all) if not comp_df.empty else None
-
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(x=yrs_all, y=s_max.tolist(), fill=None, mode="lines",
-                            line=dict(width=0, color="rgba(200,200,200,0)"), showlegend=False))
-                        fig.add_trace(go.Scatter(x=yrs_all, y=s_min.tolist(), fill="tonexty", mode="lines",
-                            line=dict(width=0), fillcolor="rgba(156,163,175,0.15)", name="Sector range"))
-                        fig.add_trace(go.Scatter(x=yrs_all, y=s_mean.tolist(), mode="lines",
-                            name="Sector avg", line=dict(color="#9CA3AF", width=1.5, dash="dot")))
-                        if c_vals is not None and c_vals.notna().any():
-                            fig.add_trace(go.Scatter(x=yrs_all, y=c_vals.tolist(), mode="lines+markers",
-                                name=company, line=dict(color=clr, width=2.5), marker=dict(size=5)))
-                        fig.update_layout(height=220, margin=dict(l=10,r=10,t=10,b=10),
-                            plot_bgcolor="#fff", paper_bgcolor="#fff",
-                            xaxis=dict(gridcolor="#F3F4F6"),
-                            yaxis=dict(gridcolor="#F3F4F6"),
-                            legend=dict(font=dict(size=10), orientation="h", y=-0.25))
-                        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Trend charts require the wide master CSV. Run build_esg_master.py first.")
-
-    # ── Strengths / gaps ──────────────────────────────────────────────────────
-    col_l2, col_r2 = st.columns(2)
-    with col_l2:
-        with st.container(border=True):
-            st.markdown("#### Key strengths")
-            strengths = [b for b in benchmarks if
-                (b.lower_is_better and b.company_value <= b.q25) or
-                (not b.lower_is_better and b.company_value >= b.q75)]
-            if strengths:
-                for b in strengths:
-                    st.success(f"**{b.kpi_name}** — top quartile  {b.company_value:.3f} {b.unit} ≤ Q25 {b.q25:.3f}")
-            else:
-                st.info("No top-quartile metrics for the selected company and year.")
-    with col_r2:
-        with st.container(border=True):
-            st.markdown("#### Improvement areas")
-            gaps = [b for b in benchmarks if
-                (b.lower_is_better and b.company_value > b.median) or
-                (not b.lower_is_better and b.company_value < b.median)]
-            if gaps:
-                for b in gaps:
-                    st.warning(f"**{b.kpi_name}** — {b.company_value:.3f} vs median {b.median:.3f} {b.unit}")
-            else:
-                st.success("All KPIs at or above sector median.")
+    with tab_waste:
+        st.caption("Waste recovery rate and volumes vs sector — Q1/Median/Q3 shown")
+        c1, c2 = st.columns(2, gap="medium")
+        fig_wst_trend = _trend_vs_sector("waste_pct","Waste_Recovery_Rate_%",
+            "Waste Recovery Rate vs Sector (%)", CAT_WASTE)
+        with c1:
+            st.plotly_chart(fig_wst_trend, use_container_width=True, key=_chart_key(company, rep_year, "11"))
+        with c2:
+            fig_wst = go.Figure()
+            fig_wst.add_trace(go.Bar(
+                x=ys, y=[trend[y]["waste_total"] for y in ys],
+                name="Total Waste", marker_color="#E2E8F0", marker_line_width=0, opacity=0.9,
+            ))
+            fig_wst.add_trace(go.Bar(
+                x=ys, y=[trend[y]["waste_rec"] for y in ys],
+                name="Recovered", marker_color=CAT_WASTE, marker_line_width=0,
+            ))
+            fig_wst.update_layout(**chart_layout_defaults("Total Waste vs Recovered (T)", height=270),
+                                   barmode="overlay", bargap=0.25,
+                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                                   xaxis=dict(gridcolor="#F1F5F9"))
+            apply_chart_animation(fig_wst)
+            st.plotly_chart(fig_wst, use_container_width=True, key=_chart_key(company, rep_year, "12"))
+        _pdf_download_btn("Waste", "dl_bench_waste", [
+            ("waste_area", "Waste Recovery Rate vs Sector (%)"),
+            ("waste_bar",  "Total Waste vs Recovered (T)"),
+        ])
 
 
-# ─────────────────────────────────────────────────────────
-# PAGE 4 -- VERIFICATION (dss+ only)
-# ─────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────
-# SHARED: dss+ company/year selector
 # ─────────────────────────────────────────────────────────
 def _dss_company_selector(page_key: str):
     """
@@ -2888,13 +3840,21 @@ def page_verification():
                         st.toast(f"Submission returned to {sel_co} with error details.")
 
     st.divider()
-    col_approve, col_export, _ = st.columns([1.5, 1.5, 3])
+    col_approve, col_flag, col_export, _ = st.columns([1.5, 1.5, 1.5, 1])
     with col_approve:
         warn_ids = [f"flag_{sel_co}_{sel_yr}_{i}"
                     for i, f in enumerate(all_flags) if f.severity == "warning"]
-        if st.button("Approve All Warnings", type="primary"):
+        if st.button("Verify & Approve", type="primary"):
             resolved_set.update(warn_ids)
             st.session_state["flags_resolved_real"] = resolved_set
+            # Persist verification status so client's submission bar reflects it
+            _write_verification_status(sel_co, sel_yr, "Verified")
+            st.success(f"✅ {sel_co} {sel_yr} marked as Verified")
+            st.rerun()
+    with col_flag:
+        if st.button("Mark as Pending", key="mark_pending_btn"):
+            _write_verification_status(sel_co, sel_yr, "Pending")
+            st.info(f"Marked {sel_co} {sel_yr} as Pending Review")
             st.rerun()
     with col_export:
         if st.button("Export Flag Report"):
@@ -2958,6 +3918,7 @@ def page_readiness():
             )
         ))
         fig.update_layout(height=200, margin=dict(l=10,r=10,t=10,b=10), paper_bgcolor="rgba(0,0,0,0)")
+        apply_chart_animation(fig)
         st.plotly_chart(fig, use_container_width=True)
 
     with col_info:
@@ -3118,6 +4079,1589 @@ def page_readiness():
 
 
 # ─────────────────────────────────────────────────────────
+# NEW PAGES
+# ─────────────────────────────────────────────────────────
+
+def page_home():
+    """
+    Client Home — 8 animated KPI cards, interactive trend charts, summary data table.
+    This is the client's personal performance dashboard.
+    """
+    company  = st.session_state.user_company
+    comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    years     = sorted(dl.get_years(_CONSOLIDATED_DF, company))
+
+    # ── Header: Welcome + year selector + Submit Data inline ─────────────────
+    h_left, h_mid, h_right = st.columns([3, 1, 1])
+    with h_left:
+        st.markdown(section_header_html(
+            f"Welcome, {st.session_state.user_name.split()[0]} 👋",
+            f"{company} · Your Performance Dashboard",
+        ), unsafe_allow_html=True)
+    with h_mid:
+        if years:
+            sel_yr = st.selectbox("", sorted(years, reverse=True),
+                                  key="home_yr", label_visibility="collapsed")
+        else:
+            sel_yr = CURR_YEAR
+    with h_right:
+        if st.button("📋 Submit Data", use_container_width=True, key="home_submit_btn"):
+            st.session_state.page = "entry"
+            st.rerun()
+
+    if not years:
+        st.markdown(empty_state_html("📊", "No data yet",
+            "Submit your first KPI report to see your dashboard.",
+            "→ Submit Data"), unsafe_allow_html=True)
+        return
+
+    from formula_engine import TemplateInputs as TI, calculate as calc
+    valid = {f.name for f in TI.__dataclass_fields__.values()}
+
+    step  = dl.get_step_data(comp_hist, sel_yr)
+    clean = {k: v for k, v in step.items() if k in valid}
+    inp   = TI(company=company, year=sel_yr, **clean)
+    out   = calc(inp)
+
+    prev_out = None
+    if sel_yr - 1 in years:
+        ps = dl.get_step_data(comp_hist, sel_yr - 1)
+        pc = {k: v for k, v in ps.items() if k in valid}
+        prev_out = calc(TI(company=company, year=sel_yr - 1, **pc))
+
+    # ── Submission status strip — data completeness + DSS+ verification state ───
+    status_hist  = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    step_data_yr = dl.get_step_data(status_hist, sel_yr) if status_hist else {}
+
+    def _has(key, min_val=1):
+        v = step_data_yr.get(key, 0)
+        try: return float(v) >= min_val
+        except: return bool(v)
+
+    section_done = [
+        _has("total_sites"),
+        _has("production"),
+        _has("water_withdrawals"),
+        _has("renew_elec_purchased") or _has("nonrenew_elec_purchased") or _has("nat_gas"),
+        step_data_yr.get("co2_scope2_steam") is not None and _has("production"),
+        _has("waste_total"),
+    ]
+    n_done = sum(section_done)
+    pct    = n_done / 6 * 100
+    sc     = GREEN if pct == 100 else (AMBER if pct >= 50 else RED)
+
+    # Check DSS+ verification status from persistent CSV
+    verif_status = "Not Submitted"
+    verif_color  = "#94A3B8"
+    verif_icon   = "○"
+    try:
+        from pathlib import Path
+        vcsv = Path("data_storage/verifications.csv")
+        if vcsv.exists():
+            import csv
+            with open(vcsv, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("Company","").strip() == company and str(row.get("Year","")).strip() == str(sel_yr):
+                        vs = row.get("Status","").strip()
+                        if vs == "Verified":
+                            verif_status = "Verified by dss+"; verif_color = GREEN; verif_icon = "✓"
+                        elif vs == "Pending":
+                            verif_status = "Pending Review";   verif_color = AMBER; verif_icon = "◉"
+                        elif vs == "Flagged":
+                            verif_status = "Flagged — see notes"; verif_color = RED; verif_icon = "⚑"
+        elif n_done > 0:
+            verif_status = "Pending Review"; verif_color = AMBER; verif_icon = "◉"
+    except Exception:
+        pass
+
+    st.markdown(f"""
+    <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
+        padding:12px 20px;margin-bottom:16px;display:flex;align-items:center;gap:16px">
+      <div style="flex:1">
+        <div style="font-size:12px;color:{MUTED};margin-bottom:5px">
+          {sel_yr} Submission Status</div>
+        <div style="background:#F1F5F9;border-radius:4px;height:6px;overflow:hidden">
+          <div style="background:{sc};width:{pct:.0f}%;height:100%;border-radius:4px;
+              transition:width .8s ease"></div>
+        </div>
+      </div>
+      <div style="font-size:18px;font-weight:700;color:{sc}">{n_done}/6</div>
+      <div style="font-size:12px;color:{MUTED}">sections complete</div>
+      <div style="border-left:1px solid {BORDER};padding-left:16px;font-size:12px;
+          color:{verif_color};font-weight:600;white-space:nowrap">
+        {verif_icon} {verif_status}</div>
+    </div>""", unsafe_allow_html=True)
+
+    # ── 8 KPI cards (4 × 2) ──────────────────────────────────────────────────
+    renew_tot = max(inp.renew_elec_purchased + inp.nonrenew_elec_purchased + inp.self_gen_elec, 1)
+    renew_pct = inp.renew_elec_purchased / renew_tot * 100
+
+    def _yoy(cur, prev_val, lower=True):
+        if not prev_val or prev_val == 0: return "", ""
+        pct = (cur - prev_val) / abs(prev_val) * 100
+        good = pct <= 0 if lower else pct >= 0
+        bg   = "#DCFCE7" if good else "#FEE2E2"
+        col  = "#166534" if good else "#991B1B"
+        arr  = "▼" if pct < 0 else "▲"
+        sign = "+" if pct > 0 else ""
+        chip = (f'<span style="background:{bg};color:{col};font-size:10px;font-weight:600;'
+                f'padding:2px 7px;border-radius:4px">{arr}{sign}{pct:.1f}%</span>')
+        return chip, bg
+
+    p = prev_out
+    cards = [
+        ("CO₂ Absolute",      f"{out.total_co2:,.0f}",           "T.CO₂",  *_yoy(out.total_co2, p.total_co2 if p else 0),       CAT_CO2),
+        ("CO₂ Intensity",     f"{out.co2_kpi:.3f}",              "T/T",    *_yoy(out.co2_kpi,   p.co2_kpi   if p else 0),       CAT_CO2),
+        ("Energy Intensity",  f"{out.energy_kpi:.2f}",           "GJ/T",   *_yoy(out.energy_kpi,p.energy_kpi if p else 0),      CAT_ENERGY),
+        ("Renewable Share",   f"{renew_pct:.1f}",                "%",      *_yoy(renew_pct, 0, lower=False),                    CAT_RENEW),
+        ("Water Intensity",   f"{out.water_kpi:.2f}",            "m³/T",   *_yoy(out.water_kpi, p.water_kpi if p else 0),       CAT_WATER),
+        ("Water Withdrawal",  f"{inp.water_withdrawals:,.0f}",   "m³",     *_yoy(inp.water_withdrawals, 0),                     CAT_WATER),
+        ("Waste Recovery",    f"{out.waste_recovery_pct*100:.1f}","%",     *_yoy(out.waste_recovery_pct*100, (p.waste_recovery_pct*100 if p else 0), lower=False), CAT_WASTE),
+        ("ISO 14001",         f"{out.pct_certified*100:.0f}",    "%",      *_yoy(out.pct_certified*100, (p.pct_certified*100 if p else 0), lower=False), GREEN),
+    ]
+    COLORS_CARD = [CAT_CO2,CAT_CO2,CAT_ENERGY,CAT_RENEW,CAT_WATER,CAT_WATER,CAT_WASTE,GREEN]
+
+    for row_start in [0, 4]:
+        cols = st.columns(4)
+        for i, (label, val_str, unit, chip_html, _, color) in enumerate(cards[row_start:row_start+4]):
+            with cols[i]:
+                st.markdown(f"""
+                <div style="background:#fff;border:1px solid {BORDER};border-radius:10px;
+                    padding:16px 18px 14px;margin-bottom:8px;height:110px;
+                    display:flex;flex-direction:column;justify-content:space-between;
+                    animation:tipFadeIn 400ms ease-out {i*70+row_start*30}ms both;
+                    transition:box-shadow 200ms,transform 200ms"
+                    onmouseover="this.style.boxShadow='0 6px 20px rgba(15,23,42,.1)';this.style.transform='translateY(-2px)'"
+                    onmouseout="this.style.boxShadow='';this.style.transform=''">
+                  <div style="font-size:10.5px;font-weight:600;color:{MUTED};
+                      text-transform:uppercase;letter-spacing:.6px">{label}</div>
+                  <div style="font-size:26px;font-weight:700;color:{color};
+                      font-variant-numeric:tabular-nums;line-height:1;letter-spacing:-.5px;
+                      white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+                    {val_str}
+                    <span style="font-size:11px;font-weight:400;color:{MUTED};margin-left:2px">{unit}</span>
+                  </div>
+                  <div style="margin-top:2px">{chip_html}</div>
+                </div>""", unsafe_allow_html=True)
+
+    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+    # ── Interactive charts ────────────────────────────────────────────────────
+    t1, t2, t3, t4 = st.tabs(["📈 CO₂ Trend", "⚡ Energy Mix", "💧 Water", "♻️ Waste & Fuel"])
+
+    # Build multi-year computed KPIs for charts
+    yr_kpis = {}
+    for y in years:
+        sd = dl.get_step_data(comp_hist, y)
+        sc = {k: v for k, v in sd.items() if k in valid}
+        o  = calc(TI(company=company, year=y, **sc))
+        ii = TI(company=company, year=y, **sc)
+        rt = max(ii.renew_elec_purchased + ii.nonrenew_elec_purchased + ii.self_gen_elec, 1)
+        yr_kpis[y] = {
+            "scope1": o.total_co2_scope1, "scope2": o.total_co2_scope2,
+            "total_co2": o.total_co2, "co2_kpi": o.co2_kpi,
+            "energy_kpi": o.energy_kpi, "water_kpi": o.water_kpi,
+            "waste_pct": o.waste_recovery_pct * 100,
+            "renew_pct": ii.renew_elec_purchased / rt * 100,
+            "nat_gas": ii.nat_gas, "coal": ii.coal_sub, "diesel": ii.diesel,
+            "biomass": ii.biomass, "renew_elec": ii.renew_elec_purchased,
+            "nonrenew_elec": ii.nonrenew_elec_purchased,
+            "water_m3": ii.water_withdrawals, "production": ii.production,
+        }
+
+    ys = years
+
+    with t1:
+        # Stacked area: Scope 1 + Scope 2 with intensity overlay
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=ys, y=[yr_kpis[y]["scope2"] for y in ys],
+            name="Scope 2", fill="tonexty", stackgroup="co2",
+            mode="none", fillcolor="rgba(71,85,105,0.25)",
+            hovertemplate="<b>%{x}</b> · Scope 2<br>%{y:,.0f} T.CO₂<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=ys, y=[yr_kpis[y]["scope1"] for y in ys],
+            name="Scope 1", fill="tonexty", stackgroup="co2",
+            mode="none", fillcolor="rgba(71,85,105,0.5)",
+            hovertemplate="<b>%{x}</b> · Scope 1<br>%{y:,.0f} T.CO₂<extra></extra>",
+        ))
+        # Intensity as secondary line
+        fig.add_trace(go.Scatter(
+            x=ys, y=[yr_kpis[y]["co2_kpi"] for y in ys],
+            name="CO₂ Intensity (T/T)", yaxis="y2",
+            mode="lines+markers",
+            line=dict(color="#C8102E", width=2.5, dash="dot"),
+            marker=dict(size=6, color="#C8102E"),
+            hovertemplate="<b>%{x}</b><br>Intensity: %{y:.3f} T/T<extra></extra>",
+        ))
+        # Annotate best/worst year
+        if len(ys) >= 2:
+            best_y = min(ys, key=lambda y: yr_kpis[y]["co2_kpi"])
+            fig.add_annotation(x=best_y, y=yr_kpis[best_y]["co2_kpi"], yref="y2",
+                               text="Best", showarrow=True, arrowhead=2,
+                               ax=0, ay=-30, font=dict(size=10, color=GREEN),
+                               arrowcolor=GREEN)
+        fig.update_layout(
+            **chart_layout_defaults("Total CO₂ Emissions (Scope 1 + 2) with Intensity", height=320),
+            yaxis=dict(title=dict(text="T.CO₂", font=dict(color=CAT_CO2)), tickformat=","),
+            yaxis2=dict(title=dict(text="T.CO₂ / T prod.", font=dict(color="#C8102E")),
+                        overlaying="y", side="right", tickformat=".3f"),
+            hovermode="x unified",
+        )
+        apply_chart_animation(fig)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with t2:
+        fuel_cfg = [
+            ("Renewable Elec.",    [yr_kpis[y]["renew_elec"]    for y in ys], CAT_RENEW),
+            ("Non-Renew. Elec.",   [yr_kpis[y]["nonrenew_elec"] for y in ys], "#94A3B8"),
+            ("Natural Gas",        [yr_kpis[y]["nat_gas"]        for y in ys], CAT_ENERGY),
+            ("Coal",               [yr_kpis[y]["coal"]           for y in ys], "#475569"),
+            ("Diesel",             [yr_kpis[y]["diesel"]         for y in ys], "#78716C"),
+            ("Biomass",            [yr_kpis[y]["biomass"]        for y in ys], "#16A34A"),
+        ]
+        fig2 = go.Figure()
+        for label, vals, color in fuel_cfg:
+            if any(v > 0 for v in vals):
+                fig2.add_trace(go.Bar(
+                    name=label, x=ys, y=vals, marker_color=color,
+                    marker_line_width=0,
+                    hovertemplate=f"<b>{label}</b><br>%{{x}}: %{{y:,.0f}} GJ<br>%{{customdata:.1f}}% of total<extra></extra>",
+                ))
+        fig2.update_layout(
+            barmode="stack",
+            **chart_layout_defaults("Energy Mix by Source (GJ)", height=320),
+            hovermode="x unified",
+            bargap=0.3,
+        )
+        apply_chart_animation(fig2)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with t3:
+        w_m3  = [yr_kpis[y]["water_m3"]  for y in ys]
+        w_kpi = [yr_kpis[y]["water_kpi"] for y in ys]
+        fig3  = go.Figure()
+        fig3.add_trace(go.Bar(
+            x=ys, y=w_m3, name="Total Withdrawals",
+            marker_color=CAT_WATER, marker_line_width=0,
+            opacity=0.8,
+            hovertemplate="<b>%{x}</b><br>%{y:,.0f} m³<extra></extra>",
+        ))
+        fig3.add_trace(go.Scatter(
+            x=ys, y=w_kpi, name="Intensity (m³/T)",
+            yaxis="y2", mode="lines+markers",
+            line=dict(color="#0E7490", width=2.5),
+            marker=dict(size=7, color="#0E7490", symbol="diamond"),
+            hovertemplate="<b>%{x}</b><br>Intensity: %{y:.2f} m³/T<extra></extra>",
+        ))
+        fig3.update_layout(
+            **chart_layout_defaults("Water Withdrawals & Intensity", height=320),
+            yaxis=dict(title=dict(text="m³", font=dict(color=CAT_WATER)), tickformat=","),
+            yaxis2=dict(title=dict(text="m³/T (intensity)", font=dict(color="#0E7490")),
+                        overlaying="y", side="right", tickformat=".2f"),
+            hovermode="x unified",
+        )
+        apply_chart_animation(fig3)
+        st.plotly_chart(fig3, use_container_width=True)
+
+    with t4:
+        w_total    = [dl.get_step_data(comp_hist, y).get("waste_total",    0) for y in ys]
+        w_recovery = [dl.get_step_data(comp_hist, y).get("waste_recovery", 0) for y in ys]
+        w_pcts     = [yr_kpis[y]["waste_pct"]   for y in ys]
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            fig4 = go.Figure()
+            fig4.add_trace(go.Bar(
+                x=ys, y=w_total, name="Total Waste",
+                marker_color="#E2E8F0", marker_line_width=0, opacity=0.8,
+            ))
+            fig4.add_trace(go.Bar(
+                x=ys, y=w_recovery, name="Recovered",
+                marker_color=CAT_WASTE, marker_line_width=0,
+            ))
+            fig4.add_trace(go.Scatter(
+                x=ys, y=w_pcts, name="Recovery %",
+                yaxis="y2", mode="lines+markers",
+                line=dict(color="#6D28D9", width=2.5),
+                marker=dict(size=7, color="#6D28D9"),
+                hovertemplate="Recovery: %{y:.1f}%<extra></extra>",
+            ))
+            fig4.update_layout(
+                barmode="overlay",
+                **chart_layout_defaults("Waste Recovery (T)", height=300),
+                yaxis=dict(title="Metric T", tickformat=","),
+                yaxis2=dict(title="Recovery %", overlaying="y", side="right",
+                            range=[0, 110], ticksuffix="%"),
+                hovermode="x unified",
+            )
+            apply_chart_animation(fig4)
+            st.plotly_chart(fig4, use_container_width=True)
+
+        with c2:
+            # Waste recovery % trend — more useful than a static gauge
+            rec_pcts = [yr_kpis[y]["waste_pct"] for y in ys]
+            fig_rec = go.Figure()
+            # Background zones
+            fig_rec.add_hrect(y0=0,  y1=70,  fillcolor="#FEE2E2", opacity=0.25, line_width=0)
+            fig_rec.add_hrect(y0=70, y1=85,  fillcolor="#FEF3C7", opacity=0.25, line_width=0)
+            fig_rec.add_hrect(y0=85, y1=100, fillcolor="#DCFCE7", opacity=0.25, line_width=0)
+            # 90% best-practice target line
+            fig_rec.add_hline(y=90, line_dash="dot", line_color=GREEN,
+                              line_width=1.5, annotation_text="Target 90%",
+                              annotation_font=dict(size=9, color=GREEN))
+            # Recovery trend
+            fig_rec.add_trace(go.Scatter(
+                x=ys, y=rec_pcts, mode="lines+markers",
+                fill="tozeroy",
+                fillcolor="rgba(124,58,237,0.10)",
+                line=dict(color=CAT_WASTE, width=2.5),
+                marker=dict(size=7, color=CAT_WASTE, symbol="circle",
+                            line=dict(color="white", width=1.5)),
+                hovertemplate="<b>%{x}</b><br>Recovery: %{y:.1f}%<extra></extra>",
+                name="Recovery %",
+            ))
+            fig_rec.update_layout(
+                **chart_layout_defaults("Waste Recovery Trend (%)", height=300,
+                                        showlegend=False),
+                yaxis=dict(range=[0, 105], ticksuffix="%", gridcolor="#F1F5F9",
+                           zeroline=False),
+                xaxis=dict(gridcolor="#F1F5F9"),
+            )
+            apply_chart_animation(fig_rec)
+            st.plotly_chart(fig_rec, use_container_width=True)
+
+    # ── Historical KPI summary table ──────────────────────────────────────────
+    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+    st.markdown(f"**Historical KPI Summary — {company}**")
+
+    import pandas as pd
+    tbl_rows = []
+    table_years = sorted([y for y in years if 2014 <= y <= 2023], reverse=True)
+    for y in table_years:
+        sd = dl.get_step_data(comp_hist, y)
+        sc = {k: v for k, v in sd.items() if k in valid}
+        o  = calc(TI(company=company, year=y, **sc))
+        ii = TI(company=company, year=y, **sc)
+        rt = max(ii.renew_elec_purchased + ii.nonrenew_elec_purchased + ii.self_gen_elec, 1)
+        tbl_rows.append({
+            "Year":              y,
+            "Production (MT)":   f"{ii.production/1e6:.3f}",
+            "CO₂ Total (T)":     f"{o.total_co2:,.0f}",
+            "CO₂ Intensity":     f"{o.co2_kpi:.3f}",
+            "Energy KPI (GJ/T)": f"{o.energy_kpi:.2f}",
+            "Renew. Elec. %":    f"{ii.renew_elec_purchased/rt*100:.1f}%",
+            "Water KPI (m³/T)":  f"{o.water_kpi:.2f}",
+            "Waste Recovery %":  f"{o.waste_recovery_pct*100:.1f}%",
+        })
+    tbl_df = pd.DataFrame(tbl_rows)
+    st.dataframe(
+        tbl_df.style
+            .set_properties(**{"text-align": "right", "font-size": "12px"})
+            .set_table_styles([
+                {"selector": "th", "props": [
+                    ("font-size","11px"), ("text-transform","uppercase"),
+                    ("letter-spacing",".4px"), ("color","#64748B"),
+                    ("background","#F8FAFC"), ("padding","8px 12px"),
+                ]},
+                {"selector": "td:first-child", "props": [
+                    ("font-weight","600"), ("color","#0F172A"), ("text-align","center"),
+                ]},
+            ]),
+        use_container_width=True, hide_index=True,
+    )
+
+def page_my_dashboard():
+    """
+    Client My Dashboard — Sector analysis view.
+    """
+    company = st.session_state.user_company
+    st.markdown(section_header_html(
+        "My Dashboard",
+        f"TIP Sector Analysis · {company} highlighted",
+    ), unsafe_allow_html=True)
+
+    if _CONSOLIDATED_DF.empty or _SECTOR_DF.empty:
+        st.info("Sector data not loaded. Run build_esg_master.py first.")
+        return
+
+    # Define has_wide locally (same as in page_analysis)
+    df      = _CONSOLIDATED_DF
+    has_wide = not df.empty and "Row_Label" not in df.columns
+
+    # ── Year range selector ───────────────────────────────────────────────────
+    col_yr1, col_yr2, col_toggle, _ = st.columns([1, 1, 2, 2])
+    with col_yr1:
+        yr_start = st.selectbox("From", LONG_YEARS, index=0, key="dash_yr_start")
+    with col_yr2:
+        yr_end   = st.selectbox("To", LONG_YEARS[::-1], index=0, key="dash_yr_end")
+    with col_toggle:
+        show_company = st.toggle(f"Highlight {company.split()[0]}", value=True, key="dash_highlight")
+
+    yr_range = [y for y in LONG_YEARS if yr_start <= y <= yr_end]
+    if not yr_range:
+        yr_range = LONG_YEARS
+
+    # Sector data for the range
+    sec_range = _SECTOR_DF[_SECTOR_DF["Year"].isin(yr_range)].sort_values("Year")
+
+    # Company overlay data
+    comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    from formula_engine import TemplateInputs as TI, calculate as calc
+    valid = {f.name for f in TI.__dataclass_fields__.values()}
+    co_kpis = {}
+    if show_company:
+        for y in yr_range:
+            sd = dl.get_step_data(comp_hist, y)
+            sc = {k: v for k, v in sd.items() if k in valid}
+            if sc:
+                o = calc(TI(company=company, year=y, **sc))
+                co_kpis[y] = {
+                    "co2_kpi": o.co2_kpi, "energy_kpi": o.energy_kpi,
+                    "water_kpi": o.water_kpi, "total_co2": o.total_co2,
+                }
+
+    # ── 4-metric summary row ──────────────────────────────────────────────────
+    if not sec_range.empty:
+        latest_sec = sec_range.iloc[-1]
+        latest_yr  = int(latest_sec["Year"])
+        prev_sec   = sec_range.iloc[-2] if len(sec_range) > 1 else None
+
+        metric_cols = st.columns(4)
+        metrics = [
+            ("Sector CO₂ Intensity", "Avg_CO2_KPI",    ".3f", "T.CO₂/T"),
+            ("Sector Energy KPI",    "Avg_Energy_KPI", ".2f", "GJ/T"),
+            ("Sector Water KPI",     "Avg_Water_KPI",  ".2f", "m³/T"),
+            ("Avg Renewable %",      "Avg_Renewable_Share", ".1f", "%"),
+        ]
+        for i, (label, col, fmt, unit) in enumerate(metrics):
+            with metric_cols[i]:
+                val  = latest_sec.get(col, 0)
+                prev = prev_sec.get(col, 0) if prev_sec is not None else None
+                delta = (f"{(val-prev)/abs(prev)*100:+.1f}%" if prev and prev != 0 else None)
+                st.metric(label, f"{val:{fmt}} {unit}", delta=delta)
+
+    st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
+
+    # ── Charts ────────────────────────────────────────────────────────────────
+    r1c1, r1c2 = st.columns(2, gap="medium")
+
+    with r1c1:
+        # Sector total CO₂ bar + company line overlay
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(
+            x=sec_range["Year"].tolist(),
+            y=sec_range["Total_CO2"].tolist() if "Total_CO2" in sec_range else [],
+            name="Sector Total CO₂",
+            marker_color="#CBD5E1", marker_line_width=0, opacity=0.75,
+            hovertemplate="<b>%{x}</b><br>Sector: %{y:,.0f} T.CO₂<extra></extra>",
+        ))
+        if co_kpis and show_company:
+            co_yrs = sorted(co_kpis.keys())
+            fig1.add_trace(go.Scatter(
+                x=co_yrs, y=[co_kpis[y]["total_co2"] for y in co_yrs],
+                name=company.split()[0], mode="lines+markers",
+                line=dict(color=CAT_CO2, width=2.5),
+                marker=dict(size=7, color=CAT_CO2, symbol="circle"),
+                yaxis="y2",
+                hovertemplate="<b>%{x}</b><br>Your CO₂: %{y:,.0f} T<extra></extra>",
+            ))
+        fig1.update_layout(
+            **chart_layout_defaults("Sector CO₂ vs Your Performance", height=300),
+            yaxis2=dict(overlaying="y", side="right",
+                        title=dict(text=f"{company.split()[0]} CO₂", font=dict(color=CAT_CO2, size=10))),
+            hovermode="x unified",
+        )
+        apply_chart_animation(fig1)
+        st.plotly_chart(fig1, use_container_width=True)
+
+    with r1c2:
+        # CO₂ intensity trend — sector average vs company
+        fig2 = go.Figure()
+        if "Avg_CO2_KPI" in sec_range.columns:
+            fig2.add_trace(go.Scatter(
+                x=sec_range["Year"].tolist(), y=sec_range["Avg_CO2_KPI"].tolist(),
+                name="Sector Average", mode="lines+markers",
+                line=dict(color="#94A3B8", width=2, dash="dot"),
+                marker=dict(size=5, color="#94A3B8"),
+                fill="tozeroy", fillcolor="rgba(148,163,184,0.08)",
+                hovertemplate="Sector avg: %{y:.3f}<extra></extra>",
+            ))
+        if co_kpis and show_company:
+            co_yrs = sorted(co_kpis.keys())
+            fig2.add_trace(go.Scatter(
+                x=co_yrs, y=[co_kpis[y]["co2_kpi"] for y in co_yrs],
+                name=company.split()[0],
+                mode="lines+markers",
+                line=dict(color="#C8102E", width=2.5),
+                marker=dict(size=8, color="#C8102E", symbol="diamond"),
+                hovertemplate=f"{company.split()[0]}: %{{y:.3f}}<extra></extra>",
+            ))
+        fig2.update_layout(
+            **chart_layout_defaults("CO₂ Intensity Trend (T.CO₂/T)", height=300),
+            hovermode="x unified",
+        )
+        apply_chart_animation(fig2)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    r2c1, r2c2 = st.columns(2, gap="medium")
+
+    with r2c1:
+        # Energy & renewable share
+        fig3 = go.Figure()
+        if "Avg_Energy_KPI" in sec_range.columns:
+            fig3.add_trace(go.Bar(
+                x=sec_range["Year"].tolist(), y=sec_range["Avg_Energy_KPI"].tolist(),
+                name="Sector Energy KPI", marker_color=CAT_ENERGY, marker_line_width=0, opacity=0.8,
+                hovertemplate="<b>%{x}</b><br>Sector avg: %{y:.2f} GJ/T<extra></extra>",
+            ))
+        if co_kpis and show_company:
+            co_yrs = sorted(co_kpis.keys())
+            fig3.add_trace(go.Scatter(
+                x=co_yrs, y=[co_kpis[y]["energy_kpi"] for y in co_yrs],
+                name=company.split()[0], mode="lines+markers",
+                line=dict(color="#92400E", width=2.5),
+                marker=dict(size=7, color="#92400E"),
+                hovertemplate=f"{company.split()[0]}: %{{y:.2f}} GJ/T<extra></extra>",
+            ))
+        if "Avg_Renewable_Share" in sec_range.columns:
+            fig3.add_trace(go.Scatter(
+                x=sec_range["Year"].tolist(), y=sec_range["Avg_Renewable_Share"].tolist(),
+                name="Renewable Share %", mode="lines", yaxis="y2",
+                line=dict(color=CAT_RENEW, width=1.5, dash="longdash"),
+                hovertemplate="Renew. %: %{y:.1f}%<extra></extra>",
+            ))
+        fig3.update_layout(
+            **chart_layout_defaults("Energy KPI vs Renewable Share", height=300),
+            yaxis2=dict(overlaying="y", side="right", ticksuffix="%",
+                        title=dict(font=dict(color=CAT_RENEW, size=10))),
+            hovermode="x unified",
+        )
+        apply_chart_animation(fig3)
+        st.plotly_chart(fig3, use_container_width=True)
+
+    with r2c2:
+        # Water intensity trend
+        fig4 = go.Figure()
+        if "Avg_Water_KPI" in sec_range.columns:
+            fig4.add_trace(go.Scatter(
+                x=sec_range["Year"].tolist(), y=sec_range["Avg_Water_KPI"].tolist(),
+                name="Sector Average", mode="lines",
+                line=dict(color=CAT_WATER, width=2),
+                fill="tozeroy", fillcolor="rgba(8,145,178,0.10)",
+                hovertemplate="Sector avg: %{y:.2f}<extra></extra>",
+            ))
+        if co_kpis and show_company:
+            co_yrs = sorted(co_kpis.keys())
+            fig4.add_trace(go.Scatter(
+                x=co_yrs, y=[co_kpis[y]["water_kpi"] for y in co_yrs],
+                name=company.split()[0], mode="lines+markers",
+                line=dict(color="#0E7490", width=2.5),
+                marker=dict(size=7, color="#0E7490", symbol="square"),
+                hovertemplate=f"{company.split()[0]}: %{{y:.2f}} m³/T<extra></extra>",
+            ))
+        fig4.update_layout(
+            **chart_layout_defaults("Water Intensity Trend (m³/T)", height=300),
+            hovermode="x unified",
+        )
+        apply_chart_animation(fig4)
+        st.plotly_chart(fig4, use_container_width=True)
+
+    # ── Sector production & companies chart ───────────────────────────────────
+    if "Total_Production" in sec_range.columns:
+        fig5 = go.Figure()
+        fig5.add_trace(go.Scatter(
+            x=sec_range["Year"].tolist(),
+            y=(sec_range["Total_Production"] / 1e6).tolist(),
+            mode="lines+markers",
+            fill="tozeroy", fillcolor="rgba(22,163,74,0.08)",
+            line=dict(color=GREEN, width=2.5),
+            marker=dict(size=6, color=GREEN),
+            name="TIP Total Production",
+            hovertemplate="<b>%{x}</b><br>%{y:.2f} million T<extra></extra>",
+        ))
+        fig5.update_layout(**chart_layout_defaults(
+            "TIP Sector Total Production (million metric T)", height=220, showlegend=False))
+        apply_chart_animation(fig5)
+        st.plotly_chart(fig5, use_container_width=True,
+                        key=_chart_key(company, "dash_prod"))
+
+    # ── Additional client-facing charts ───────────────────────────────────────
+    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+    st.markdown(f"**{company.split()[0]} — Company-specific trends vs sector**")
+    st.caption("Your data highlighted · Toggle 'Highlight' to show/hide company overlay")
+
+    r3c1, r3c2 = st.columns(2, gap="medium")
+
+    with r3c1:
+        # Renewable electricity trend for this company vs sector
+        sec_renew_mean, sec_renew_q25, sec_renew_q75 = {}, {}, {}
+        if has_wide and "Renewable_Electricity_Share_%" in sec_range.columns:
+            sec_renew_mean = sec_range.set_index("Year")["Renewable_Electricity_Share_%"].to_dict()
+        if not _CONSOLIDATED_DF.empty and "Renewable_Electricity_Share_%" in _CONSOLIDATED_DF.columns:
+            grp = _CONSOLIDATED_DF.groupby("Year")["Renewable_Electricity_Share_%"]
+            sec_renew_q25 = grp.quantile(.25).to_dict()
+            sec_renew_q75 = grp.quantile(.75).to_dict()
+
+        fig6 = go.Figure()
+        if sec_renew_q25:
+            fig6.add_trace(go.Scatter(x=yr_range, y=[sec_renew_q75.get(y) for y in yr_range],
+                fill=None, mode="lines", line=dict(width=0), showlegend=False))
+            fig6.add_trace(go.Scatter(x=yr_range, y=[sec_renew_q25.get(y) for y in yr_range],
+                fill="tonexty", mode="lines", line=dict(width=0),
+                fillcolor="rgba(22,163,74,0.10)", name="Sector IQR"))
+            fig6.add_trace(go.Scatter(x=yr_range, y=[sec_renew_mean.get(y) for y in yr_range],
+                mode="lines", name="Sector Median",
+                line=dict(color="#94A3B8", width=1.5, dash="dashdot")))
+        if show_company and co_kpis:
+            fig6.add_trace(go.Scatter(
+                x=sorted(co_kpis.keys()),
+                y=[co_kpis[y].get("renew_pct", 0) for y in sorted(co_kpis.keys())],
+                mode="lines+markers", name=company.split()[0],
+                line=dict(color=CAT_RENEW, width=2.5),
+                marker=dict(size=7, color=CAT_RENEW),
+                hovertemplate="<b>%{x}</b><br>Renewable: %{y:.1f}%<extra></extra>",
+            ))
+        fig6.update_layout(**chart_layout_defaults("Renewable Electricity Share (%)", height=270),
+                           yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9"),
+                           xaxis=dict(gridcolor="#F1F5F9"), hovermode="x unified")
+        apply_chart_animation(fig6)
+        st.plotly_chart(fig6, use_container_width=True,
+                        key=_chart_key(company, sel_yr if 'sel_yr' in dir() else 0, "renew_dash"))
+
+    with r3c2:
+        # YoY CO₂ change bar chart for this company
+        if co_kpis and len(sorted(co_kpis.keys())) >= 2:
+            co_yrs_sorted = sorted(co_kpis.keys())
+            yoy_bars  = []
+            yoy_years = []
+            for j in range(1, len(co_yrs_sorted)):
+                y_cur  = co_yrs_sorted[j]
+                y_prev = co_yrs_sorted[j-1]
+                cur_v  = co_kpis.get(y_cur, {}).get("co2_kpi", 0)
+                prv_v  = co_kpis.get(y_prev, {}).get("co2_kpi", 0)
+                if prv_v and prv_v != 0:
+                    yoy_bars.append((cur_v - prv_v) / abs(prv_v) * 100)
+                    yoy_years.append(y_cur)
+            if yoy_bars:
+                bar_colors = [CAT_RENEW if v < 0 else RED for v in yoy_bars]
+                fig7 = go.Figure(go.Bar(
+                    x=yoy_years, y=yoy_bars,
+                    marker_color=bar_colors, marker_line_width=0,
+                    hovertemplate="<b>%{x}</b><br>YoY: %{y:+.2f}%<extra></extra>",
+                ))
+                fig7.add_hline(y=0, line_color="#CBD5E1", line_width=1)
+                fig7.update_layout(**chart_layout_defaults(
+                    f"CO₂ Intensity YoY Change (%) — {company.split()[0]}", height=270,
+                    showlegend=False),
+                    yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9", zeroline=False),
+                    xaxis=dict(gridcolor="#F1F5F9"))
+                apply_chart_animation(fig7)
+                st.plotly_chart(fig7, use_container_width=True,
+                                key=_chart_key(company, "yoy_co2_dash"))
+
+def page_company_data():
+    """
+    DSS+ Company Data — full KPI template table for a selected company.
+    Accessed from Portfolio 'Open Template' button or directly from nav.
+    """
+    st.markdown(section_header_html(
+        "Company Data",
+        "Full KPI template for selected company · All historical years",
+    ), unsafe_allow_html=True)
+
+    companies_in_db = dl.get_companies(_CONSOLIDATED_DF) or COMPANIES
+
+    # Pre-select company from portfolio if set
+    pre_co = st.session_state.pop("portfolio_company", None)
+    default_co = (pre_co
+                  or st.session_state.get("reporting_company")
+                  or companies_in_db[0])
+    if default_co not in companies_in_db:
+        default_co = companies_in_db[0]
+
+    col_co, col_yr, _ = st.columns([2, 1, 3])
+    with col_co:
+        sel_co = st.selectbox(
+            "Company", options=companies_in_db,
+            index=companies_in_db.index(default_co),
+            key="codata_company"
+        )
+    with col_yr:
+        avail_years = dl.get_years(_CONSOLIDATED_DF, sel_co) or [CURR_YEAR]
+        sel_yr = st.selectbox(
+            "Year", options=sorted(avail_years, reverse=True),
+            key="codata_year"
+        )
+
+    # Set session state so all render_*_tab() functions read the right data
+    st.session_state.reporting_company  = sel_co
+    st.session_state.reporting_year     = sel_yr
+
+    # Load and populate session state with this company's data
+    hist    = dl.get_company_hist(_CONSOLIDATED_DF, sel_co)
+    step_data = dl.get_step_data(hist, sel_yr) if hist else {}
+    valid_fields = _VALID_TEMPLATE_FIELDS
+
+    for field, val in step_data.items():
+        if field in valid_fields:
+            st.session_state[field] = val
+
+    from formula_engine import TemplateInputs as TI, calculate as calc
+    valid = {f.name for f in TI.__dataclass_fields__.values()}
+    clean = {k: v for k, v in step_data.items() if k in valid}
+    inp   = TI(company=sel_co, year=sel_yr, **clean)
+    out   = calc(inp)
+
+    st.session_state["_codata_inp"] = inp
+    st.session_state["_codata_out"] = out
+    st.session_state["template_done"]       = True
+    st.session_state["company_setup_done"]  = True
+    st.session_state["step"]                = 6
+
+    # ── Render all template sheets as tabs ────────────────────────────────────
+    tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
+        "Main Data Input",
+        "Electricity by Country",
+        "Waste",
+        "Qualitative Data",
+        "Conversion Tables",
+    ])
+    with tab_main:
+        render_template_table()
+    with tab_elec:
+        render_electricity_tab()
+    with tab_waste:
+        render_waste_tab()
+    with tab_qual:
+        render_qualitative_tab()
+    with tab_conv:
+        render_conversion_tab()
+
+    st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
+    if st.button("← Back to Portfolio", key="codata_back"):
+        st.session_state.page = "portfolio"
+        st.rerun()
+
+
+
+def page_reports():
+    """
+    Sustainability Report — one-page CSR report with company summary,
+    KPI tables, trend charts, benchmarking position. Download as PDF.
+    """
+    from pdf_report import generate_executive_pdf, build_kpi_dict_from_outputs, REPORTLAB_OK
+    from datetime import date as _date
+
+    company   = st.session_state.user_company
+    comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+    years     = sorted(dl.get_years(_CONSOLIDATED_DF, company) or [CURR_YEAR])
+
+    # ── Header with Download button top-right ─────────────────────────────────
+    hdr_col, btn_col = st.columns([3, 1])
+    with hdr_col:
+        st.markdown(f"## {company}")
+        st.caption("TIP ESG Sustainability Report · Tire Industry Project")
+    with btn_col:
+        if years:
+            sel_yr = st.selectbox("Year", sorted(years, reverse=True),
+                                  key="rpt_year_sel", label_visibility="collapsed")
+        else:
+            sel_yr = CURR_YEAR
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    from formula_engine import TemplateInputs as TI, calculate as calc
+    valid = {f.name for f in TI.__dataclass_fields__.values()}
+
+    step  = dl.get_step_data(comp_hist, sel_yr)
+    clean = {k: v for k, v in step.items() if k in valid}
+    inp   = TI(company=company, year=sel_yr, **clean)
+    out   = calc(inp)
+
+    prev_out = None
+    if sel_yr - 1 in years:
+        ps = dl.get_step_data(comp_hist, sel_yr - 1)
+        pc = {k: v for k, v in ps.items() if k in valid}
+        prev_out = calc(TI(company=company, year=sel_yr - 1, **pc))
+
+    kpi_dict = build_kpi_dict_from_outputs(inp, out, prev_out)
+    rt       = max(inp.renew_elec_purchased + inp.nonrenew_elec_purchased + inp.self_gen_elec, 1)
+    renew_pct = inp.renew_elec_purchased / rt * 100
+
+    # ── Pre-compute historical table (needed by both PDF and web view) ────────
+    from formula_engine import TemplateInputs as TI, calculate as calc
+    valid = {f.name for f in TI.__dataclass_fields__.values()}
+    tbl_yrs = sorted([y for y in years if y <= sel_yr and y >= sel_yr - 9], reverse=True)
+    tbl_rows = []
+    for y in tbl_yrs:
+        sd_t = dl.get_step_data(comp_hist, y)
+        sc_t = {k: v for k, v in sd_t.items() if k in valid}
+        if not sc_t: continue
+        o_t  = calc(TI(company=company, year=y, **sc_t))
+        ii_t = TI(company=company, year=y, **sc_t)
+        rt2  = max(ii_t.renew_elec_purchased + ii_t.nonrenew_elec_purchased + ii_t.self_gen_elec, 1)
+        tbl_rows.append({
+            "Year":              y,
+            "Production (M T)":  f"{ii_t.production/1e6:.2f}",
+            "CO₂ Total (T)":     f"{o_t.total_co2:,.0f}",
+            "CO₂ Intensity":     f"{o_t.co2_kpi:.3f}",
+            "Energy KPI (GJ/T)": f"{o_t.energy_kpi:.2f}",
+            "Renew. Elec. %":    f"{ii_t.renew_elec_purchased/rt2*100:.1f}%",
+            "Water KPI (m³/T)":  f"{o_t.water_kpi:.2f}",
+            "Waste Recovery %":  f"{o_t.waste_recovery_pct*100:.1f}%",
+        })
+
+    # CO₂ trend for last 5 years
+    trend_yrs  = sorted([y for y in years if y <= sel_yr])[-5:]
+    co2_trend  = []
+    for ty in trend_yrs:
+        sd = dl.get_step_data(comp_hist, ty)
+        sc = {k: v for k, v in sd.items() if k in valid}
+        co2_trend.append(calc(TI(company=company, year=ty, **sc)).co2_kpi)
+
+    # Generate PDF using matplotlib — matches the web page content
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    pdf_bytes = None
+    try:
+        import pdf_charts_v2 as pc
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units    import mm
+        from reportlab.pdfgen       import canvas as rl_canvas
+        from reportlab.lib.utils    import ImageReader
+        import io as _io
+
+        W, H = A4; MARGIN = 12*mm; CW = W - 2*MARGIN
+        buf2 = _io.BytesIO()
+        cv   = rl_canvas.Canvas(buf2, pagesize=A4)
+
+        # --- Cover band ---
+        cv.setFillColor((10/255, 34/255, 64/255))
+        cv.rect(0, H - 30*mm, W, 30*mm, fill=1, stroke=0)
+        cv.setFont("Helvetica-Bold", 15)
+        cv.setFillColor((1,1,1))
+        cv.drawString(MARGIN, H - 13*mm, company)
+        cv.setFont("Helvetica", 9); cv.setFillColor((0.55,0.65,0.75))
+        cv.drawString(MARGIN, H - 20*mm, f"TIP ESG Sustainability Performance Report  ·  {sel_yr}")
+        cv.setFont("Helvetica-Bold", 7); cv.setFillColor((0.3,0.9,0.4))
+        cv.drawString(W - MARGIN - 55, H - 15*mm, "dss+ Verified Standard")
+        cv.setFont("Helvetica-Bold", 28); cv.setFillColor((1,1,1))
+        cv.drawRightString(W - MARGIN, H - 17*mm, str(sel_yr))
+
+        cursor = H - 34*mm
+
+        def _embed_img(img_bytes, h=55*mm, w=None):
+            nonlocal cursor
+            if cursor - h < MARGIN + 5*mm:
+                cv.showPage(); cursor = H - MARGIN
+            reader = ImageReader(_io.BytesIO(img_bytes))
+            use_w = w or CW
+            cv.drawImage(reader, MARGIN, cursor - h, width=use_w, height=h, preserveAspectRatio=True)
+            cursor -= h + 4*mm
+
+        def _section_hdr(title, subtitle, color=(10/255,34/255,64/255)):
+            nonlocal cursor
+            cv.setFillColor((0.96, 0.97, 0.99))
+            cv.rect(MARGIN, cursor - 10*mm, CW, 10*mm, fill=1, stroke=0)
+            cv.setFillColor(color)
+            cv.rect(MARGIN, cursor - 10*mm, 2.5, 10*mm, fill=1, stroke=0)
+            cv.setFont("Helvetica-Bold", 9); cv.setFillColor(color)
+            cv.drawString(MARGIN + 5, cursor - 6*mm, title)
+            cv.setFont("Helvetica", 7); cv.setFillColor((0.4,0.4,0.4))
+            cv.drawString(MARGIN + 5, cursor - 9*mm, subtitle)
+            cursor -= 12*mm
+
+        # --- 6 KPI cards row ---
+        kpi_card_data = [
+            ("CO₂ Intensity",     f"{out.co2_kpi:.3f}", "T.CO₂/T"),
+            ("Renewable Elec.",   f"{renew_pct:.1f}",   "%"),
+            ("Water Intensity",   f"{out.water_kpi:.2f}","m³/T"),
+            ("Waste Recovery",    f"{out.waste_recovery_pct*100:.1f}","%"),
+            ("Energy Intensity",  f"{out.energy_kpi:.2f}","GJ/T"),
+            ("Production",        f"{inp.production/1e6:.2f}","M T"),
+        ]
+        card_w = CW / 6; card_h = 18*mm
+        if cursor - card_h < MARGIN: cv.showPage(); cursor = H - MARGIN
+        for j, (lbl, val, unit) in enumerate(kpi_card_data):
+            cx = MARGIN + j * card_w
+            cv.setFillColor((0.97, 0.98, 1.0))
+            cv.roundRect(cx, cursor - card_h, card_w - 1, card_h, 2, fill=1, stroke=0)
+            cv.setFillColor((0.4, 0.45, 0.5))
+            cv.setFont("Helvetica", 6); cv.drawCentredString(cx + card_w/2, cursor - 5*mm, lbl.upper())
+            cv.setFont("Helvetica-Bold", 11); cv.setFillColor((0.06, 0.13, 0.25))
+            cv.drawCentredString(cx + card_w/2, cursor - 10*mm, val)
+            cv.setFont("Helvetica", 6); cv.setFillColor((0.5, 0.5, 0.5))
+            cv.drawCentredString(cx + card_w/2, cursor - 14*mm, unit)
+        cursor -= card_h + 6*mm
+
+        # --- Section 1: Environmental ---
+        _section_hdr("1.  Environmental Performance",
+                     "CO₂ emissions, energy consumption and climate targets")
+
+        # Build data for charts
+        all_hist = {}
+        for y_h in years:
+            sd_h = dl.get_step_data(comp_hist, y_h)
+            sc_h = {k: v for k,v in sd_h.items() if k in valid}
+            if not sc_h: continue
+            o_h  = calc(TI(company=company, year=y_h, **sc_h))
+            ii_h = TI(company=company, year=y_h, **sc_h)
+            rt_h = max(ii_h.renew_elec_purchased + ii_h.nonrenew_elec_purchased + ii_h.self_gen_elec, 1)
+            all_hist[y_h] = {"co2": o_h.total_co2, "nat_gas": ii_h.nat_gas,
+                              "coal": ii_h.coal_sub, "diesel": ii_h.diesel,
+                              "renew_gj": ii_h.renew_elec_purchased,
+                              "nonrenew_gj": ii_h.nonrenew_elec_purchased,
+                              "biomass": ii_h.biomass, "water_m3": ii_h.water_withdrawals,
+                              "waste_pct": o_h.waste_recovery_pct*100}
+        hy = sorted(all_hist.keys())
+
+        # CO₂ + energy mix side by side
+        if hy:
+            img_co2 = pc.area_line(hy, [all_hist[y]["co2"] for y in hy],
+                                   "Total CO₂ Emissions (T.CO₂)", color=pc.C["co2"])
+            img_nrg = pc.stacked_bar(hy[-8:], {
+                "Nat. Gas": [all_hist[y]["nat_gas"]    for y in hy[-8:]],
+                "Renew.":   [all_hist[y]["renew_gj"]   for y in hy[-8:]],
+                "Diesel":   [all_hist[y]["diesel"]      for y in hy[-8:]],
+                "Coal":     [all_hist[y]["coal"]        for y in hy[-8:]],
+            }, "Energy Mix by Source (GJ)",
+            color_dict={"Nat. Gas":pc.C["energy"],"Renew.":pc.C["green"],
+                        "Diesel":"#78716C","Coal":"#475569"})
+
+            half_w = CW / 2 - 2*mm
+            h_img  = 52*mm
+            if cursor - h_img < MARGIN: cv.showPage(); cursor = H - MARGIN
+            cv.drawImage(ImageReader(_io.BytesIO(img_co2)),
+                         MARGIN, cursor-h_img, width=half_w, height=h_img, preserveAspectRatio=True)
+            cv.drawImage(ImageReader(_io.BytesIO(img_nrg)),
+                         MARGIN+half_w+2*mm, cursor-h_img, width=half_w, height=h_img, preserveAspectRatio=True)
+            cursor -= h_img + 5*mm
+
+        # --- Section 2: Resource Efficiency ---
+        _section_hdr("2.  Resource Efficiency",
+                     "Water withdrawals, waste management and circular economy",
+                     color=(0.03,0.35,0.43))
+        if hy:
+            img_wat = pc.bar_chart(hy, [all_hist[y]["water_m3"]/1e6 for y in hy],
+                                   "Water Withdrawals (M m³)", "M m³", color=pc.C["water"])
+            img_wst = pc.area_with_target(hy, [all_hist[y]["waste_pct"] for y in hy],
+                                          "Waste Recovery Rate (%)", "%",
+                                          color=pc.C["waste"])
+            h_img = 52*mm
+            if cursor - h_img < MARGIN: cv.showPage(); cursor = H - MARGIN
+            cv.drawImage(ImageReader(_io.BytesIO(img_wat)),
+                         MARGIN, cursor-h_img, width=half_w, height=h_img, preserveAspectRatio=True)
+            cv.drawImage(ImageReader(_io.BytesIO(img_wst)),
+                         MARGIN+half_w+2*mm, cursor-h_img, width=half_w, height=h_img, preserveAspectRatio=True)
+            cursor -= h_img + 5*mm
+
+        # --- Section 3: Historical table ---
+        _section_hdr("3.  Historical Performance Data",
+                     f"{max(tbl_yrs[-1] if tbl_rows else sel_yr-9, sel_yr-9)}–{sel_yr}",
+                     color=(0.09,0.32,0.09))
+        if tbl_rows:
+            cv.setFont("Helvetica-Bold", 7); cv.setFillColor((0.06,0.13,0.25))
+            headers = list(tbl_rows[0].keys())
+            col_w   = CW / len(headers)
+            row_h   = 5.5*mm
+            # header row
+            if cursor - row_h < MARGIN: cv.showPage(); cursor = H - MARGIN
+            cv.setFillColor((0.94,0.95,0.98))
+            cv.rect(MARGIN, cursor-row_h, CW, row_h, fill=1, stroke=0)
+            for j, h_txt in enumerate(headers):
+                cv.setFont("Helvetica-Bold", 6); cv.setFillColor((0.3,0.35,0.4))
+                cv.drawCentredString(MARGIN + (j+0.5)*col_w, cursor-4*mm, str(h_txt)[:12])
+            cursor -= row_h
+            for ri, row in enumerate(tbl_rows):
+                if cursor - row_h < MARGIN: cv.showPage(); cursor = H - MARGIN
+                if ri % 2 == 0:
+                    cv.setFillColor((0.975,0.978,0.985))
+                    cv.rect(MARGIN, cursor-row_h, CW, row_h, fill=1, stroke=0)
+                for j, col_name in enumerate(headers):
+                    cv.setFont("Helvetica", 6)
+                    cv.setFillColor((0.15,0.15,0.2) if j==0 else (0.35,0.38,0.42))
+                    cv.drawCentredString(MARGIN+(j+0.5)*col_w, cursor-4*mm, str(row.get(col_name,""))[:10])
+                cursor -= row_h
+
+        # --- Footer ---
+        cv.setFillColor((0.95,0.96,0.98))
+        cv.rect(0, 0, W, 12*mm, fill=1, stroke=0)
+        cv.setFont("Helvetica", 6); cv.setFillColor((0.4,0.4,0.4))
+        cv.drawString(MARGIN, 5*mm,
+            "Methodology: GHG Protocol (Scope 1+2) · TIP KPI definitions v3.1 · IEA 2023 emission factors")
+        from datetime import date as _ddate
+        cv.drawRightString(W-MARGIN, 5*mm,
+            f"Generated {_ddate.today().strftime('%d %b %Y')} · TIP ESG Platform by dss+")
+
+        cv.save(); buf2.seek(0); pdf_bytes = buf2.read()
+    except Exception as _e:
+        pdf_bytes = None
+        st.warning(f"PDF generation error: {_e}")
+    filename = f"{company.replace(' ','_')}_Sustainability_Report_{sel_yr}.pdf"
+    with btn_col:
+        if pdf_bytes:
+            st.download_button("⬇ Download PDF", data=pdf_bytes, file_name=filename,
+                               mime="application/pdf", type="primary",
+                               use_container_width=True)
+        else:
+            st.button("⬇ Download PDF", disabled=True, use_container_width=True)
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # REPORT BODY — styled as a professional one-page CSR report
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Cover band ────────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#0A2240 0%,#164E63 100%);
+        border-radius:12px;padding:28px 32px;margin-bottom:20px;
+        display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div style="color:rgba(255,255,255,.5);font-size:11px;font-weight:500;
+            text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">
+          TIP ESG Platform · Tire Industry Project
+        </div>
+        <div style="color:#fff;font-size:28px;font-weight:800;letter-spacing:-.5px;
+            margin-bottom:4px">{_html.escape(company)}</div>
+        <div style="color:rgba(255,255,255,.6);font-size:14px">
+          Sustainability Performance Report · {sel_yr}
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="color:rgba(255,255,255,.4);font-size:10px;text-transform:uppercase">
+          Reporting Year</div>
+        <div style="color:#fff;font-size:52px;font-weight:800;line-height:1">
+          {sel_yr}</div>
+        <div style="color:{GREEN};font-size:11px;font-weight:600;margin-top:4px">
+          ● dss+ Verified Standard</div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # ── Executive Summary ──────────────────────────────────────────────────────
+    def _yoy_str(cur, prev_val, lower=True):
+        if not prev_val or prev_val == 0: return ""
+        pct = (cur - prev_val) / abs(prev_val) * 100
+        good = pct <= 0 if lower else pct >= 0
+        arrow = "▼" if pct < 0 else "▲"
+        col   = GREEN if good else RED
+        return f'<span style="color:{col};font-size:11px;font-weight:600">{arrow} {abs(pct):.1f}%</span>'
+
+    co2_yoy    = _yoy_str(out.co2_kpi,    prev_out.co2_kpi if prev_out else None)
+    energy_yoy = _yoy_str(out.energy_kpi, prev_out.energy_kpi if prev_out else None)
+    water_yoy  = _yoy_str(out.water_kpi,  prev_out.water_kpi if prev_out else None)
+    waste_yoy  = _yoy_str(out.waste_recovery_pct, prev_out.waste_recovery_pct if prev_out else None, lower=False)
+
+    kpi_summary = [
+        ("CO₂ Intensity",     f"{out.co2_kpi:.3f}",           "T.CO₂/T", co2_yoy,    CAT_CO2),
+        ("Renewable Elec.",   f"{renew_pct:.1f}",              "%",       "",          CAT_RENEW),
+        ("Water Intensity",   f"{out.water_kpi:.2f}",          "m³/T",    water_yoy,  CAT_WATER),
+        ("Waste Recovery",    f"{out.waste_recovery_pct*100:.1f}","%",    waste_yoy,  CAT_WASTE),
+        ("Energy Intensity",  f"{out.energy_kpi:.2f}",         "GJ/T",    energy_yoy, CAT_ENERGY),
+        ("Production",        f"{inp.production/1e6:.2f}",     "M T",     "",          NAVY),
+    ]
+    kpi_cols = st.columns(6)
+    for i, (label, val, unit, yoy_h, color) in enumerate(kpi_summary):
+        with kpi_cols[i]:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
+                padding:10px 8px;text-align:center;
+                height:90px;display:flex;flex-direction:column;
+                justify-content:space-between;align-items:center;
+                animation:tipFadeIn 400ms ease-out {i*50}ms both">
+              <div style="font-size:9px;color:{MUTED};text-transform:uppercase;
+                  letter-spacing:.5px;font-weight:600">{label}</div>
+              <div style="font-size:19px;font-weight:800;color:{color};
+                  font-variant-numeric:tabular-nums;line-height:1">{val}</div>
+              <div style="font-size:9px;color:{MUTED}">{unit}</div>
+              <div style="margin-top:2px;min-height:14px">{yoy_h}</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+
+    # ── Section 1: Environmental Performance ─────────────────────────────────
+    st.markdown(f"""
+    <div style="border-left:3px solid {CAT_CO2};padding:4px 0 4px 12px;margin-bottom:12px">
+      <div style="font-size:14px;font-weight:700;color:{TEXT}">
+        1. Environmental Performance</div>
+      <div style="font-size:11px;color:{MUTED}">
+        CO₂ emissions, energy consumption and climate targets</div>
+    </div>""", unsafe_allow_html=True)
+
+    r1c1, r1c2 = st.columns(2, gap="medium")
+    with r1c1:
+        # CO₂ trend
+        co2_all = []
+        for y in years:
+            sd = dl.get_step_data(comp_hist, y)
+            sc = {k: v for k, v in sd.items() if k in valid}
+            if sc: co2_all.append((y, calc(TI(company=company, year=y, **sc)).total_co2))
+        if co2_all:
+            ys_c, vals_c = zip(*co2_all)
+            fig_co2 = go.Figure()
+            fig_co2.add_trace(go.Scatter(
+                x=list(ys_c), y=list(vals_c), mode="lines+markers",
+                fill="tozeroy", fillcolor="rgba(71,85,105,0.08)",
+                line=dict(color=CAT_CO2, width=2.5),
+                marker=dict(size=6, color=CAT_CO2),
+                hovertemplate="<b>%{x}</b>: %{y:,.0f} T.CO₂<extra></extra>",
+            ))
+            fig_co2.update_layout(**chart_layout_defaults("Total CO₂ Emissions (T.CO₂)", height=220,
+                                                           showlegend=False),
+                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                                   xaxis=dict(gridcolor="#F1F5F9"))
+            apply_chart_animation(fig_co2)
+            st.plotly_chart(fig_co2, use_container_width=True)
+
+    with r1c2:
+        # Energy mix stacked bar
+        fuel_data = [(y, dl.get_step_data(comp_hist, y)) for y in years[-8:]]
+        if fuel_data:
+            fig_nrg = go.Figure()
+            fuel_keys = [("Nat. Gas","nat_gas",CAT_ENERGY),
+                         ("Coal","coal_sub","#475569"),
+                         ("Diesel","diesel","#78716C"),
+                         ("Renew. Elec","renew_elec_purchased",CAT_RENEW)]
+            for lbl, fkey, fcol in fuel_keys:
+                vals = [sd.get(fkey, 0) for _, sd in fuel_data]
+                if any(v>0 for v in vals):
+                    fig_nrg.add_trace(go.Bar(
+                        x=[y for y,_ in fuel_data], y=vals,
+                        name=lbl, marker_color=fcol, marker_line_width=0,
+                        hovertemplate=f"<b>{lbl}</b>: %{{y:,.0f}} GJ<extra></extra>",
+                    ))
+            fig_nrg.update_layout(**chart_layout_defaults("Energy Mix by Source (GJ)", height=220),
+                                   barmode="stack", bargap=0.2,
+                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                                   xaxis=dict(gridcolor="#F1F5F9"))
+            apply_chart_animation(fig_nrg)
+            st.plotly_chart(fig_nrg, use_container_width=True)
+
+    # ── Section 2: Resource Efficiency ────────────────────────────────────────
+    st.markdown(f"""
+    <div style="border-left:3px solid {CAT_WATER};padding:4px 0 4px 12px;margin-bottom:12px">
+      <div style="font-size:14px;font-weight:700;color:{TEXT}">
+        2. Resource Efficiency</div>
+      <div style="font-size:11px;color:{MUTED}">
+        Water withdrawals, waste management and circular economy</div>
+    </div>""", unsafe_allow_html=True)
+
+    r2c1, r2c2 = st.columns(2, gap="medium")
+    with r2c1:
+        water_vals = [(y, dl.get_step_data(comp_hist,y).get("water_withdrawals",0)) for y in years]
+        if water_vals:
+            ys_w, vals_w = zip(*water_vals)
+            fig_wat = go.Figure(go.Bar(
+                x=list(ys_w), y=[v/1e6 for v in vals_w],
+                marker_color=CAT_WATER, marker_line_width=0, opacity=0.85,
+                hovertemplate="<b>%{x}</b>: %{y:.2f} M m³<extra></extra>",
+            ))
+            fig_wat.update_layout(**chart_layout_defaults("Water Withdrawals (M m³)", height=200,
+                                                           showlegend=False),
+                                   yaxis=dict(gridcolor="#F1F5F9"),
+                                   xaxis=dict(gridcolor="#F1F5F9"))
+            apply_chart_animation(fig_wat)
+            st.plotly_chart(fig_wat, use_container_width=True)
+
+    with r2c2:
+        waste_rec_vals = []
+        for y in years:
+            sd = dl.get_step_data(comp_hist, y)
+            sc = {k: v for k, v in sd.items() if k in valid}
+            if sc:
+                o = calc(TI(company=company, year=y, **sc))
+                waste_rec_vals.append((y, o.waste_recovery_pct*100))
+        if waste_rec_vals:
+            ys_wr, vals_wr = zip(*waste_rec_vals)
+            fig_wr = go.Figure()
+            fig_wr.add_hline(y=90, line_dash="dot", line_color=GREEN,
+                             line_width=1.5, annotation_text="Target 90%",
+                             annotation_font=dict(size=9, color=GREEN))
+            fig_wr.add_trace(go.Scatter(
+                x=list(ys_wr), y=list(vals_wr), mode="lines+markers",
+                fill="tozeroy", fillcolor="rgba(124,58,237,0.08)",
+                line=dict(color=CAT_WASTE, width=2.5),
+                marker=dict(size=6, color=CAT_WASTE),
+                hovertemplate="<b>%{x}</b>: %{y:.1f}%<extra></extra>",
+            ))
+            fig_wr.update_layout(**chart_layout_defaults("Waste Recovery Rate (%)", height=200,
+                                                          showlegend=False),
+                                  yaxis=dict(range=[0,105], ticksuffix="%",
+                                             gridcolor="#F1F5F9"),
+                                  xaxis=dict(gridcolor="#F1F5F9"))
+            apply_chart_animation(fig_wr)
+            st.plotly_chart(fig_wr, use_container_width=True)
+
+    # ── Section 3: Historical KPI Table ───────────────────────────────────────
+    st.markdown(f"""
+    <div style="border-left:3px solid {GREEN};padding:4px 0 4px 12px;margin-bottom:12px">
+      <div style="font-size:14px;font-weight:700;color:{TEXT}">
+        3. Historical Performance Data ({max(years)-9 if len(years)>=10 else min(years)}–{sel_yr})</div>
+    </div>""", unsafe_allow_html=True)
+
+    # tbl_rows already computed above (before PDF generation)
+    if tbl_rows:
+        tbl_df = pd.DataFrame(tbl_rows)
+        st.dataframe(
+            tbl_df.style
+                .set_properties(**{"text-align":"right","font-size":"12px"})
+                .set_table_styles([
+                    {"selector":"th","props":[
+                        ("font-size","10px"),("text-transform","uppercase"),
+                        ("letter-spacing",".4px"),("color","#64748B"),
+                        ("background","#F8FAFC"),("padding","8px 12px")]},
+                    {"selector":"td:first-child","props":[
+                        ("font-weight","600"),("color","#0F172A"),
+                        ("text-align","center")]},
+                ]),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:#F8FAFC;border-radius:8px;padding:12px 20px;margin-top:16px;
+        display:flex;justify-content:space-between;align-items:center;
+        border:1px solid {BORDER}">
+      <div style="font-size:11px;color:{MUTED}">
+        Methodology: GHG Protocol (Scope 1+2) · TIP KPI definitions v3.1 ·
+        Emission factors: IEA 2023</div>
+      <div style="font-size:11px;color:{MUTED}">
+        Generated {_date.today().strftime('%d %b %Y')} · TIP ESG Platform powered by dss+</div>
+    </div>""", unsafe_allow_html=True)
+
+
+def page_settings():
+    """Settings page — for both client and DSS+ users."""
+    st.markdown(section_header_html("Settings", "Account & preferences"),
+                unsafe_allow_html=True)
+
+    tab_acct, tab_notif, tab_about = st.tabs(["Account", "Notifications", "About"])
+
+    with tab_acct:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Profile**")
+            st.text_input("Display Name", value=st.session_state.user_name,
+                          key="set_name")
+            st.text_input("Email", value=st.session_state.user_email,
+                          disabled=True, key="set_email")
+            role = "dss+ Analyst (Internal)" if st.session_state.is_dss else "Client Company User"
+            st.text_input("Role", value=role, disabled=True, key="set_role")
+            if st.button("Save Profile", key="save_profile"):
+                st.success("Profile updated.")
+        with col2:
+            st.markdown("**Security**")
+            st.text_input("Current Password", type="password", key="set_cur_pw")
+            st.text_input("New Password",     type="password", key="set_new_pw")
+            st.text_input("Confirm Password", type="password", key="set_cfm_pw")
+            if st.button("Change Password", key="change_pw"):
+                st.info("Password change will be available in the full production release.")
+
+    with tab_notif:
+        st.markdown("**Email notifications**")
+        st.checkbox("Submission deadline reminders",          value=True,  key="n1")
+        st.checkbox("Verification status updates",            value=True,  key="n2")
+        st.checkbox("Sector benchmarks published",            value=False, key="n3")
+        st.checkbox("AI anomaly alerts",                      value=True,  key="n4")
+        if st.button("Save notification preferences", key="save_notif"):
+            st.success("Preferences saved.")
+
+    with tab_about:
+        st.markdown(f"""
+        **TIP ESG Platform**
+
+        Version 1.0 · Built for the WBCSD Tire Industry Project by dss+
+
+        - Formula engine: GHG Protocol Scope 1 & 2
+        - Benchmark data: TIP member companies 2009–{CURR_YEAR}
+        - AI assistant: Local Ollama (phi3) / Azure OpenAI Enterprise
+        - Storage: Local filesystem (v1) → Azure SharePoint (v2)
+
+        *For technical support contact your dss+ account manager.*
+        """)
+
+
+def page_portfolio():
+    """DSS+ Portfolio — 10-company grid with status chips and KPI heatmap."""
+    st.markdown(section_header_html(
+        "Portfolio Overview",
+        f"All TIP member companies · {CURR_YEAR} reporting cycle",
+        badge=f"{len(_COMPANIES)} Companies",
+    ), unsafe_allow_html=True)
+
+    if _CONSOLIDATED_DF.empty:
+        st.markdown(empty_state_html("🗂️", "No data loaded",
+            "Run python build_esg_master.py to load company data."),
+            unsafe_allow_html=True)
+        return
+
+    # Status summary bar
+    statuses = ["complete", "review", "pending"]
+    status_map = {}
+    for i, co in enumerate(_COMPANIES):
+        # Determine status from data completeness
+        hist = dl.get_company_hist(_CONSOLIDATED_DF, co)
+        step = dl.get_step_data(hist, CURR_YEAR) if hist else {}
+        n    = len(step)
+        status_map[co] = "complete" if n >= 15 else "review" if n >= 5 else "pending"
+
+    n_complete = sum(1 for s in status_map.values() if s == "complete")
+    n_review   = sum(1 for s in status_map.values() if s == "review")
+    n_pending  = sum(1 for s in status_map.values() if s == "pending")
+
+    st.markdown(f"""
+    <div style="display:flex;gap:12px;margin-bottom:20px">
+      <div style="background:#DCFCE7;border-radius:8px;padding:12px 20px;flex:1;text-align:center">
+        <div style="font-size:28px;font-weight:700;color:#166534">{n_complete}</div>
+        <div style="font-size:11px;color:#166534;font-weight:500">Complete</div>
+      </div>
+      <div style="background:#FEF3C7;border-radius:8px;padding:12px 20px;flex:1;text-align:center">
+        <div style="font-size:28px;font-weight:700;color:#92400E">{n_review}</div>
+        <div style="font-size:11px;color:#92400E;font-weight:500">In Review</div>
+      </div>
+      <div style="background:#F1F5F9;border-radius:8px;padding:12px 20px;flex:1;text-align:center">
+        <div style="font-size:28px;font-weight:700;color:#475569">{n_pending}</div>
+        <div style="font-size:11px;color:#475569;font-weight:500">Pending</div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # Company grid — 2 columns
+    cols = st.columns(2, gap="medium")
+    from formula_engine import TemplateInputs as TI, calculate as calc
+    valid = {f.name for f in TI.__dataclass_fields__.values()}
+
+    for i, company in enumerate(_COMPANIES):
+        hist  = dl.get_company_hist(_CONSOLIDATED_DF, company)
+        step  = dl.get_step_data(hist, CURR_YEAR) if hist else {}
+        clean = {k: v for k, v in step.items() if k in valid}
+        out   = calc(TI(company=company, year=CURR_YEAR, **clean))
+        kpis  = {"co2_kpi": out.co2_kpi, "energy_kpi": out.energy_kpi,
+                 "water_kpi": out.water_kpi}
+
+        with cols[i % 2]:
+            st.markdown(co_card_html(
+                company, status_map[company], CURR_YEAR,
+                kpis, anim_delay=i * 60,
+            ), unsafe_allow_html=True)
+            if st.button(f"Open {company.split()[0]} Template →",
+                         key=f"port_view_{i}", use_container_width=True):
+                st.session_state.portfolio_company  = company
+                st.session_state.reporting_company  = company
+                st.session_state.dss_verif_company  = company
+                st.session_state.dss_ready_company  = company
+                st.session_state.dss_analy_company  = company
+                st.session_state.company_setup_done = False
+                st.session_state.template_done      = False
+                st.session_state.step               = 0
+                st.session_state.page               = "company_data"
+                st.rerun()
+        st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
+
+
+def page_doc_library():
+    """DSS+ Document Library — upload PDFs, AI-extract KPIs."""
+    st.markdown(section_header_html(
+        "Document Library",
+        "Upload company submissions and source documents",
+    ), unsafe_allow_html=True)
+
+    col_up, col_lib = st.columns([1, 1], gap="large")
+
+    with col_up:
+        st.markdown("**Upload Document**")
+        company_sel = st.selectbox("Company", _COMPANIES, key="doclib_co")
+        year_sel    = st.number_input("Year", min_value=2009,
+                                      max_value=CURR_YEAR + 1,
+                                      value=CURR_YEAR, step=1, key="doclib_yr")
+        doc_type    = st.selectbox("Document Type",
+                                   ["Annual ESG Report", "Sustainability Appendix",
+                                    "GHG Inventory", "Audit Evidence", "Other"],
+                                   key="doclib_type")
+        uploaded    = st.file_uploader("Upload PDF or Excel",
+                                        type=["pdf", "xlsx", "csv"],
+                                        key="doclib_file")
+        if uploaded and st.button("📤 Upload & Extract KPIs",
+                                   type="primary", use_container_width=True,
+                                   key="doclib_upload"):
+            with st.spinner("Uploading and extracting KPIs via AI…"):
+                import time; time.sleep(1.5)
+            st.success(f"Uploaded {uploaded.name} for {company_sel} {year_sel}. "
+                       "AI extraction queued — results appear in Verification Queue.")
+
+    with col_lib:
+        st.markdown("**Recent Documents**")
+        docs = [
+            ("VerdaTyres Corp",    2023, "Annual ESG Report",     "complete", "13 May 2026"),
+            ("AlphaTread Ltd",     2023, "GHG Inventory",         "review",   "12 May 2026"),
+            ("BetaRubber Inc",     2022, "Sustainability Appendix","complete", "10 May 2026"),
+            ("DeltaGrip GmbH",     2023, "Annual ESG Report",     "pending",  "08 May 2026"),
+        ]
+        for co, yr, dtype, status, ts in docs:
+            chip = status_chip_html(status)
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
+                padding:12px 14px;margin-bottom:6px">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:{TEXT}">{co} · {yr}</div>
+                  <div style="font-size:11px;color:{MUTED}">{dtype} · {ts}</div>
+                </div>
+                {chip}
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+
+def page_sector_reports():
+    """DSS+ Sector Reports — generate annual TIP sustainability report."""
+    st.markdown(section_header_html(
+        "Sector Reports",
+        "Generate the annual TIP consolidated sustainability report",
+    ), unsafe_allow_html=True)
+
+    col_gen, col_prev = st.columns([1, 1], gap="large")
+
+    with col_gen:
+        st.markdown("**Generate Report**")
+        rpt_year = st.selectbox("Report Year", LONG_YEARS[::-1], key="sr_year")
+        rpt_scope = st.multiselect("Include Companies", _COMPANIES,
+                                   default=_COMPANIES, key="sr_scope")
+        rpt_format = st.radio("Format", ["PDF (Executive)", "Excel (Full Data)"],
+                              key="sr_fmt", horizontal=True)
+        st.markdown("**Sections to include:**")
+        c1, c2 = st.columns(2)
+        with c1:
+            inc_co2    = st.checkbox("CO₂ & GHG",        True, key="inc_co2")
+            inc_energy = st.checkbox("Energy",            True, key="inc_energy")
+            inc_water  = st.checkbox("Water",             True, key="inc_water")
+        with c2:
+            inc_waste  = st.checkbox("Waste",             True, key="inc_waste")
+            inc_bench  = st.checkbox("Benchmarking",      True, key="inc_bench")
+            inc_sdg    = st.checkbox("SDG Roadmap",       False, key="inc_sdg")
+
+        if st.button("🌍 Generate Sector Report", type="primary",
+                     use_container_width=True, key="gen_sector"):
+            with st.spinner(f"Generating {rpt_year} sector report…"):
+                import time; time.sleep(2)
+            if not _CONSOLIDATED_DF.empty:
+                subset = _CONSOLIDATED_DF[
+                    (_CONSOLIDATED_DF["Company"].isin(rpt_scope)) &
+                    (_CONSOLIDATED_DF["Year"] == rpt_year)
+                ]
+                csv_bytes = subset.to_csv(index=False).encode()
+                st.download_button(
+                    "⬇ Download Sector Data (CSV)",
+                    data=csv_bytes,
+                    file_name=f"TIP_Sector_Report_{rpt_year}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            st.success(f"Sector report for {rpt_year} ready.")
+
+    with col_prev:
+        st.markdown("**Previous Reports**")
+        prev_reports = [
+            (2023, "TIP Annual Sustainability Report 2023", "Published"),
+            (2022, "TIP Annual Sustainability Report 2022", "Published"),
+            (2021, "TIP Annual Sustainability Report 2021", "Archived"),
+        ]
+        for yr, name, status in prev_reports:
+            chip = status_chip_html("complete" if status == "Published" else "pending")
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
+                padding:12px 14px;margin-bottom:6px">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:{TEXT}">{name}</div>
+                  <div style="font-size:11px;color:{MUTED}">{yr} · {status}</div>
+                </div>
+                {chip}
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+
+def page_admin():
+    """DSS+ Admin — tenant management, RBAC, AI usage."""
+    st.markdown(section_header_html(
+        "Admin", "Platform administration",
+        badge="DSS+ Only",
+    ), unsafe_allow_html=True)
+
+    tab_tenants, tab_users, tab_ai, tab_system = st.tabs(
+        ["Tenants", "Users", "AI Usage", "System"]
+    )
+
+    with tab_tenants:
+        st.markdown("**Active Tenants (TIP Member Companies)**")
+        for i, co in enumerate(_COMPANIES):
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
+                padding:10px 14px;margin-bottom:4px;display:flex;
+                align-items:center;justify-content:space-between">
+              <div style="font-size:13px;font-weight:500;color:{TEXT}">{co}</div>
+              <div style="display:flex;gap:8px">
+                {status_chip_html('complete')}
+                <span style="font-size:11px;color:{MUTED}">Active since 2021</span>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
+        with st.expander("+ Add New Tenant"):
+            st.text_input("Company Name", key="admin_co_name")
+            st.text_input("Contact Email", key="admin_co_email")
+            st.number_input("Joined Year", min_value=2009,
+                            max_value=CURR_YEAR, value=CURR_YEAR,
+                            key="admin_co_year")
+            if st.button("Add Tenant", type="primary", key="admin_add_co"):
+                st.info("Tenant provisioning will be available in v2 (Azure AD integration).")
+
+    with tab_users:
+        st.markdown("**Role-Based Access Control**")
+        roles = {
+            "Client User":    "Edit and submit own company data",
+            "Client Admin":   "Manage users + approve within tenant",
+            "DSS+ Analyst":   "Cross-tenant read, verification write",
+            "DSS+ Admin":     "Super-user, manage all tenants and AI settings",
+        }
+        for role, desc in roles.items():
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
+                padding:10px 14px;margin-bottom:4px">
+              <div style="font-size:13px;font-weight:600;color:{TEXT}">{role}</div>
+              <div style="font-size:11px;color:{MUTED}">{desc}</div>
+            </div>""", unsafe_allow_html=True)
+
+    with tab_ai:
+        st.markdown("**AI Usage Logs**")
+        st.info("AI usage logs are stored in data_storage/chat_logs/ (JSONL format). "
+                "Full usage analytics will be available in v2.")
+        log_dir = Path("data_storage/chat_logs")
+        if log_dir.exists():
+            logs = list(log_dir.glob("*.jsonl"))
+            st.metric("Log files this week", len(logs))
+            for lf in sorted(logs, reverse=True)[:5]:
+                st.markdown(f"• `{lf.name}` — {lf.stat().st_size:,} bytes")
+
+    with tab_system:
+        st.markdown("**System Information**")
+        import platform, sys
+        info = {
+            "Python": sys.version.split()[0],
+            "Platform": platform.system(),
+            "Data Year Range": f"{cfg.DATA_YEAR_START}–{cfg.DATA_YEAR_END}",
+            "Companies": len(_COMPANIES),
+            "Master CSV rows": len(_CONSOLIDATED_DF) if not _CONSOLIDATED_DF.empty else 0,
+        }
+        for k, v in info.items():
+            st.markdown(f"""
+            <div style="display:flex;justify-content:space-between;
+                padding:6px 0;border-bottom:1px solid {BG};font-size:13px">
+              <span style="color:{MUTED}">{k}</span>
+              <span style="color:{TEXT};font-weight:500">{v}</span>
+            </div>""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────
 # MAIN ROUTER
 # ─────────────────────────────────────────────────────────
 if not st.session_state.authenticated:
@@ -3125,8 +5669,27 @@ if not st.session_state.authenticated:
 else:
     show_sidebar()
     page = st.session_state.page
-    if   page == "entry":         page_entry()
-    elif page == "analysis":      page_analysis()
-    elif page == "benchmarking":  page_benchmarking()
-    elif page == "verification":  page_verification()
-    elif page == "readiness":     page_readiness()
+
+    # ── Client pages ──────────────────────────────────────
+    if   page == "home":            page_home()
+    elif page == "entry":           page_entry()
+    elif page == "my_records":      page_my_records()
+    elif page == "dashboard":       page_my_dashboard()
+    elif page == "benchmarking":    page_benchmarking()
+    elif page == "reports":         page_reports()
+    elif page == "settings":        page_settings()
+
+    # ── DSS+ pages ────────────────────────────────────────
+    elif page == "portfolio":       page_portfolio()
+    elif page == "company_data":    page_company_data()
+    elif page == "verification":    page_verification()
+    elif page == "analysis":        page_analysis()
+    elif page == "readiness":       page_readiness()
+    elif page == "doc_library":     page_doc_library()
+    elif page == "sector_reports":  page_sector_reports()
+    elif page == "admin":           page_admin()
+
+    else:
+        # Fallback — redirect to correct home
+        st.session_state.page = "portfolio" if st.session_state.is_dss else "home"
+        st.rerun()

@@ -2214,7 +2214,9 @@ def page_analysis():
         return go.Scatter(**kw)
 
     df = _CONSOLIDATED_DF
-    has_wide = (not df.empty and "Row_Label" not in df.columns)
+    has_wide   = (not df.empty and "Row_Label" not in df.columns)
+    _first_yr  = int(yrs_int[0])  if yrs_int else 2009
+    _last_yr   = int(yrs_int[-1]) if yrs_int else CURR_YEAR
 
     def _sector(col, divisor=1):
         if has_wide and col in df.columns:
@@ -2527,18 +2529,18 @@ def page_analysis():
             for co in companies:
                 s = _co_series(co, "Total energy - KPI")
                 if s is not None:
-                    v09 = float(s.iloc[0])  if not np.isnan(float(s.iloc[0]))  else None
-                    v23 = float(s.iloc[-1]) if not np.isnan(float(s.iloc[-1])) else None
-                    if v09 and v23:
-                        rows.append({"Company": co.split()[0], "2009": v09, "2023": v23})
+                    v_first = float(s.iloc[0])  if not np.isnan(float(s.iloc[0]))  else None
+                    v_last  = float(s.iloc[-1]) if not np.isnan(float(s.iloc[-1])) else None
+                    if v_first and v_last:
+                        rows.append({"Company": co.split()[0], str(_first_yr): v_first, str(_last_yr): v_last})
             if rows:
                 f = go.Figure()
                 names = [r["Company"] for r in rows]
-                f.add_trace(go.Bar(name="2009", x=names, y=[r["2009"] for r in rows],
+                f.add_trace(go.Bar(name=str(_first_yr), x=names, y=[r[str(_first_yr)] for r in rows],
                     marker_color="rgba(10,34,64,.4)", marker_line_width=0))
-                f.add_trace(go.Bar(name="2023", x=names, y=[r["2023"] for r in rows],
+                f.add_trace(go.Bar(name=str(_last_yr), x=names, y=[r[str(_last_yr)] for r in rows],
                     marker_color=C["navy"], marker_line_width=0))
-                f.update_layout(**_layout("Energy intensity (GJ/T) — 2009 vs 2023 by company",
+                f.update_layout(**_layout(f"Energy intensity (GJ/T) — {_first_yr} vs {_last_yr} by company",
                     260, barmode="group",
                     yaxis=dict(title="GJ/metric T", gridcolor=C["grid"])))
                 st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "26"))
@@ -2573,7 +2575,7 @@ def page_analysis():
                 labels=["Scope 1","Scope 2"], values=[s1l, s2l], hole=0.55,
                 marker_colors=[C["red"], C["blue"]], textfont_size=12,
                 hovertemplate="%{label}: %{value:.3f}M<extra></extra>"))
-            f.update_layout(**_layout("Scope 1 vs Scope 2 — 2023", 240, legend_h=False))
+            f.update_layout(**_layout(f"Scope 1 vs Scope 2 — {overlay_year or _last_yr}", 240, legend_h=False))
             st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "29"))
         with c6:
             if companies:
@@ -2591,7 +2593,7 @@ def page_analysis():
                         marker_color=[C["green"] if v < 0.70 else C["red"] for v in sv],
                         marker_line_width=0,
                         hovertemplate="%{x:.3f} T.CO₂/T<extra>%{y}</extra>"))
-                    f.update_layout(**_layout("CO₂ intensity by company — 2023", 240,
+                    f.update_layout(**_layout(f"CO₂ intensity by company — {overlay_year or _last_yr}", 240,
                         legend_h=False,
                         xaxis=dict(title="T.CO₂/metric T", gridcolor=C["grid"])))
                     st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "30"))
@@ -2605,7 +2607,7 @@ def page_analysis():
                         v09 = float(s.iloc[0]);  v23 = float(s.iloc[-1])
                         if not (np.isnan(v09) or np.isnan(v23)):
                             yoy_rows.append({"Company": co.split()[0],
-                                "2009": f"{v09:.3f}", "2023": f"{v23:.3f}",
+                                str(_first_yr): f"{v_first:.3f}", str(_last_yr): f"{v_last:.3f}",
                                 "Change": f"{(v23-v09)/v09*100:+.1f}%"})
                 if yoy_rows:
                     st.markdown("**CO₂ intensity 2009 → 2023**")
@@ -2663,12 +2665,12 @@ def page_analysis():
                         marker_color=[C["green"] if v<7.0 else C["amber"] for v in vals],
                         marker_line_width=0,
                         hovertemplate="%{x:.2f} m³/T<extra>%{y}</extra>"))
-                    f.update_layout(**_layout("Water intensity ranking — 2023 (m³/T)",
+                    f.update_layout(**_layout(f"Water intensity ranking — {overlay_year or _last_yr} (m³/T)",
                         260, legend_h=False))
                     st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "34"))
             with c4:
                 if "Water intake" in df.columns and "Production" in df.columns:
-                    yr_df = df[df["Year"]==2023].dropna(subset=["Water intake","Production"])
+                    yr_df = df[df["Year"]==(overlay_year or _last_yr)].dropna(subset=["Water intake","Production"])
                     if not yr_df.empty:
                         f = go.Figure()
                         for idx, (_, row) in enumerate(yr_df.iterrows()):
@@ -2679,7 +2681,7 @@ def page_analysis():
                                 text=[str(row["Company"]).split()[0]],
                                 textposition="top center",
                                 marker=dict(size=12, color=PALETTE_10[idx % 10])))
-                        f.update_layout(**_layout("Water vs production — 2023", 260,
+                        f.update_layout(**_layout(f"Water vs production — {overlay_year or _last_yr}", 260,
                             legend_h=False,
                             xaxis=dict(title="Production (M T)", gridcolor=C["grid"]),
                             yaxis=dict(title="Water (M m³)", gridcolor=C["grid"])))
@@ -2732,7 +2734,7 @@ def page_analysis():
                         hovertemplate="%{y:.1f}%<extra>%{x}</extra>"))
                     f.add_hline(y=80, line_dash="dot", line_color=C["navy"],
                         annotation_text="80% target", annotation_font_size=10)
-                    f.update_layout(**_layout("Waste recovery by company — 2023 (%)", 260,
+                    f.update_layout(**_layout(f"Waste recovery by company — {overlay_year or _last_yr} (%)", 260,
                         yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
                     st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "38"))
             with c4:
@@ -4438,7 +4440,7 @@ def page_home():
 
     import pandas as pd
     tbl_rows = []
-    table_years = sorted([y for y in years if 2014 <= y <= 2023], reverse=True)
+    table_years = sorted([y for y in years if y <= sel_yr][-10:], reverse=True)
     for y in table_years:
         sd = dl.get_step_data(comp_hist, y)
         sc = {k: v for k, v in sd.items() if k in valid}

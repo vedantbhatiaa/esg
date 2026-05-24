@@ -87,7 +87,7 @@ def _reload_consolidated_df() -> bool:
     global _CONSOLIDATED_DF, _COMPANIES, _SECTOR_DF, _USING_FALLBACK_DATA
     try:
         from pathlib import Path
-        csv_path = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
+        csv_path = Path(f"data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_{cfg.DATA_YEAR_START}_{cfg.DATA_YEAR_END}.csv")
         fresh = pd.DataFrame()
 
         # Try storage client
@@ -1025,7 +1025,7 @@ def _sync_consolidate_excel(master_df: "pd.DataFrame") -> None:
     from pathlib import Path
     from openpyxl import load_workbook
 
-    xl_path = Path("data_storage/master/CONSOLIDATED_DUMMY_2009_2023.xlsx")
+    xl_path = Path(f"data_storage/master/CONSOLIDATED_DUMMY_{cfg.DATA_YEAR_START}_{cfg.DATA_YEAR_END}.xlsx")
     if not xl_path.exists():
         return  # nothing to sync yet
 
@@ -1167,11 +1167,17 @@ def _save_submission_to_csv(inp, out) -> str:
        - Per-company CSVs in data_storage/members/TIP/<Company>/
        - TIP members aggregate CSV
     """
-    import os, tempfile
+    import os, tempfile, glob
     from pathlib import Path
     from datetime import datetime
 
-    csv_path = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
+    # ── Determine save path ONCE, using the CURRENT DATA_YEAR_END ─────────────
+    # IMPORTANT: capture this BEFORE refresh_year_bounds() changes it.
+    save_year_end = max(cfg.DATA_YEAR_END, inp.year)   # always at least the new year
+    csv_path = Path(
+        f"data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES"
+        f"_{cfg.DATA_YEAR_START}_{save_year_end}.csv"
+    )
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     new_row     = pd.DataFrame([_build_master_row(inp, out)])
@@ -1191,24 +1197,32 @@ def _save_submission_to_csv(inp, out) -> str:
 
     def _load_best_existing():
         """
-        Load the most complete existing master DataFrame.
-        Checks all candidate paths and picks the one with the most rows.
+        Load the most complete existing master DataFrame by scanning ALL candidate
+        files in the master directory, regardless of year range in the filename.
+        This prevents data loss when the filename changes after a new year is added.
         """
-        candidates = [
-            csv_path,
-            Path("data_storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"),
-        ]
         best = pd.DataFrame(columns=master_cols)
-        for p in candidates:
-            if p.exists():
+        search_dirs = [
+            Path("data_storage/master"),
+            Path("data_storage/raw"),
+        ]
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+            for p in sorted(search_dir.glob("ESG_MASTER_WIDE_ALL_COMPANIES_*.csv"),
+                            key=lambda x: x.stat().st_mtime, reverse=True):
                 try:
                     df = pd.read_csv(p)
-                    if "Company" in df.columns and "Year" in df.columns and len(df) > len(best):
+                    if ("Company" in df.columns and "Year" in df.columns
+                            and len(df) > len(best)):
                         best = df
-                except PermissionError:
+                except (PermissionError, Exception):
                     pass
-                except Exception:
-                    pass
+
+        # Final fallback: try the globally loaded _CONSOLIDATED_DF (in-memory)
+        if len(best) == 0 and not _CONSOLIDATED_DF.empty:
+            best = _CONSOLIDATED_DF.copy()
+
         return _align(best)
 
     # ── 1. Build combined DataFrame ──────────────────────────────────────────
@@ -1236,7 +1250,10 @@ def _save_submission_to_csv(inp, out) -> str:
             # Derived outputs (member files, TIP aggregate) strip all-zero country cols.
             combined.to_csv(csv_path, index=False)
             # Sync TIP members aggregate
-            tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
+            tip_master_path = Path(
+                f"data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS"
+                f"_{cfg.DATA_YEAR_START}_{save_year_end}.csv"
+            )
             _update_tip_members_file(csv_path, tip_master_path)
             # Sync per-company member files
             _sync_company_member_files(combined)
@@ -1249,6 +1266,15 @@ def _save_submission_to_csv(inp, out) -> str:
             _CONSOLIDATED_DF     = combined.copy()
             _COMPANIES           = dl.get_companies(combined)
             _USING_FALLBACK_DATA = False
+            # Refresh cfg year bounds so new year shows in all dropdowns
+            try:
+                cfg.refresh_year_bounds(combined)
+                global HIST_YEARS, CURR_YEAR, LONG_YEARS
+                HIST_YEARS = cfg.hist_years()
+                CURR_YEAR  = cfg.curr_year()
+                LONG_YEARS = cfg.long_years()
+            except Exception:
+                pass
             try:
                 _SECTOR_DF = dl.load_sector_aggregated()
             except Exception:
@@ -1296,7 +1322,9 @@ def page_entry():
         <div style="font-size:12px;color:{MUTED}">ESG KPI Data Entry</div>
         """, unsafe_allow_html=True)
     with h2:
-        yr_options = sorted(list(set(all_yrs + [CURR_YEAR])), reverse=True)
+        # Year options: all existing + next upcoming (max+1 auto-advances)
+        next_yr    = (max(all_yrs) + 1) if all_yrs else CURR_YEAR
+        yr_options = sorted(list(set(all_yrs + [next_yr])), reverse=True)
         sel_yr = st.selectbox("", yr_options, key="entry_year_sel",
                               label_visibility="collapsed")
 
@@ -1444,6 +1472,23 @@ def page_entry():
                                           use_container_width=True)
 
     if submitted:
+        # Round integer-scale fields to avoid floating-point precision artifacts
+        total_sites   = int(round(total_sites))
+        iso_sites     = int(round(iso_sites))
+        production    = round(production, 0)
+        water_withdrawals = round(water_withdrawals, 0)
+        renew_elec    = round(renew_elec, 2)
+        nonrenew_elec = round(nonrenew_elec, 2)
+        self_gen      = round(self_gen, 2)
+        purchased_steam   = round(purchased_steam, 2)
+        sold_electricity  = round(sold_electricity, 2)
+        nat_gas    = round(nat_gas, 2)
+        coal_sub   = round(coal_sub, 2)
+        diesel     = round(diesel, 2)
+        biomass    = round(biomass, 2)
+        waste_total    = round(waste_total, 2)
+        waste_recovery = round(waste_recovery, 2)
+
         inp = TemplateInputs(
             company=company, year=sel_yr,
             total_sites=total_sites, iso_sites=iso_sites,
@@ -1540,9 +1585,25 @@ def page_my_records():
 
     # ── Save & sync on button click ───────────────────────────────────────────
     if save_clicked:
-        msg = _save_submission_to_csv(inp, out)   # updates globals in-place
+        msg = _save_submission_to_csv(inp, out)   # updates globals + disk
+        # Reload fresh_hist from the just-updated _CONSOLIDATED_DF so the template
+        # immediately reflects the saved values (not the pre-save state).
+        _reload_consolidated_df()
+        fresh_hist_new = dl.get_company_hist(_CONSOLIDATED_DF, company)
+        step_data_new  = dl.get_step_data(fresh_hist_new, sel_yr) if fresh_hist_new else {}
+        clean_new = {k: v for k, v in step_data_new.items()
+                     if k in {f.name for f in TemplateInputs.__dataclass_fields__.values()}}
+        if clean_new:
+            inp_new = TemplateInputs(company=company, year=sel_yr, **clean_new)
+            out_new = calculate(inp_new)
+        else:
+            inp_new, out_new = inp, out
+        st.session_state.step_data      = {fld: getattr(inp_new, fld) for fld in _VALID_TEMPLATE_FIELDS}
+        st.session_state["_codata_inp"] = inp_new
+        st.session_state["_codata_out"] = out_new
+        st.session_state["_df_version"] = st.session_state.get("_df_version", 0) + 1
         st.success(f"✅ {msg}")
-        st.rerun()   # force re-render so table shows updated values
+        st.rerun()   # re-render with fresh session state
 
     # ── All 5 template sheets as tabs ─────────────────────────────────────────
     tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
@@ -1792,7 +1853,7 @@ def _save_electricity_to_master(company: str, year: int) -> str:
     if elec_df.empty:
         return "No electricity data entered yet."
 
-    csv_path = Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
+    csv_path = Path(f"data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_{cfg.DATA_YEAR_START}_{cfg.DATA_YEAR_END}.csv")
     if not csv_path.exists():
         return "Master CSV not found. Save KPI data first."
 
@@ -1845,7 +1906,7 @@ def _save_electricity_to_master(company: str, year: int) -> str:
         return "Master CSV is open in Excel — close it and try again."
 
     # Sync all dependent files
-    tip_master_path = Path("data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_2009_2023.csv")
+    tip_master_path = Path(f"data_storage/members/TIP/ESG_MASTER_WIDE_TIP_MEMBERS_{cfg.DATA_YEAR_START}_{cfg.DATA_YEAR_END}.csv")
     _update_tip_members_file(csv_path, tip_master_path)
     _sync_company_member_files(master)
     _sync_consolidate_excel(master)
@@ -1889,16 +1950,22 @@ def render_electricity_tab():
     ELEC_COUNTRIES = ELEC_ALL_COUNTRIES  # module-level list of all 31
     COUNTRY_COL_GJ = ELEC_COUNTRY_COLS  # all 31 countries stored in master
     GJ_TO_MWH = 1.0 / 3.6
-    YEARS = list(range(2009, 2024))
+    # Dynamic year range: all years in DB + current reporting year
+    _elec_company = st.session_state.get("reporting_company") or st.session_state.get("user_company", "")
+    _db_yrs  = sorted(dl.get_years(_CONSOLIDATED_DF, _elec_company) or []) if _elec_company else []
+    _rep_yr  = st.session_state.get("reporting_year", CURR_YEAR)
+    YEARS    = sorted(set(_db_yrs + [_rep_yr]))
 
     company  = st.session_state.get("reporting_company") or st.session_state.get("user_company", "")
     rep_year = st.session_state.get("reporting_year", CURR_YEAR)
 
     # ── Key that tracks which company+year the editor was last initialised for ──
-    # When this changes we rebuild elec_data from the master so the editor
-    # always shows what is actually stored in the DB.
     load_key = f"{company}|{rep_year}"
-    needs_reload = st.session_state.get("_elec_load_key") != load_key
+    existing_elec = st.session_state.get("elec_data", pd.DataFrame())
+    # Also force reload if the rep_year column isn't in the existing DataFrame
+    # (happens when rep_year is a new year not yet in the cached df)
+    col_missing  = (not existing_elec.empty and str(rep_year) not in existing_elec.columns)
+    needs_reload = (st.session_state.get("_elec_load_key") != load_key) or col_missing
 
     if needs_reload:
         # Build base DataFrame of zeros
@@ -2181,6 +2248,14 @@ def page_analysis():
     yrs     = [str(y) for y in LONG_YEARS]
     yrs_int = LONG_YEARS
 
+    # Define year bounds for the whole page (including Peer Spotlight at bottom)
+    if not _CONSOLIDATED_DF.empty and "Year" in _CONSOLIDATED_DF.columns:
+        _all_data_yrs = sorted(_CONSOLIDATED_DF["Year"].dropna().unique().astype(int).tolist())
+    else:
+        _all_data_yrs = list(LONG_YEARS)
+    _first_yr = int(_all_data_yrs[0])  if _all_data_yrs else (CURR_YEAR - 14)
+    _last_yr  = int(_all_data_yrs[-1]) if _all_data_yrs else CURR_YEAR
+
     C = {
         "navy":"#0A2240","red":"#C8102E","green":"#00916E","blue":"#1D4ED8",
         "teal":"#0891B2","amber":"#D97706","purple":"#7C3AED","coral":"#EA580C",
@@ -2214,9 +2289,7 @@ def page_analysis():
         return go.Scatter(**kw)
 
     df = _CONSOLIDATED_DF
-    has_wide   = (not df.empty and "Row_Label" not in df.columns)
-    _first_yr  = int(yrs_int[0])  if yrs_int else 2009
-    _last_yr   = int(yrs_int[-1]) if yrs_int else CURR_YEAR
+    has_wide = (not df.empty and "Row_Label" not in df.columns)
 
     def _sector(col, divisor=1):
         if has_wide and col in df.columns:
@@ -2529,18 +2602,18 @@ def page_analysis():
             for co in companies:
                 s = _co_series(co, "Total energy - KPI")
                 if s is not None:
-                    v_first = float(s.iloc[0])  if not np.isnan(float(s.iloc[0]))  else None
-                    v_last  = float(s.iloc[-1]) if not np.isnan(float(s.iloc[-1])) else None
-                    if v_first and v_last:
-                        rows.append({"Company": co.split()[0], str(_first_yr): v_first, str(_last_yr): v_last})
+                    v09 = float(s.iloc[0])  if not np.isnan(float(s.iloc[0]))  else None
+                    v23 = float(s.iloc[-1]) if not np.isnan(float(s.iloc[-1])) else None
+                    if v09 and v23:
+                        rows.append({"Company": co.split()[0], "2009": v09, "2023": v23})
             if rows:
                 f = go.Figure()
                 names = [r["Company"] for r in rows]
-                f.add_trace(go.Bar(name=str(_first_yr), x=names, y=[r[str(_first_yr)] for r in rows],
+                f.add_trace(go.Bar(name="2009", x=names, y=[r["2009"] for r in rows],
                     marker_color="rgba(10,34,64,.4)", marker_line_width=0))
-                f.add_trace(go.Bar(name=str(_last_yr), x=names, y=[r[str(_last_yr)] for r in rows],
+                f.add_trace(go.Bar(name="2023", x=names, y=[r["2023"] for r in rows],
                     marker_color=C["navy"], marker_line_width=0))
-                f.update_layout(**_layout(f"Energy intensity (GJ/T) — {_first_yr} vs {_last_yr} by company",
+                f.update_layout(**_layout("Energy intensity (GJ/T) — 2009 vs 2023 by company",
                     260, barmode="group",
                     yaxis=dict(title="GJ/metric T", gridcolor=C["grid"])))
                 st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "26"))
@@ -2575,7 +2648,7 @@ def page_analysis():
                 labels=["Scope 1","Scope 2"], values=[s1l, s2l], hole=0.55,
                 marker_colors=[C["red"], C["blue"]], textfont_size=12,
                 hovertemplate="%{label}: %{value:.3f}M<extra></extra>"))
-            f.update_layout(**_layout(f"Scope 1 vs Scope 2 — {overlay_year or _last_yr}", 240, legend_h=False))
+            f.update_layout(**_layout("Scope 1 vs Scope 2 — 2023", 240, legend_h=False))
             st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "29"))
         with c6:
             if companies:
@@ -2593,7 +2666,7 @@ def page_analysis():
                         marker_color=[C["green"] if v < 0.70 else C["red"] for v in sv],
                         marker_line_width=0,
                         hovertemplate="%{x:.3f} T.CO₂/T<extra>%{y}</extra>"))
-                    f.update_layout(**_layout(f"CO₂ intensity by company — {overlay_year or _last_yr}", 240,
+                    f.update_layout(**_layout("CO₂ intensity by company — 2023", 240,
                         legend_h=False,
                         xaxis=dict(title="T.CO₂/metric T", gridcolor=C["grid"])))
                     st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "30"))
@@ -2607,7 +2680,7 @@ def page_analysis():
                         v09 = float(s.iloc[0]);  v23 = float(s.iloc[-1])
                         if not (np.isnan(v09) or np.isnan(v23)):
                             yoy_rows.append({"Company": co.split()[0],
-                                str(_first_yr): f"{v_first:.3f}", str(_last_yr): f"{v_last:.3f}",
+                                "2009": f"{v09:.3f}", "2023": f"{v23:.3f}",
                                 "Change": f"{(v23-v09)/v09*100:+.1f}%"})
                 if yoy_rows:
                     st.markdown("**CO₂ intensity 2009 → 2023**")
@@ -2665,12 +2738,12 @@ def page_analysis():
                         marker_color=[C["green"] if v<7.0 else C["amber"] for v in vals],
                         marker_line_width=0,
                         hovertemplate="%{x:.2f} m³/T<extra>%{y}</extra>"))
-                    f.update_layout(**_layout(f"Water intensity ranking — {overlay_year or _last_yr} (m³/T)",
+                    f.update_layout(**_layout("Water intensity ranking — 2023 (m³/T)",
                         260, legend_h=False))
                     st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "34"))
             with c4:
                 if "Water intake" in df.columns and "Production" in df.columns:
-                    yr_df = df[df["Year"]==(overlay_year or _last_yr)].dropna(subset=["Water intake","Production"])
+                    yr_df = df[df["Year"]==2023].dropna(subset=["Water intake","Production"])
                     if not yr_df.empty:
                         f = go.Figure()
                         for idx, (_, row) in enumerate(yr_df.iterrows()):
@@ -2681,7 +2754,7 @@ def page_analysis():
                                 text=[str(row["Company"]).split()[0]],
                                 textposition="top center",
                                 marker=dict(size=12, color=PALETTE_10[idx % 10])))
-                        f.update_layout(**_layout(f"Water vs production — {overlay_year or _last_yr}", 260,
+                        f.update_layout(**_layout("Water vs production — 2023", 260,
                             legend_h=False,
                             xaxis=dict(title="Production (M T)", gridcolor=C["grid"]),
                             yaxis=dict(title="Water (M m³)", gridcolor=C["grid"])))
@@ -2734,7 +2807,7 @@ def page_analysis():
                         hovertemplate="%{y:.1f}%<extra>%{x}</extra>"))
                     f.add_hline(y=80, line_dash="dot", line_color=C["navy"],
                         annotation_text="80% target", annotation_font_size=10)
-                    f.update_layout(**_layout(f"Waste recovery by company — {overlay_year or _last_yr} (%)", 260,
+                    f.update_layout(**_layout("Waste recovery by company — 2023 (%)", 260,
                         yaxis=dict(range=[0,100],ticksuffix="%",gridcolor=C["grid"])))
                     st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "38"))
             with c4:
@@ -2775,39 +2848,136 @@ def page_analysis():
                     yaxis=dict(gridcolor=C["grid"])))
                 st.plotly_chart(f, use_container_width=True, key=_chart_key(overlay_company or "sector", overlay_year or 0, "40"))
 
+    # ── Peer Performance Spotlight — DSS+ only ────────────────────────────────
+    if is_dss_user and not _CONSOLIDATED_DF.empty:
+        st.divider()
+        _yr_a = _first_yr
+        _yr_b = overlay_year or _last_yr
+        st.markdown(f"**Peer Performance Spotlight — {_yr_a} → {_yr_b}**")
+        st.caption("Change in CO₂ intensity and renewable electricity share across all TIP members")
+
+        spot_cols = ["Company","Total CO2 - KPI","Renewable_Electricity_Share_%"]
+        spot_avail = all(c in _CONSOLIDATED_DF.columns for c in spot_cols[1:])
+        if spot_avail:
+            ya_df = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"]==_yr_a][spot_cols].set_index("Company")
+            yb_df = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"]==_yr_b][spot_cols].set_index("Company")
+            common = ya_df.index.intersection(yb_df.index)
+            if len(common) >= 2:
+                spot_rows = []
+                for co in common:
+                    co2_a = ya_df.loc[co,"Total CO2 - KPI"]
+                    co2_b = yb_df.loc[co,"Total CO2 - KPI"]
+                    ren_a = ya_df.loc[co,"Renewable_Electricity_Share_%"]
+                    ren_b = yb_df.loc[co,"Renewable_Electricity_Share_%"]
+                    if pd.notna(co2_a) and pd.notna(co2_b) and co2_a > 0:
+                        co2_chg = (co2_b - co2_a) / co2_a * 100
+                        ren_chg = float(ren_b - ren_a) if pd.notna(ren_a) and pd.notna(ren_b) else 0
+                        spot_rows.append({
+                            "Company": co,
+                            f"CO₂ KPI {_yr_b}": f"{co2_b:.3f}",
+                            "CO₂ Change": co2_chg,
+                            f"Renew% {_yr_b}": f"{ren_b:.1f}%",
+                            "Renew Change": ren_chg,
+                        })
+
+                if spot_rows:
+                    s_df = pd.DataFrame(spot_rows).sort_values("CO₂ Change")
+                    sc1, sc2 = st.columns(2, gap="medium")
+                    with sc1:
+                        # CO₂ improvement bar chart
+                        fig_spot = go.Figure(go.Bar(
+                            x=s_df["CO₂ Change"].tolist(),
+                            y=s_df["Company"].tolist(),
+                            orientation="h",
+                            marker_color=[GREEN if v < 0 else RED for v in s_df["CO₂ Change"]],
+                            marker_line_width=0,
+                            text=[f"{v:+.1f}%" for v in s_df["CO₂ Change"]],
+                            textposition="outside",
+                            textfont=dict(size=9),
+                            hovertemplate="<b>%{y}</b><br>CO₂ change: %{x:+.1f}%<extra></extra>",
+                        ))
+                        fig_spot.add_vline(x=0, line_color="#CBD5E1", line_width=1)
+                        fig_spot.update_layout(
+                            **chart_layout_defaults(
+                                f"CO₂ Intensity Change {_yr_a}→{_yr_b} (%)", height=320, showlegend=False),
+                            xaxis=dict(ticksuffix="%", gridcolor="#F1F5F9", zeroline=False),
+                            yaxis=dict(gridcolor="#F1F5F9"),
+                        )
+                        apply_chart_animation(fig_spot)
+                        st.plotly_chart(fig_spot, use_container_width=True,
+                                        key=_chart_key(overlay_company or "sector", _yr_b, "spot_co2"))
+
+                    with sc2:
+                        s_df2 = pd.DataFrame(spot_rows).sort_values("Renew Change", ascending=False)
+                        fig_ren = go.Figure(go.Bar(
+                            x=s_df2["Renew Change"].tolist(),
+                            y=s_df2["Company"].tolist(),
+                            orientation="h",
+                            marker_color=[GREEN if v > 0 else RED for v in s_df2["Renew Change"]],
+                            marker_line_width=0,
+                            text=[f"{v:+.1f} pp" for v in s_df2["Renew Change"]],
+                            textposition="outside",
+                            textfont=dict(size=9),
+                            hovertemplate="<b>%{y}</b><br>Renew change: %{x:+.1f} pp<extra></extra>",
+                        ))
+                        fig_ren.add_vline(x=0, line_color="#CBD5E1", line_width=1)
+                        fig_ren.update_layout(
+                            **chart_layout_defaults(
+                                f"Renewable Electricity Change {_yr_a}→{_yr_b} (pp)", height=320, showlegend=False),
+                            xaxis=dict(ticksuffix=" pp", gridcolor="#F1F5F9", zeroline=False),
+                            yaxis=dict(gridcolor="#F1F5F9"),
+                        )
+                        apply_chart_animation(fig_ren)
+                        st.plotly_chart(fig_ren, use_container_width=True,
+                                        key=_chart_key(overlay_company or "sector", _yr_b, "spot_ren"))
+
 
 # ─────────────────────────────────────────────────────────
 # PAGE 3 -- BENCHMARKING
 # ─────────────────────────────────────────────────────────
 def _compute_industry_scores(df, year):
-    """Compute sector median scores (0–100, 100=best) for the 5 TIP KPIs."""
+    """
+    Compute sector median scores (0–100, 100=best) for the 5 TIP KPIs.
+    Uses actual data min/max for normalization — no hardcoded ranges.
+    """
     KPI_MAP = [
-        ("Total CO2 - KPI",              True,  0.55, 0.82),
-        ("Total energy - KPI",           True,  8.0,  10.5),
-        ("Water intake - KPI",           True,  5.5,  9.0),
-        ("Renewable_Electricity_Share_%", False, 0.0,  100.0),
-        ("Waste_Recovery_Rate_%",         False, 70.0, 100.0),
+        ("Total CO2 - KPI",               True),
+        ("Total energy - KPI",            True),
+        ("Water intake - KPI",            True),
+        ("Renewable_Electricity_Share_%", False),
+        ("Waste_Recovery_Rate_%",         False),
     ]
     if df.empty or "Row_Label" in df.columns:
         return [50.0] * 5
-    yr_df = df[df["Year"] == year]
-    if yr_df.empty:
-        # Try nearest year
-        nearest = df["Year"].dropna().unique()
-        if len(nearest):
-            yr_df = df[df["Year"] == nearest[abs(nearest - year).argmin()]]
-        if yr_df.empty:
-            return [50.0] * 5
+
+    # Use ALL data (not just one year) for computing the normalization range
+    # so the score is consistent across years and reflects true sector position
     scores = []
-    for col, lower_better, best, worst in KPI_MAP:
-        if col in yr_df.columns and yr_df[col].notna().any():
-            med  = float(yr_df[col].median())
-            span = abs(worst - best) or 1
-            s    = ((worst - med) / span * 100 if lower_better
-                    else (med - best) / span * 100)
-            scores.append(round(max(0, min(100, s)), 1))
-        else:
+    for col, lower_better in KPI_MAP:
+        if col not in df.columns:
             scores.append(50.0)
+            continue
+        all_vals  = df[col].dropna()
+        yr_df     = df[df["Year"] == year]
+        if yr_df.empty:
+            nearest = df["Year"].dropna().unique()
+            if len(nearest):
+                yr_df = df[df["Year"] == nearest[abs(nearest - year).argmin()]]
+        if yr_df.empty or col not in yr_df.columns:
+            scores.append(50.0)
+            continue
+
+        med  = float(yr_df[col].median())
+        best = float(all_vals.quantile(0.1 if lower_better else 0.9))
+        worst= float(all_vals.quantile(0.9 if lower_better else 0.1))
+        span = abs(worst - best) or 1
+
+        if lower_better:
+            s = max(0.0, min(100.0, (worst - med) / span * 100))
+        else:
+            s = max(0.0, min(100.0, (med - worst) / span * 100))
+        scores.append(round(s, 1))
+
     return scores
 
 
@@ -2915,6 +3085,7 @@ def page_benchmarking():
         else:
             q25, med, q75, lo, hi = val*.85, val, val*1.15, val*.7, val*1.3
         b = BenchmarkResult(col, val, q25, med, q75, unit, lb)
+        b.q50 = med   # explicit alias for the dot-and-whisker chart
         b._lo, b._hi, b._vals = lo, hi, vals
         return b
 
@@ -3375,21 +3546,9 @@ def page_benchmarking():
         except Exception as ex:
             return None
 
-    _pdf_col, _ = st.columns([2, 4])
-    with _pdf_col:
-        _pdf_all = _full_bench_pdf()
-        if _pdf_all:
-            st.download_button(
-                "⬇  Download Full Benchmarking Report (PDF)",
-                data=_pdf_all,
-                file_name=f"{company.replace(' ','_')}_Benchmarking_{rep_year}.pdf",
-                mime="application/pdf", key="dl_full_bench",
-                use_container_width=True, type="primary",
-            )
-
     # ── KPI Tabs ──────────────────────────────────────────────────────────────
-    tab_gen, tab_co2, tab_energy, tab_elec, tab_water, tab_waste = st.tabs([
-        "General", "CO₂", "Energy", "Electricity", "Water", "Waste"
+    tab_gen, tab_co2, tab_energy, tab_elec, tab_water, tab_waste, tab_advanced = st.tabs([
+        "General", "CO₂", "Energy", "Electricity", "Water", "Waste", "Advanced"
     ])
 
     with tab_gen:
@@ -3466,19 +3625,6 @@ def page_benchmarking():
             raw = (b.company_value - b._lo) / rng
             return max(0, min(100, (1-raw)*100 if b.lower_is_better else raw*100))
 
-        _pdf_download_btn("General Benchmarking", "dl_bench_gen", [
-            ("radar", ["CO₂ Intensity","Energy Intensity","Water Intensity",
-                       "Renewable Elec.","Waste Recovery"],
-             co_scores, sec_scores, company.split()[0]),
-            ("position_bar",
-             ["CO₂ Intensity","Energy Intensity","Water Intensity","Renewable Elec.","Waste Recovery"],
-             [_pos_score(BM[j]) for j in range(5)],
-             [CAT_CO2, CAT_ENERGY, CAT_WATER, CAT_RENEW, CAT_WASTE]),
-            ("improvement_table",
-             [{"KPI": k, f"{min(all_years)}→{rep_year}": v}
-              for k, v in _compute_kpi_improvement(company, min(all_years), rep_year).items()]),
-        ])
-
     with tab_co2:
         st.caption("CO₂ emissions intensity vs sector peers — Q1/Median/Q3 reference lines shown")
         c1, c2 = st.columns(2, gap="medium")
@@ -3504,11 +3650,6 @@ def page_benchmarking():
                                   hovermode="x unified")
             apply_chart_animation(fig_sc)
             st.plotly_chart(fig_sc, use_container_width=True, key=_chart_key(company, rep_year, "4"))
-        _pdf_download_btn("CO2", "dl_bench_co2", [
-            ("line_vs_sector", "Total CO2 - KPI", "co2_kpi",
-             "CO₂ Intensity Trend vs Sector (T.CO₂/T)", CAT_CO2),
-            ("stacked_area_scope", "Scope 1 vs Scope 2 (T.CO₂)"),
-        ])
 
     with tab_energy:
         st.caption("Energy intensity and consumption mix — Q1/Median/Q3 shown")
@@ -3538,11 +3679,6 @@ def page_benchmarking():
                                     xaxis=dict(gridcolor="#F1F5F9"))
             apply_chart_animation(fig_fuel)
             st.plotly_chart(fig_fuel, use_container_width=True, key=_chart_key(company, rep_year, "6"))
-        _pdf_download_btn("Energy", "dl_bench_energy", [
-            ("line_vs_sector", "Total energy - KPI", "energy_kpi",
-             "Energy Intensity Trend vs Sector (GJ/T)", CAT_ENERGY),
-            ("energy_mix_bar", "Energy Mix by Source (GJ)"),
-        ])
 
     with tab_elec:
         st.caption("Electricity sourcing — renewable vs non-renewable with sector quartiles")
@@ -3570,11 +3706,6 @@ def page_benchmarking():
             st.plotly_chart(fig_elec, use_container_width=True, key=_chart_key(company, rep_year, "7"))
         with c2:
             st.plotly_chart(fig_renew_trend, use_container_width=True, key=_chart_key(company, rep_year, "8"))
-        _pdf_download_btn("Electricity", "dl_bench_elec", [
-            ("elec_mix_bar", "Electricity Mix (%)"),
-            ("line_vs_sector", "Renewable_Electricity_Share_%", "renew_pct",
-             "Renewable Electricity Share vs Sector (%)", CAT_RENEW),
-        ])
 
     with tab_water:
         st.caption("Water withdrawals and intensity vs sector — Q1/Median/Q3 shown")
@@ -3606,11 +3737,6 @@ def page_benchmarking():
             )
             apply_chart_animation(fig_wat)
             st.plotly_chart(fig_wat, use_container_width=True, key=_chart_key(company, rep_year, "10"))
-        _pdf_download_btn("Water", "dl_bench_water", [
-            ("line_vs_sector", "Water intake - KPI", "water_kpi",
-             "Water Intensity Trend vs Sector (m³/T)", CAT_WATER),
-            ("water_bar", "Water Withdrawals (M m³)"),
-        ])
 
     with tab_waste:
         st.caption("Waste recovery rate and volumes vs sector — Q1/Median/Q3 shown")
@@ -3635,13 +3761,128 @@ def page_benchmarking():
                                    xaxis=dict(gridcolor="#F1F5F9"))
             apply_chart_animation(fig_wst)
             st.plotly_chart(fig_wst, use_container_width=True, key=_chart_key(company, rep_year, "12"))
-        _pdf_download_btn("Waste", "dl_bench_waste", [
-            ("waste_area", "Waste Recovery Rate vs Sector (%)"),
-            ("waste_bar",  "Total Waste vs Recovered (T)"),
-        ])
+
+    with tab_advanced:
+        st.caption("Paris-aligned trajectory · Peer heatmap · Decoupling analysis")
+
+        c1, c2 = st.columns(2, gap="medium")
+        with c1:
+            # Paris-aligned CO₂ intensity pathway
+            base_yr  = min(ys) if ys else 2009
+            base_val = trend.get(base_yr, {}).get("co2_kpi", out.co2_kpi)
+            paris_path = [base_val * (0.958 ** (y - base_yr)) for y in ys]
+            actuals    = [trend.get(y, {}).get("co2_kpi") for y in ys]
+
+            fig_path = go.Figure()
+            fig_path.add_trace(go.Scatter(
+                x=ys, y=actuals, name="Actual intensity",
+                mode="lines+markers", line=dict(color=CAT_CO2, width=2.5),
+                marker=dict(size=6, color=CAT_CO2),
+                hovertemplate="<b>%{x}</b><br>Actual: %{y:.3f}<extra></extra>",
+            ))
+            fig_path.add_trace(go.Scatter(
+                x=ys, y=paris_path, name=f"Paris 4.2%/yr (from {base_yr})",
+                mode="lines", line=dict(color=GREEN, width=1.5, dash="dot"),
+                hovertemplate="<b>%{x}</b><br>Target: %{y:.3f}<extra></extra>",
+            ))
+            fig_path.update_layout(
+                **chart_layout_defaults(
+                    f"CO₂ Intensity vs Paris-Aligned Target (T.CO₂/T)", height=280),
+                yaxis=dict(gridcolor="#F1F5F9"),
+                xaxis=dict(gridcolor="#F1F5F9"),
+                hovermode="x unified",
+            )
+            apply_chart_animation(fig_path)
+            st.plotly_chart(fig_path, use_container_width=True,
+                            key=_chart_key(company, rep_year, "paris_bench"))
+
+        with c2:
+            # Renewable vs CO₂ decoupling chart (scatter: renew% x-axis, co2_kpi y-axis, year as color)
+            renew_pts = [trend.get(y, {}).get("renew_pct") for y in ys]
+            co2_pts   = [trend.get(y, {}).get("co2_kpi") for y in ys]
+            valid_pts  = [(y, r, c) for y, r, c in zip(ys, renew_pts, co2_pts)
+                          if r is not None and c is not None and r > 0 and c > 0]
+
+            if valid_pts:
+                yrs_v, rens_v, co2s_v = zip(*valid_pts)
+                fig_dcpl = go.Figure()
+                n = len(yrs_v)
+                # Color gradient: dark green (old) → bright green (recent)
+                colors_d = [f"rgba(22,163,74,{0.25 + 0.75*i/(max(n-1,1))})" for i in range(n)]
+
+                fig_dcpl.add_trace(go.Scatter(
+                    x=list(rens_v), y=list(co2s_v), mode="lines+markers",
+                    line=dict(color="#E2E8F0", width=1, dash="dot"),
+                    marker=dict(size=10, color=colors_d, line=dict(color="white", width=1.5),
+                                symbol="circle"),
+                    hovertemplate="<b>%{customdata}</b><br>Renewable: %{x:.1f}%<br>CO₂: %{y:.3f}<extra></extra>",
+                    customdata=list(yrs_v),
+                    showlegend=False,
+                ))
+                # Label only first, last, and every 3rd year to avoid overlap
+                label_idx = list({0, n-1} | {i for i in range(n) if i % 4 == 0})
+                for idx in sorted(label_idx):
+                    fig_dcpl.add_annotation(
+                        x=rens_v[idx], y=co2s_v[idx],
+                        text=str(yrs_v[idx]),
+                        font=dict(size=9, color=colors_d[idx]),
+                        showarrow=False, yshift=12,
+                    )
+                fig_dcpl.update_layout(
+                    **chart_layout_defaults(
+                        "Decoupling: Renewable % vs CO₂ Intensity (dark=recent)", height=300,
+                        showlegend=False),
+                    xaxis=dict(title=dict(text="Renewable Electricity (%)"), gridcolor="#F1F5F9"),
+                    yaxis=dict(title=dict(text="CO₂ Intensity (T.CO₂/T)"), gridcolor="#F1F5F9"),
+                )
+                apply_chart_animation(fig_dcpl)
+                st.plotly_chart(fig_dcpl, use_container_width=True,
+                                key=_chart_key(company, rep_year, "decpl_bench"))
+
+        # KPI Scorecard — works for any year including 2024 with only 1 company
+        st.markdown(f"**KPI Scorecard — {rep_year} vs Sector Quartiles**")
+        sc_rows = []
+        for b in BM:
+            good = ((b.company_value <= b.q50 and b.lower_is_better) or
+                    (b.company_value >= b.q50 and not b.lower_is_better))
+            trend = "↓ Improving" if good else "↑ Needs work"
+            sc_rows.append({
+                "KPI": b.kpi_name,
+                "Your Value": f"{b.company_value:.3f} {b.unit}",
+                "Sector Q1": f"{b.q25:.3f}",
+                "Sector Median": f"{b.q50:.3f}",
+                "Sector Q3": f"{b.q75:.3f}",
+                "vs Median": trend,
+            })
+        sc_df = pd.DataFrame(sc_rows)
+        def _color_sc(val):
+            if "Improving" in str(val): return f"color:{GREEN};font-weight:600"
+            if "Needs work" in str(val): return f"color:{RED};font-weight:600"
+            return ""
+        st.dataframe(sc_df.style.map(_color_sc, subset=["vs Median"]),
+                     hide_index=True, use_container_width=True)
+
+    # ── Full Benchmarking Report download — always at bottom ─────────────────
+    st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+    st.divider()
+    with st.spinner("Preparing benchmarking report…"):
+        _pdf_all = _full_bench_pdf()
+    if _pdf_all:
+        st.download_button(
+            "⬇  Download Full Benchmarking Report (PDF)",
+            data=_pdf_all,
+            file_name=f"{company.replace(' ','_')}_Benchmarking_{rep_year}.pdf",
+            mime="application/pdf",
+            key="dl_full_bench",
+            use_container_width=True,
+            type="primary",
+        )
+    else:
+        st.warning("⚠ PDF requires `reportlab` and `matplotlib`. "
+                   "Run: `pip install reportlab matplotlib` then reload.",
+                   icon=None)
 
 
-# ─────────────────────────────────────────────────────────
 def _dss_company_selector(page_key: str):
     """
     Lets a dss+ analyst pick any company + year from the consolidated DB.
@@ -4106,6 +4347,11 @@ def page_home():
                                   key="home_yr", label_visibility="collapsed")
         else:
             sel_yr = CURR_YEAR
+
+    # Data version — increments on every save, guarantees ALL chart nodes are
+    # replaced (not patched) so every bar/point gets identical fresh animation.
+    _dv = st.session_state.get("_df_version", 0)
+
     with h_right:
         if st.button("📋 Submit Data", use_container_width=True, key="home_submit_btn"):
             st.session_state.page = "entry"
@@ -4252,23 +4498,49 @@ def page_home():
     t1, t2, t3, t4 = st.tabs(["📈 CO₂ Trend", "⚡ Energy Mix", "💧 Water", "♻️ Waste & Fuel"])
 
     # Build multi-year computed KPIs for charts
+    # Reads step_data from comp_hist; if production is 0/missing, falls back
+    # to _CONSOLIDATED_DF directly so 2023/2024 intensity lines complete correctly.
     yr_kpis = {}
     for y in years:
         sd = dl.get_step_data(comp_hist, y)
         sc = {k: v for k, v in sd.items() if k in valid}
+
+        # Fallback: if production missing, read directly from _CONSOLIDATED_DF
+        if (not sc.get("production") or float(sc.get("production", 0)) < 100) and not _CONSOLIDATED_DF.empty:
+            row_df = _CONSOLIDATED_DF[(_CONSOLIDATED_DF["Company"] == company) &
+                                      (_CONSOLIDATED_DF["Year"] == y)]
+            if not row_df.empty:
+                _prod_col = next((c for c in ["Production","production","Production Volume"]
+                                  if c in row_df.columns), None)
+                if _prod_col:
+                    _v = row_df[_prod_col].iloc[0]
+                    if pd.notna(_v) and float(_v) > 100:
+                        sc["production"] = float(_v)
+
         o  = calc(TI(company=company, year=y, **sc))
         ii = TI(company=company, year=y, **sc)
         rt = max(ii.renew_elec_purchased + ii.nonrenew_elec_purchased + ii.self_gen_elec, 1)
+
+        # Sanity bounds — if intensity is implausible, set None so Plotly
+        # shows a gap rather than an off-scale spike that hides the line.
+        def _sane(val, lo, hi):
+            return val if (val is not None and lo <= val <= hi) else None
+
         yr_kpis[y] = {
-            "scope1": o.total_co2_scope1, "scope2": o.total_co2_scope2,
-            "total_co2": o.total_co2, "co2_kpi": o.co2_kpi,
-            "energy_kpi": o.energy_kpi, "water_kpi": o.water_kpi,
-            "waste_pct": o.waste_recovery_pct * 100,
-            "renew_pct": ii.renew_elec_purchased / rt * 100,
-            "nat_gas": ii.nat_gas, "coal": ii.coal_sub, "diesel": ii.diesel,
-            "biomass": ii.biomass, "renew_elec": ii.renew_elec_purchased,
+            "scope1":      o.total_co2_scope1,
+            "scope2":      o.total_co2_scope2,
+            "total_co2":   o.total_co2,
+            "co2_kpi":     _sane(o.co2_kpi,    0.1, 5.0),    # T.CO₂/T  — tire sector 0.3–1.5
+            "energy_kpi":  _sane(o.energy_kpi,  1.0, 50.0),   # GJ/T      — tire sector 5–15
+            "water_kpi":   _sane(o.water_kpi,   0.5, 50.0),   # m³/T      — tire sector 5–15
+            "waste_pct":   _sane(o.waste_recovery_pct * 100, 0, 100),
+            "renew_pct":   ii.renew_elec_purchased / rt * 100,
+            "nat_gas":     ii.nat_gas,  "coal":       ii.coal_sub,
+            "diesel":      ii.diesel,   "biomass":    ii.biomass,
+            "renew_elec":  ii.renew_elec_purchased,
             "nonrenew_elec": ii.nonrenew_elec_purchased,
-            "water_m3": ii.water_withdrawals, "production": ii.production,
+            "water_m3":    ii.water_withdrawals,
+            "production":  ii.production,
         }
 
     ys = years
@@ -4292,15 +4564,17 @@ def page_home():
         fig.add_trace(go.Scatter(
             x=ys, y=[yr_kpis[y]["co2_kpi"] for y in ys],
             name="CO₂ Intensity (T/T)", yaxis="y2",
-            mode="lines+markers",
+            mode="lines+markers", connectgaps=False,
             line=dict(color="#C8102E", width=2.5, dash="dot"),
             marker=dict(size=6, color="#C8102E"),
             hovertemplate="<b>%{x}</b><br>Intensity: %{y:.3f} T/T<extra></extra>",
         ))
         # Annotate best/worst year
         if len(ys) >= 2:
-            best_y = min(ys, key=lambda y: yr_kpis[y]["co2_kpi"])
-            fig.add_annotation(x=best_y, y=yr_kpis[best_y]["co2_kpi"], yref="y2",
+            _kpi_valid_ys = [y for y in ys if yr_kpis[y]["co2_kpi"] is not None]
+            best_y = min(_kpi_valid_ys, key=lambda y: yr_kpis[y]["co2_kpi"]) if _kpi_valid_ys else None
+            if best_y is not None:
+              fig.add_annotation(x=best_y, y=yr_kpis[best_y]["co2_kpi"], yref="y2",
                                text="Best", showarrow=True, arrowhead=2,
                                ax=0, ay=-30, font=dict(size=10, color=GREEN),
                                arrowcolor=GREEN)
@@ -4312,7 +4586,8 @@ def page_home():
             hovermode="x unified",
         )
         apply_chart_animation(fig)
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_xaxes(automargin=True)
+        st.plotly_chart(fig, use_container_width=True, key=_chart_key("home", sel_yr, _dv, "co2_home"))
 
     with t2:
         fuel_cfg = [
@@ -4338,7 +4613,8 @@ def page_home():
             bargap=0.3,
         )
         apply_chart_animation(fig2)
-        st.plotly_chart(fig2, use_container_width=True)
+        fig2.update_xaxes(automargin=True)
+        st.plotly_chart(fig2, use_container_width=True, key=_chart_key("home", sel_yr, _dv, "fuel_home"))
 
     with t3:
         w_m3  = [yr_kpis[y]["water_m3"]  for y in ys]
@@ -4352,7 +4628,7 @@ def page_home():
         ))
         fig3.add_trace(go.Scatter(
             x=ys, y=w_kpi, name="Intensity (m³/T)",
-            yaxis="y2", mode="lines+markers",
+            yaxis="y2", mode="lines+markers", connectgaps=False,
             line=dict(color="#0E7490", width=2.5),
             marker=dict(size=7, color="#0E7490", symbol="diamond"),
             hovertemplate="<b>%{x}</b><br>Intensity: %{y:.2f} m³/T<extra></extra>",
@@ -4365,7 +4641,8 @@ def page_home():
             hovermode="x unified",
         )
         apply_chart_animation(fig3)
-        st.plotly_chart(fig3, use_container_width=True)
+        fig3.update_xaxes(automargin=True)
+        st.plotly_chart(fig3, use_container_width=True, key=_chart_key("home", sel_yr, _dv, "water_home"))
 
     with t4:
         w_total    = [dl.get_step_data(comp_hist, y).get("waste_total",    0) for y in ys]
@@ -4399,7 +4676,8 @@ def page_home():
                 hovermode="x unified",
             )
             apply_chart_animation(fig4)
-            st.plotly_chart(fig4, use_container_width=True)
+            fig4.update_xaxes(automargin=True)
+            st.plotly_chart(fig4, use_container_width=True, key=_chart_key("home", sel_yr, _dv, "waste_home"))
 
         with c2:
             # Waste recovery % trend — more useful than a static gauge
@@ -4415,7 +4693,7 @@ def page_home():
                               annotation_font=dict(size=9, color=GREEN))
             # Recovery trend
             fig_rec.add_trace(go.Scatter(
-                x=ys, y=rec_pcts, mode="lines+markers",
+                x=ys, y=rec_pcts, mode="lines+markers", connectgaps=False,
                 fill="tozeroy",
                 fillcolor="rgba(124,58,237,0.10)",
                 line=dict(color=CAT_WASTE, width=2.5),
@@ -4432,7 +4710,7 @@ def page_home():
                 xaxis=dict(gridcolor="#F1F5F9"),
             )
             apply_chart_animation(fig_rec)
-            st.plotly_chart(fig_rec, use_container_width=True)
+            st.plotly_chart(fig_rec, use_container_width=True, key=_chart_key("home", sel_yr, _dv, "wastrec_home"))
 
     # ── Historical KPI summary table ──────────────────────────────────────────
     st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
@@ -4440,7 +4718,10 @@ def page_home():
 
     import pandas as pd
     tbl_rows = []
-    table_years = sorted([y for y in years if y <= sel_yr][-10:], reverse=True)
+    # Always include sel_yr even if it's a new/upcoming year not yet in DB
+    # Show selected year + up to 9 previous years (most recent 10 total)
+    all_candidate_yrs = sorted(list(set(list(years) + [sel_yr])), reverse=True)
+    table_years = all_candidate_yrs[:10]   # most recent 10 years including sel_yr
     for y in table_years:
         sd = dl.get_step_data(comp_hist, y)
         sc = {k: v for k, v in sd.items() if k in valid}
@@ -4493,20 +4774,25 @@ def page_my_dashboard():
     has_wide = not df.empty and "Row_Label" not in df.columns
 
     # ── Year range selector ───────────────────────────────────────────────────
+    # Use ALL years from the DB — automatically includes 2024+ when data is submitted
+    _dash_all_yrs = sorted(set(LONG_YEARS) | set(
+        _CONSOLIDATED_DF["Year"].dropna().unique().astype(int).tolist()
+        if not _CONSOLIDATED_DF.empty else []
+    ))
     col_yr1, col_yr2, col_toggle, _ = st.columns([1, 1, 2, 2])
     with col_yr1:
-        yr_start = st.selectbox("From", LONG_YEARS, index=0, key="dash_yr_start")
+        yr_start = st.selectbox("From", _dash_all_yrs, index=0, key="dash_yr_start")
     with col_yr2:
-        yr_end   = st.selectbox("To", LONG_YEARS[::-1], index=0, key="dash_yr_end")
+        yr_end   = st.selectbox("To", _dash_all_yrs[::-1], index=0, key="dash_yr_end")
     with col_toggle:
         show_company = st.toggle(f"Highlight {company.split()[0]}", value=True, key="dash_highlight")
 
-    yr_range = [y for y in LONG_YEARS if yr_start <= y <= yr_end]
+    yr_range = [y for y in _dash_all_yrs if yr_start <= y <= yr_end]
     if not yr_range:
-        yr_range = LONG_YEARS
+        yr_range = _dash_all_yrs
 
-    # Sector data for the range
-    sec_range = _SECTOR_DF[_SECTOR_DF["Year"].isin(yr_range)].sort_values("Year")
+    # Sector data for the range — includes any 2024 rows in _SECTOR_DF
+    sec_range = _SECTOR_DF[_SECTOR_DF["Year"].isin(yr_range)].sort_values("Year") if not _SECTOR_DF.empty else pd.DataFrame()
 
     # Company overlay data
     comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
@@ -4518,11 +4804,22 @@ def page_my_dashboard():
             sd = dl.get_step_data(comp_hist, y)
             sc = {k: v for k, v in sd.items() if k in valid}
             if sc:
-                o = calc(TI(company=company, year=y, **sc))
+                o  = calc(TI(company=company, year=y, **sc))
+                ii = TI(company=company, year=y, **sc)
+                rt = max(ii.renew_elec_purchased + ii.nonrenew_elec_purchased + ii.self_gen_elec, 1)
                 co_kpis[y] = {
-                    "co2_kpi": o.co2_kpi, "energy_kpi": o.energy_kpi,
-                    "water_kpi": o.water_kpi, "total_co2": o.total_co2,
+                    "co2_kpi":    o.co2_kpi,    "energy_kpi":  o.energy_kpi,
+                    "water_kpi":  o.water_kpi,  "total_co2":   o.total_co2,
+                    "scope1":     o.total_co2_scope1,
+                    "scope2":     o.total_co2_scope2,
+                    "waste_total":    ii.waste_total,
+                    "waste_rec":      ii.waste_recovery,
+                    "production":     ii.production,
+                    "renew_pct":      ii.renew_elec_purchased / rt * 100,
+                    "waste_pct":      o.waste_recovery_pct * 100,
                 }
+
+    _dash_yr = max(co_kpis.keys()) if co_kpis else (yr_range[-1] if yr_range else CURR_YEAR)
 
     # ── 4-metric summary row ──────────────────────────────────────────────────
     if not sec_range.empty:
@@ -4730,7 +5027,7 @@ def page_my_dashboard():
                            xaxis=dict(gridcolor="#F1F5F9"), hovermode="x unified")
         apply_chart_animation(fig6)
         st.plotly_chart(fig6, use_container_width=True,
-                        key=_chart_key(company, sel_yr if 'sel_yr' in dir() else 0, "renew_dash"))
+                        key=_chart_key(company, _dash_yr, "renew_dash"))
 
     with r3c2:
         # YoY CO₂ change bar chart for this company
@@ -4761,8 +5058,138 @@ def page_my_dashboard():
                     xaxis=dict(gridcolor="#F1F5F9"))
                 apply_chart_animation(fig7)
                 st.plotly_chart(fig7, use_container_width=True,
-                                key=_chart_key(company, "yoy_co2_dash"))
+                                key=_chart_key(company, _dash_yr, "yoy_co2_dash"))
 
+    # ── Row 4: Paris-aligned pathway + Scope 1 vs 2 breakdown ────────────────
+    st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+    r4c1, r4c2 = st.columns(2, gap="medium")
+
+    with r4c1:
+        # Paris-aligned CO₂ trajectory (4.2% annual reduction from 2015 base)
+        if co_kpis and len(sorted(co_kpis.keys())) >= 2:
+            co_yrs   = sorted(co_kpis.keys())
+            base_yr  = min(co_yrs)
+            base_val = co_kpis[base_yr].get("co2_kpi", 0)
+            actuals  = [co_kpis.get(y, {}).get("co2_kpi") for y in co_yrs]
+            # Paris 4.2%/yr reduction pathway
+            paris    = [base_val * (0.958 ** (y - base_yr)) for y in co_yrs]
+
+            fig_paris = go.Figure()
+            fig_paris.add_trace(go.Scatter(
+                x=co_yrs, y=actuals, mode="lines+markers",
+                name="Actual", line=dict(color=CAT_CO2, width=2.5),
+                marker=dict(size=6, color=CAT_CO2),
+                hovertemplate="<b>%{x}</b><br>Actual: %{y:.3f}<extra></extra>",
+            ))
+            fig_paris.add_trace(go.Scatter(
+                x=co_yrs, y=paris, mode="lines",
+                name="Paris 4.2%/yr target", line=dict(color=GREEN, width=1.5, dash="dot"),
+                hovertemplate="<b>%{x}</b><br>Target: %{y:.3f}<extra></extra>",
+            ))
+            fig_paris.update_layout(
+                **chart_layout_defaults(
+                    f"CO₂ Intensity vs Paris-Aligned Trajectory (T.CO₂/T)", height=260),
+                yaxis=dict(gridcolor="#F1F5F9"),
+                xaxis=dict(gridcolor="#F1F5F9"),
+                hovermode="x unified",
+            )
+            apply_chart_animation(fig_paris)
+            st.plotly_chart(fig_paris, use_container_width=True,
+                            key=_chart_key(company, "paris_dash"))
+
+    with r4c2:
+        # Scope 1 vs Scope 2 stacked area
+        if co_kpis:
+            fig_sc = go.Figure()
+            scope1_vals = [co_kpis.get(y, {}).get("scope1", 0) for y in sorted(co_kpis.keys())]
+            scope2_vals = [co_kpis.get(y, {}).get("scope2", 0) for y in sorted(co_kpis.keys())]
+            s_yrs       = sorted(co_kpis.keys())
+            fig_sc.add_trace(go.Scatter(
+                x=s_yrs, y=scope1_vals, name="Scope 1 (Fuels)",
+                stackgroup="sc", fill="tonexty", mode="none",
+                fillcolor="rgba(71,85,105,0.6)",
+                hovertemplate="<b>%{x}</b><br>Scope 1: %{y:,.0f} T.CO₂<extra></extra>",
+            ))
+            fig_sc.add_trace(go.Scatter(
+                x=s_yrs, y=scope2_vals, name="Scope 2 (Electricity)",
+                stackgroup="sc", fill="tonexty", mode="none",
+                fillcolor="rgba(71,85,105,0.2)",
+                hovertemplate="<b>%{x}</b><br>Scope 2: %{y:,.0f} T.CO₂<extra></extra>",
+            ))
+            fig_sc.update_layout(
+                **chart_layout_defaults("CO₂ Scope 1 vs Scope 2 (T.CO₂)", height=260),
+                yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                xaxis=dict(gridcolor="#F1F5F9"),
+                hovermode="x unified",
+            )
+            apply_chart_animation(fig_sc)
+            st.plotly_chart(fig_sc, use_container_width=True,
+                            key=_chart_key(company, "scope_dash"))
+
+    # ── Row 5: Waste recovery waterfall + Water-production efficiency scatter ──
+    r5c1, r5c2 = st.columns(2, gap="medium")
+
+    with r5c1:
+        # Waste recovery waterfall for selected year
+        if co_kpis and _dash_yr in co_kpis:
+            wt = co_kpis[_dash_yr].get("waste_total", 0)
+            wr = co_kpis[_dash_yr].get("waste_rec", 0)
+            we = max(wt - wr, 0)
+            if wt > 0:
+                fig_wf = go.Figure(go.Waterfall(
+                    x=["Total Waste", "Recovered", "Eliminated"],
+                    y=[wt, -wr, -we],
+                    measure=["absolute", "relative", "relative"],
+                    connector={"line": {"color": "#E2E8F0"}},
+                    decreasing={"marker": {"color": CAT_RENEW}},
+                    increasing={"marker": {"color": CAT_WASTE}},
+                    totals={"marker": {"color": CAT_WASTE}},
+                    texttemplate="%{y:,.0f}",
+                    textposition="outside",
+                    hovertemplate="<b>%{x}</b>: %{y:,.0f} T<extra></extra>",
+                ))
+                fig_wf.update_layout(
+                    **chart_layout_defaults(
+                        f"Waste Flow — {_dash_yr} (metric T)", height=280, showlegend=False),
+                    yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                )
+                apply_chart_animation(fig_wf)
+                st.plotly_chart(fig_wf, use_container_width=True,
+                                key=_chart_key(company, _dash_yr, "wfall_dash"))
+
+    with r5c2:
+        # Production growth vs water efficiency — dual-axis time series
+        # More readable than scatter: shows trend direction clearly
+        if co_kpis and len(co_kpis) >= 2:
+            py_yrs = sorted(co_kpis.keys())
+            prods  = [co_kpis[y].get("production", 0) / 1e6 for y in py_yrs]
+            w_kpis = [co_kpis[y].get("water_kpi", 0) for y in py_yrs]
+            fig_ef = go.Figure()
+            # Production bars (left axis)
+            fig_ef.add_trace(go.Bar(
+                x=py_yrs, y=prods, name="Production (M T)",
+                marker_color="rgba(22,163,74,0.25)", marker_line_width=0,
+                yaxis="y",
+                hovertemplate="<b>%{x}</b><br>Production: %{y:.2f} M T<extra></extra>",
+            ))
+            # Water KPI line (right axis)
+            fig_ef.add_trace(go.Scatter(
+                x=py_yrs, y=w_kpis, name="Water KPI (m³/T)",
+                mode="lines+markers", yaxis="y2",
+                line=dict(color=CAT_WATER, width=2.5),
+                marker=dict(size=6, color=CAT_WATER),
+                hovertemplate="<b>%{x}</b><br>Water KPI: %{y:.2f} m³/T<extra></extra>",
+            ))
+            fig_ef.update_layout(
+                **chart_layout_defaults("Production (bars) vs Water Intensity (line)", height=280),
+                yaxis=dict(title=dict(text="Production (M T)"), gridcolor="#F1F5F9"),
+                yaxis2=dict(title=dict(text="Water KPI (m³/T)"), overlaying="y",
+                            side="right", gridcolor="#F1F5F9"),
+                barmode="group", bargap=0.3, hovermode="x unified",
+            )
+            apply_chart_animation(fig_ef)
+            st.plotly_chart(fig_ef, use_container_width=True,
+                            key=_chart_key(company, _dash_yr, "eff_dash"))
 def page_company_data():
     """
     DSS+ Company Data — full KPI template table for a selected company.
@@ -4775,8 +5202,7 @@ def page_company_data():
 
     companies_in_db = dl.get_companies(_CONSOLIDATED_DF) or COMPANIES
 
-    # Pre-select company from portfolio if set
-    pre_co = st.session_state.pop("portfolio_company", None)
+    pre_co     = st.session_state.pop("portfolio_company", None)
     default_co = (pre_co
                   or st.session_state.get("reporting_company")
                   or companies_in_db[0])
@@ -4788,26 +5214,24 @@ def page_company_data():
         sel_co = st.selectbox(
             "Company", options=companies_in_db,
             index=companies_in_db.index(default_co),
-            key="codata_company"
+            key="codata_company",
         )
     with col_yr:
         avail_years = dl.get_years(_CONSOLIDATED_DF, sel_co) or [CURR_YEAR]
         sel_yr = st.selectbox(
             "Year", options=sorted(avail_years, reverse=True),
-            key="codata_year"
+            key="codata_year",
         )
 
     # Set session state so all render_*_tab() functions read the right data
     st.session_state.reporting_company  = sel_co
     st.session_state.reporting_year     = sel_yr
 
-    # Load and populate session state with this company's data
-    hist    = dl.get_company_hist(_CONSOLIDATED_DF, sel_co)
+    hist      = dl.get_company_hist(_CONSOLIDATED_DF, sel_co)
     step_data = dl.get_step_data(hist, sel_yr) if hist else {}
-    valid_fields = _VALID_TEMPLATE_FIELDS
 
     for field, val in step_data.items():
-        if field in valid_fields:
+        if field in _VALID_TEMPLATE_FIELDS:
             st.session_state[field] = val
 
     from formula_engine import TemplateInputs as TI, calculate as calc
@@ -4816,13 +5240,13 @@ def page_company_data():
     inp   = TI(company=sel_co, year=sel_yr, **clean)
     out   = calc(inp)
 
-    st.session_state["_codata_inp"] = inp
-    st.session_state["_codata_out"] = out
-    st.session_state["template_done"]       = True
-    st.session_state["company_setup_done"]  = True
-    st.session_state["step"]                = 6
+    st.session_state["_codata_inp"]      = inp
+    st.session_state["_codata_out"]      = out
+    st.session_state["template_done"]    = True
+    st.session_state["company_setup_done"] = True
+    st.session_state["step"]             = 6
 
-    # ── Render all template sheets as tabs ────────────────────────────────────
+    # Render all 5 template sheets as tabs
     tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
         "Main Data Input",
         "Electricity by Country",
@@ -4830,22 +5254,16 @@ def page_company_data():
         "Qualitative Data",
         "Conversion Tables",
     ])
-    with tab_main:
-        render_template_table()
-    with tab_elec:
-        render_electricity_tab()
-    with tab_waste:
-        render_waste_tab()
-    with tab_qual:
-        render_qualitative_tab()
-    with tab_conv:
-        render_conversion_tab()
+    with tab_main:  render_template_table()
+    with tab_elec:  render_electricity_tab()
+    with tab_waste: render_waste_tab()
+    with tab_qual:  render_qualitative_tab()
+    with tab_conv:  render_conversion_tab()
 
     st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
     if st.button("← Back to Portfolio", key="codata_back"):
         st.session_state.page = "portfolio"
         st.rerun()
-
 
 
 def page_reports():
@@ -5320,7 +5738,67 @@ def page_reports():
             use_container_width=True, hide_index=True,
         )
 
-    # ── Footer ────────────────────────────────────────────────────────────────
+    # ── Section 4: Standards Summary + Scope Breakdown ───────────────────────
+    st.markdown(f"""
+    <div style="border-left:3px solid {NAVY};padding:4px 0 4px 12px;margin-bottom:12px">
+      <div style="font-size:14px;font-weight:700;color:{TEXT}">
+        4. Sustainability Standards Alignment</div>
+      <div style="font-size:11px;color:{MUTED}">
+        Key GRI / SASB disclosures — all values from {sel_yr} submission</div>
+    </div>""", unsafe_allow_html=True)
+
+    gri_col, scope_col = st.columns([1.2, 1], gap="medium")
+
+    with gri_col:
+        # Compact 4-row GRI table — standard references are industry constants;
+        # values are 100% dynamic from inp/out objects
+        rt = max(inp.renew_elec_purchased + inp.nonrenew_elec_purchased + inp.self_gen_elec, 1)
+        gri_rows = [
+            {"GRI Standard":   "GRI 302-1 / SASB TR-AU-130a.1",
+             "Topic":          "Total energy consumed",
+             "Reported Value": f"{out.total_energy:,.0f} GJ",
+             "Intensity":      f"{out.energy_kpi:.2f} GJ/T"},
+            {"GRI Standard":   "GRI 303-3",
+             "Topic":          "Water withdrawal",
+             "Reported Value": f"{inp.water_withdrawals:,.0f} m³",
+             "Intensity":      f"{out.water_kpi:.2f} m³/T"},
+            {"GRI Standard":   "GRI 305-1+2",
+             "Topic":          "Scope 1 + 2 GHG emissions",
+             "Reported Value": f"{out.total_co2:,.0f} T.CO₂",
+             "Intensity":      f"{out.co2_kpi:.3f} T/T"},
+            {"GRI Standard":   "GRI 306-3+5",
+             "Topic":          "Waste generated / diverted",
+             "Reported Value": f"{inp.waste_total:,.0f} T total",
+             "Intensity":      f"{out.waste_recovery_pct*100:.1f}% recovered"},
+        ]
+        st.dataframe(pd.DataFrame(gri_rows), hide_index=True, use_container_width=True)
+        st.caption("GRI = Global Reporting Initiative · SASB = Sustainability Accounting Standards Board · Values computed from your submission")
+
+    with scope_col:
+        # Scope 1 vs 2 pie — concise, tells the decarbonisation story
+        s1 = out.total_co2_scope1
+        s2 = out.total_co2_scope2
+        if s1 + s2 > 0:
+            fig_pie = go.Figure(go.Pie(
+                labels=["Scope 1 — Fuel combustion", "Scope 2 — Purchased energy"],
+                values=[s1, s2],
+                hole=0.52,
+                marker=dict(colors=["#475569", "#94A3B8"],
+                            line=dict(color="white", width=2)),
+                textinfo="percent+label",
+                textfont=dict(size=11, family="Inter"),
+                hovertemplate="<b>%{label}</b><br>%{value:,.0f} T.CO₂<br>%{percent}<extra></extra>",
+                pull=[0.04, 0],
+            ))
+            fig_pie.add_annotation(
+                text=f"<b>{out.total_co2:,.0f}</b><br><span style='font-size:10px'>T.CO₂ Total</span>",
+                x=0.5, y=0.5, font_size=13, showarrow=False,
+            )
+            fig_pie.update_layout(
+                **chart_layout_defaults(f"GHG Emissions Breakdown — {sel_yr}", height=240, showlegend=False),
+            )
+            apply_chart_animation(fig_pie)
+            st.plotly_chart(fig_pie, use_container_width=True)
     st.markdown(f"""
     <div style="background:#F8FAFC;border-radius:8px;padding:12px 20px;margin-top:16px;
         display:flex;justify-content:space-between;align-items:center;

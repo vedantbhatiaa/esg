@@ -3040,6 +3040,14 @@ def page_benchmarking():
     No peer company names exposed in any chart.
     PDF download available per tab.
     """
+    # Pre-check: importable in this Python process before anything else runs
+    try:
+        import reportlab as _rl_check  # noqa: F401
+        import matplotlib as _mpl_check  # noqa: F401
+        _DEPS_OK = True
+    except ImportError as _dep_err:
+        _DEPS_OK = False
+        _DEPS_ERR = str(_dep_err)
     from pdf_report import generate_executive_pdf, build_kpi_dict_from_outputs, REPORTLAB_OK
     import io
 
@@ -3404,6 +3412,35 @@ def page_benchmarking():
         """Generate one PDF with all 6 benchmark sections: General → Waste."""
         import sys as _sys, os as _os
         _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        # Clear any previous error before attempting
+        try:
+            import streamlit as _st
+            _st.session_state.pop("_pdf_gen_error", None)
+        except Exception:
+            pass
+        # Pre-flight: verify both packages are importable in this Python process
+        try:
+            import reportlab   # noqa: F401
+        except ImportError as _e:
+            try:
+                import streamlit as _st
+                _st.session_state["_pdf_gen_error"] = (
+                    f"reportlab not found in this Python ({_sys.executable}). "
+                    f"Run: pip install reportlab matplotlib")
+            except Exception:
+                pass
+            return None
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError as _e:
+            try:
+                import streamlit as _st
+                _st.session_state["_pdf_gen_error"] = (
+                    f"matplotlib not found in this Python ({_sys.executable}). "
+                    f"Run: pip install reportlab matplotlib")
+            except Exception:
+                pass
+            return None
         try:
             import pdf_charts_v2 as pc
             from reportlab.lib.pagesizes import A4
@@ -3544,6 +3581,12 @@ def page_benchmarking():
             cv.save(); buf.seek(0)
             return buf.read()
         except Exception as ex:
+            # Store the real error so the warning block above can show it
+            try:
+                import streamlit as _st
+                _st.session_state["_pdf_gen_error"] = f"{type(ex).__name__}: {ex}"
+            except Exception:
+                pass
             return None
 
     # ── KPI Tabs ──────────────────────────────────────────────────────────────
@@ -3878,9 +3921,19 @@ def page_benchmarking():
             type="primary",
         )
     else:
-        st.warning("⚠ PDF requires `reportlab` and `matplotlib`. "
-                   "Run: `pip install reportlab matplotlib` then reload.",
-                   icon=None)
+        # Show the real exception so the user knows exactly what to fix
+        _pdf_err = st.session_state.get("_pdf_gen_error", "")
+        if _pdf_err:
+            st.error(f"⚠ PDF generation failed: {_pdf_err}", icon=None)
+            st.caption("Check your Python environment — run `pip install reportlab matplotlib` "
+                       "with the **same Python that runs Streamlit**. "
+                       "E.g. if using a venv: `source venv/bin/activate && pip install -r requirements.txt`")
+        else:
+            st.warning("⚠ PDF requires `reportlab` and `matplotlib`. "
+                       "Install with the **same Python that runs Streamlit**: "
+                       "`pip install reportlab matplotlib`  —  "
+                       "or run `pip install -r requirements.txt` to install all dependencies.",
+                       icon=None)
 
 
 def _dss_company_selector(page_key: str):

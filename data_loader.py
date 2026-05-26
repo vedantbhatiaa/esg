@@ -18,12 +18,25 @@ _XLSX_CANDIDATES = [
     (Path("CONSOLIDATED_DUMMY_2009_2023.xlsx"),                                "Raw Dummy data"),
 ]
 
-_CSV_CANDIDATES = [
-    Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"),
-    Path("data_storage/raw/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv"),
-    Path("data_storage/master/ESG_LONG_ALL_COMPANIES_2009_2023.csv"),
-    Path("data_storage/consolidated/consolidated_benchmarking.csv"),
-]
+def _get_csv_candidates() -> list:
+    """
+    Dynamic scan for master CSVs sorted by (mtime DESC, end-year DESC).
+    Always finds the newest file regardless of year in filename.
+    """
+    candidates = []
+    for d in [Path("data_storage/master"), Path("data_storage/raw")]:
+        if d.exists():
+            def _key(p):
+                try:    ey = int(p.stem.rsplit("_", 1)[-1])
+                except: ey = 0
+                return (p.stat().st_mtime, ey)
+            candidates.extend(sorted(d.glob("ESG_MASTER_WIDE_ALL_COMPANIES_*.csv"),
+                                     key=_key, reverse=True))
+    for s in [Path("data_storage/master/ESG_LONG_ALL_COMPANIES_2009_2023.csv"),
+              Path("data_storage/consolidated/consolidated_benchmarking.csv")]:
+        if s not in candidates:
+            candidates.append(s)
+    return candidates
 
 # ── Field mappings ─────────────────────────────────────────────────────────────
 LABEL_TO_FIELD = {
@@ -138,7 +151,7 @@ def load_consolidated() -> pd.DataFrame:
       3. XLSX files (stale after app saves — fallback only)
     """
     # ── 1. CSV first (always up-to-date after app saves) ─────────────────────
-    for path in _CSV_CANDIDATES:
+    for path in _get_csv_candidates():
         if path.exists():
             try:
                 df = _clean_df(pd.read_csv(path))
@@ -267,13 +280,74 @@ def company_trend(df: pd.DataFrame, company: str, row_label: str) -> "pd.Series"
     return df[mask].set_index("Year")["Data"].sort_index()
 
 
-def load_sector_aggregated() -> "pd.DataFrame":
-    """Load pre-aggregated sector CSV from master/."""
-    candidates = [
-        Path("data_storage/master/ESG_SECTOR_AGGREGATED_2009_2023.csv"),
-        Path("data_storage/raw/ESG_SECTOR_AGGREGATED_2009_2023.csv"),
-    ]
-    for path in candidates:
+def compute_sector_from_master(master_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute sector-level aggregations directly from the wide master DataFrame.
+    Called when the sector CSV is missing or stale (doesn't cover all master years).
+    Returns one row per year with the same column names as the pre-built sector CSV.
+    """
+    if master_df.empty or "Year" not in master_df.columns:
+        return pd.DataFrame()
+
+    COL_MAP = {
+        "n_companies":            ("Company",                  "nunique"),
+        "Total_Production":       ("Production",               "sum"),
+        "Total_Energy":           ("Total energy",             "sum"),
+        "Total_CO2":              ("Total CO2",                "sum"),
+        "Total_Water":            ("Water intake",             "sum"),
+        "Avg_Energy_KPI":         ("Total energy - KPI",       "mean"),
+        "Avg_CO2_KPI":            ("Total CO2 - KPI",          "mean"),
+        "Avg_Water_KPI":          ("Water intake - KPI",       "mean"),
+        "Avg_Renewable_Share":    ("Renewable_Electricity_Share_%", "mean"),
+        "Avg_ISO_Cert":           ("ISO_Certification_%",      "mean"),
+        "Total_Waste":            ("Total Waste",              "sum"),
+        "Total_Waste_Recovered":  ("Waste Recovered",          "sum"),
+        "Avg_Waste_Recovery_Rate":("Waste_Recovery_Rate_%",    "mean"),
+    }
+
+    rows = []
+    for yr, grp in master_df.groupby("Year"):
+        row = {"Year": int(yr)}
+        for new_col, (src_col, agg) in COL_MAP.items():
+            if src_col in grp.columns:
+                if   agg == "sum":    row[new_col] = float(grp[src_col].sum())
+                elif agg == "mean":   row[new_col] = float(grp[src_col].mean())
+                elif agg == "nunique":row[new_col] = int(grp[src_col].nunique())
+            else:
+                row[new_col] = 0.0
+        rows.append(row)
+
+    out = pd.DataFrame(rows).sort_values("Year").reset_index(drop=True)
+    print(f"[data_loader] Computed sector aggregation from master: {len(out)} years, {out['Year'].min()}–{out['Year'].max()}")
+    return out
+
+
+def load_sector_aggregated(master_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Load sector-level aggregations.
+
+    FIX: Always computes dynamically from master_df when provided so that
+    newly submitted years (e.g. 2024) are immediately visible in all
+    sector-average lines and KPI tiles without waiting for a CSV rebuild.
+
+    Falls back to the pre-built CSV only when master_df is not available.
+    """
+    # Prefer live computation from master — guarantees latest year coverage
+    if master_df is not None and not master_df.empty:
+        return compute_sector_from_master(master_df)
+
+    # Fallback: scan for newest sector CSV (dynamic, not hardcoded to 2023)
+    sector_candidates = []
+    for d in [Path("data_storage/master"), Path("data_storage/raw")]:
+        if d.exists():
+            def _sk(p):
+                try:    ey = int(p.stem.rsplit("_", 1)[-1])
+                except: ey = 0
+                return (p.stat().st_mtime, ey)
+            sector_candidates.extend(sorted(d.glob("ESG_SECTOR_AGGREGATED_*.csv"),
+                                            key=_sk, reverse=True))
+
+    for path in sector_candidates:
         if path.exists():
             try:
                 df = pd.read_csv(path)

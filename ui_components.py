@@ -367,14 +367,20 @@ button, input, select, textarea {
 
 /* ── Bar chart rise-from-x-axis animation ──────────────────────────────── */
 @keyframes barRise {
-    from { clip-path: inset(100% 0 0% 0); }
-    to   { clip-path: inset(0% 0 0% 0);   }
+    0%   { clip-path: inset(100% 0 0% 0); opacity: 0; }
+    8%   { opacity: 1; }
+    100% { clip-path: inset(0% 0 0% 0);   opacity: 1; }
 }
 
-.js-plotly-plot .barlayer .point path {
-    animation: barRise 1.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+/* Apply to BOTH selector paths so stacked + grouped + single bars all match */
+.js-plotly-plot .barlayer .point path,
+.js-plotly-plot .barlayer .trace .point path {
+    animation: barRise 1.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+    will-change: clip-path;
 }
-/* Stagger delays — 100ms per bar so you clearly see each one rise */
+/* Stagger: each column (year) rises 100ms after the previous.
+   Using BOTH .point and .trace .point selectors guarantees that
+   bar #16 (year 2024) gets the same delay as bar #1 (year 2009) — no exceptions. */
 .js-plotly-plot .barlayer .point:nth-child(1)  path { animation-delay: 0ms; }
 .js-plotly-plot .barlayer .point:nth-child(2)  path { animation-delay: 100ms; }
 .js-plotly-plot .barlayer .point:nth-child(3)  path { animation-delay: 200ms; }
@@ -390,6 +396,43 @@ button, input, select, textarea {
 .js-plotly-plot .barlayer .point:nth-child(13) path { animation-delay: 1200ms; }
 .js-plotly-plot .barlayer .point:nth-child(14) path { animation-delay: 1300ms; }
 .js-plotly-plot .barlayer .point:nth-child(15) path { animation-delay: 1400ms; }
+.js-plotly-plot .barlayer .point:nth-child(16) path { animation-delay: 1500ms; }
+.js-plotly-plot .barlayer .point:nth-child(17) path { animation-delay: 1600ms; }
+.js-plotly-plot .barlayer .point:nth-child(18) path { animation-delay: 1700ms; }
+.js-plotly-plot .barlayer .point:nth-child(19) path { animation-delay: 1800ms; }
+.js-plotly-plot .barlayer .point:nth-child(20) path { animation-delay: 1900ms; }
+.js-plotly-plot .barlayer .point:nth-child(21) path { animation-delay: 2000ms; }
+.js-plotly-plot .barlayer .point:nth-child(22) path { animation-delay: 2100ms; }
+.js-plotly-plot .barlayer .point:nth-child(23) path { animation-delay: 2200ms; }
+.js-plotly-plot .barlayer .point:nth-child(24) path { animation-delay: 2300ms; }
+.js-plotly-plot .barlayer .point:nth-child(25) path { animation-delay: 2400ms; }
+
+/* Stacked/trace variant — ensures 2024 (nth-child 16 in a 2009-2024 chart) syncs */
+.js-plotly-plot .barlayer .trace .point:nth-child(1)  path { animation-delay: 0ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(2)  path { animation-delay: 100ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(3)  path { animation-delay: 200ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(4)  path { animation-delay: 300ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(5)  path { animation-delay: 400ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(6)  path { animation-delay: 500ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(7)  path { animation-delay: 600ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(8)  path { animation-delay: 700ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(9)  path { animation-delay: 800ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(10) path { animation-delay: 900ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(11) path { animation-delay: 1000ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(12) path { animation-delay: 1100ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(13) path { animation-delay: 1200ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(14) path { animation-delay: 1300ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(15) path { animation-delay: 1400ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(16) path { animation-delay: 1500ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(17) path { animation-delay: 1600ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(18) path { animation-delay: 1700ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(19) path { animation-delay: 1800ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(20) path { animation-delay: 1900ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(21) path { animation-delay: 2000ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(22) path { animation-delay: 2100ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(23) path { animation-delay: 2200ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(24) path { animation-delay: 2300ms; }
+.js-plotly-plot .barlayer .trace .point:nth-child(25) path { animation-delay: 2400ms; }
 
 /* ── Pie / donut trace animation ───────────────────────────────────────── */
 @keyframes pieSliceIn {
@@ -519,9 +562,49 @@ COUNTER_JS = """
 
 
 def inject_global_css() -> None:
-    """Inject the full design system CSS + counter-up JS. Call once per page."""
+    """Inject the full design system CSS + counter-up JS + animation-force JS."""
     st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
     st.components.v1.html(COUNTER_JS, height=0)
+    # Force bar/line animations to restart whenever Streamlit swaps chart DOM nodes.
+    # Streamlit replaces chart divs on key change, but the browser may reuse GPU layers
+    # causing clip-path animations to skip.  This MutationObserver detects new plotly
+    # chart nodes and explicitly resets + replays the animation.
+    st.components.v1.html("""<script>
+(function() {
+  function forceAnim(root) {
+    var doc = root || (window.parent && window.parent.document) || document;
+    var els = doc.querySelectorAll(
+      '.js-plotly-plot .barlayer .point path, ' +
+      '.js-plotly-plot .scatterlayer .trace .lines path'
+    );
+    els.forEach(function(el) {
+      el.style.animation = 'none';
+      void el.offsetWidth;          // trigger reflow
+      el.style.animation = '';
+    });
+  }
+  // Run once after initial render
+  setTimeout(function() { forceAnim(); }, 400);
+
+  // Watch for any Streamlit chart replacement
+  var doc = (window.parent && window.parent.document) || document;
+  var obs = new MutationObserver(function(mutations) {
+    mutations.forEach(function(m) {
+      m.addedNodes.forEach(function(node) {
+        if (node.nodeType === 1) {
+          var charts = node.querySelectorAll
+            ? node.querySelectorAll('.js-plotly-plot')
+            : [];
+          if (charts.length > 0 || (node.classList && node.classList.contains('js-plotly-plot'))) {
+            setTimeout(function() { forceAnim(); }, 50);
+          }
+        }
+      });
+    });
+  });
+  obs.observe(doc.body || doc, { childList: true, subtree: true });
+})();
+</script>""", height=0)
 
 
 def page_fade() -> None:
@@ -730,27 +813,39 @@ def chart_layout_defaults(
     height: int = 320,
     showlegend: bool = True,
 ) -> dict:
-    """Standard layout kwargs. Does NOT include xaxis/yaxis (handled by apply_chart_animation)."""
+    """Standard layout kwargs including properly visible axes for TIP report alignment."""
     return dict(
         title=dict(
-            text=title,
-            font=dict(size=14, color="#0F172A", family="Inter, sans-serif"),
+            text=f"<b>{title}</b>" if title else "",
+            font=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"),
             x=0, xanchor="left",
         ),
         height=height,
-        margin=dict(l=0, r=0, t=40 if title else 10, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter, sans-serif", color="#64748B", size=11),
+        margin=dict(l=55, r=115, t=50, b=60),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        font=dict(family="Arial, sans-serif", color="#1C2E3F", size=12),
         showlegend=showlegend,
         legend=dict(
-            orientation="h", y=-0.18, x=0,
-            font=dict(size=11, color="#64748B"),
+            orientation="h", y=-0.22, x=0.5, xanchor="center",
+            font=dict(size=11, color="#1C2E3F"),
             bgcolor="rgba(0,0,0,0)",
         ),
         hoverlabel=dict(
             bgcolor="#FFFFFF", bordercolor="#E2E8F0",
-            font=dict(family="Inter", size=12),
+            font=dict(family="Arial", size=12),
+        ),
+        xaxis=dict(
+            showgrid=False, linecolor="#999", linewidth=1.2,
+            showline=True, mirror=False,
+            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            showticklabels=True, type="category",
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor="rgba(0,0,0,0.07)", zeroline=False,
+            showline=True, linecolor="#999", linewidth=1.2,
+            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            showticklabels=True,
         ),
     )
 

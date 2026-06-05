@@ -813,27 +813,39 @@ def chart_layout_defaults(
     height: int = 320,
     showlegend: bool = True,
 ) -> dict:
-    """Standard layout kwargs. Does NOT include xaxis/yaxis (handled by apply_chart_animation)."""
+    """Standard layout kwargs including properly visible axes for TIP report alignment."""
     return dict(
         title=dict(
-            text=title,
-            font=dict(size=14, color="#0F172A", family="Inter, sans-serif"),
+            text=f"<b>{title}</b>" if title else "",
+            font=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"),
             x=0, xanchor="left",
         ),
         height=height,
-        margin=dict(l=0, r=0, t=40 if title else 10, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter, sans-serif", color="#64748B", size=11),
+        margin=dict(l=55, r=115, t=50, b=60),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        font=dict(family="Arial, sans-serif", color="#1C2E3F", size=12),
         showlegend=showlegend,
         legend=dict(
-            orientation="h", y=-0.18, x=0,
-            font=dict(size=11, color="#64748B"),
+            orientation="h", y=-0.22, x=0.5, xanchor="center",
+            font=dict(size=11, color="#1C2E3F"),
             bgcolor="rgba(0,0,0,0)",
         ),
         hoverlabel=dict(
             bgcolor="#FFFFFF", bordercolor="#E2E8F0",
-            font=dict(family="Inter", size=12),
+            font=dict(family="Arial", size=12),
+        ),
+        xaxis=dict(
+            showgrid=False, linecolor="#999", linewidth=1.2,
+            showline=True, mirror=False,
+            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            showticklabels=True, type="category",
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor="rgba(0,0,0,0.07)", zeroline=False,
+            showline=True, linecolor="#999", linewidth=1.2,
+            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            showticklabels=True,
         ),
     )
 

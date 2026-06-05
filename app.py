@@ -892,7 +892,7 @@ STEP_FIELDS = [
      ("diesel",                  "Diesel",                                       "GJ LHV",                                              None),
      ("petrol",                  "Petrol",                                       "GJ LHV",                                              None),
      ("biomass",                 "Biomass",                                      "GJ LHV (biogenic CO2 excluded)",                      None),
-     ("waste_tires_mt",          "Waste tires",                                  "metric T (converted to GJ internally)",               None),
+     ("waste_tires_mt",          "Waste tires",                                  "metric t (converted to GJ internally)",               None),
      ("lpg",                     "LPG",                                          "GJ LHV",                                              None),
      ("other_fuels",             "Other fuels",                                  "GJ LHV",                                              None)],
     # Step 4: CO2
@@ -2445,86 +2445,88 @@ def page_analysis():
         return dict(
             title=dict(text=f"<b>{title}</b>",
                        font=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"), x=0),
-            height=h, margin=dict(l=8, r=r, t=42, b=10),
+            height=h, margin=dict(l=55, r=r, t=50, b=60),
             plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-            xaxis=dict(showgrid=False, linecolor="#CCCCCC",
-                       tickfont=dict(size=11, color="#555"),
-                       type="category"),   # prevents float-year interpolation
-            yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
-                       zeroline=False, tickfont=dict(size=10, color="#666")),
+            xaxis=dict(
+                showgrid=False, linecolor="#999", linewidth=1.2,
+                showline=True, mirror=False,
+                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                tickangle=0,
+                type="category",
+            ),
+            yaxis=dict(
+                showgrid=True, gridcolor="rgba(0,0,0,0.07)", zeroline=False,
+                showline=True, linecolor="#999", linewidth=1.2,
+                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                showticklabels=True,
+            ),
             legend=dict(orientation="h", x=0.5, xanchor="center", y=leg_y,
-                        font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+                        font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified", showlegend=show_legend,
         )
 
     def _y2(label=""):
-        return dict(tickfont=dict(size=10, color="#888"), showgrid=False,
-                    zeroline=False, title=dict(text=label, font=dict(size=9, color="#888")))
+        """Right Y-axis — fully visible, properly sized."""
+        return dict(
+            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            showgrid=False, zeroline=False,
+            showline=True, linecolor="#999", linewidth=1.2,
+            showticklabels=True,
+            title=dict(text=label, font=dict(size=11, color="#444")),
+        )
 
     def _omk(col, sz=9):
         """Open-circle marker."""
         return dict(symbol="circle", size=sz, color="white",
                     line=dict(color=col, width=2))
 
+
     def _dual(xs, bv, bl, bc, lv, ll, lc, title="", h=330,
               bfmt=".1f", lfmt=".2f", byt="", lyt=""):
         """Dual-axis bar (left) + line (right).
-        Bar values shown INSIDE bar (near top) — large, bold, no overlap with line.
-        Line values shown above/below the marker, offset to avoid bar-top collision.
+        TIP report style:
+        - Bar value centred vertically in the MIDDLE of the bar (clearly readable)
+        - Line value alternates top/bottom near marker (never inside bar)
+        - Right Y-axis fully visible; wide right margin prevents label clipping
         """
         fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-        # ── Bar trace ─────────────────────────────────────────────────────────
-        # Place text inside each bar anchored to the TOP of the bar interior.
-        # This keeps the number within the bar column, never overlapping the line.
+        # ── Bar trace — value centred in bar middle ────────────────────────────
         max_bv = max((v for v in bv if v is not None and v == v), default=1) or 1
-        bar_texts = []
-        for v in bv:
-            if v is None or v != v:
-                bar_texts.append("")
-            else:
-                # For very small bars (<8% of max) show nothing inside (too cramped)
-                bar_texts.append(f"<b>{v:{bfmt}}</b>" if v / max_bv > 0.08 else "")
-
+        bar_texts = [
+            f"<b>{v:{bfmt}}</b>" if (v is not None and v == v and abs(v) / max_bv > 0.12)
+            else ""
+            for v in bv
+        ]
         fig.add_trace(go.Bar(
             x=xs, y=bv, name=bl, marker_color=bc, marker_line_width=0, width=0.5,
             text=bar_texts,
             textposition="inside",
-            insidetextanchor="end",          # anchored near the top of each bar
-            textfont=dict(size=13, color="#1C2E3F", family="Arial, sans-serif"),
-            # Hover still shows all values
+            insidetextanchor="middle",          # ← centred in the bar
+            textfont=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"),
             hovertemplate=f"{bl}: %{{y:{bfmt}}}<extra></extra>",
+            cliponaxis=False,
         ), secondary_y=False)
 
-        # ── Line trace ────────────────────────────────────────────────────────
-        # Line values: alternate top/bottom per point so adjacent labels don't collide
+        # ── Line trace — values alternate above/below marker ─────────────────
         n = len(lv)
         line_texts = [f"{v:{lfmt}}" if v is not None and v == v else "" for v in lv]
-        # Alternate position: even index → top center, odd → bottom center
-        # Also: for the first and last points, prefer "top center"
-        text_positions = []
-        for i in range(n):
-            if i == 0 or i == n - 1:
-                text_positions.append("top center")
-            elif i % 2 == 0:
-                text_positions.append("top center")
-            else:
-                text_positions.append("bottom center")
-
+        text_pos   = ["top center" if i % 2 == 0 else "bottom center" for i in range(n)]
         fig.add_trace(go.Scatter(
             x=xs, y=lv, name=ll, mode="lines+markers+text",
             line=dict(color=lc, width=2.5), marker=_omk(lc, 10),
             text=line_texts,
-            textposition=text_positions,
-            textfont=dict(size=11, color="#1C2E3F", family="Arial, sans-serif"),
+            textposition=text_pos,
+            textfont=dict(size=12, color="#1C2E3F", family="Arial, sans-serif"),
             hovertemplate=f"{ll}: %{{y:{lfmt}}}<extra></extra>",
+            cliponaxis=False,
         ), secondary_y=True)
 
-        lay = _tlayout(title, h)
+        lay = _tlayout(title, h, r=100)
         lay["yaxis"]["title"]  = dict(text=byt, font=dict(size=10, color="#666"))
         lay["yaxis2"] = _y2(lyt)
-        # Extra top margin so outside-bar labels aren't clipped
-        lay["margin"]["t"] = 48
+        lay["margin"]["t"] = 50
+        lay["margin"]["r"] = 115
         fig.update_layout(**lay)
         return fig
 
@@ -3068,13 +3070,28 @@ def page_analysis():
                 byt="Mt", lyt="kg/t", bfmt=".2f", lfmt=".1f",
             ), use_container_width=True, key=_ck("wst01"))
         with c2:
-            # Waste recovery vs disposal stacked 100%
+            # Waste recovery vs disposal stacked 100% — percentages inside bars
+            # Absolute tonnage table shown below (matches TIP report Fig 11 layout)
             st.plotly_chart(_stack100(
                 yrs,
+                # Order: recovery (beige, bottom) then disposal (dark, top) —
+                # matches TIP report where recovery is the dominant lower section
                 [(waste_recov_pct, "Sent for recovery (%)",  TC["bar_beige"]),
                  (waste_elim_pct,  "Sent for disposal (%)",  TC["bar_blue2"])],
                 "Waste sent for recovery vs disposal (%)",
             ), use_container_width=True, key=_ck("wst02"))
+
+            # ── Absolute tonnage table below chart (TIP report Fig 11 style) ──
+            # Build rows: label | yr1 | yr2 | ...
+            _hdr = "| Metric |" + "".join(f" {y} |" for y in yrs)
+            _sep = "| --- |" + " --- |" * len(yrs)
+            _rec_vals = "| Sent for recovery (t) |" + "".join(
+                f" {int(v):,} |" if v else " — |" for v in waste_recov_a)
+            _dis_vals = "| Sent for disposal (t) |" + "".join(
+                f" {int(max(t-r,0)):,} |" if (t and r) else " — |"
+                for t, r in zip(waste_total_v, waste_recov_a))
+            _table_md = "\n".join([_hdr, _sep, _rec_vals, _dis_vals])
+            st.markdown(_table_md, unsafe_allow_html=False)
 
         c3, c4 = st.columns(2)
         with c3:
@@ -3736,8 +3753,23 @@ def page_benchmarking():
         ))
         fig.update_layout(**chart_layout_defaults(label, height=270),
                           hovermode="x unified",
-                          yaxis=dict(gridcolor="#F1F5F9"),
-                          xaxis=dict(gridcolor="#F1F5F9", type="category"))
+                          yaxis=dict(
+                              gridcolor="#F1F5F9",
+                              tickfont=dict(size=12, color="#1C2E3F"),
+                              showline=True, linecolor="#999",
+                              showticklabels=True,
+                          ),
+                          yaxis2=dict(
+                              tickfont=dict(size=12, color="#1C2E3F"),
+                              showgrid=False, showline=True, linecolor="#999",
+                              showticklabels=True,
+                          ),
+                          xaxis=dict(
+                              gridcolor="#F1F5F9", type="category",
+                              tickfont=dict(size=12, color="#1C2E3F"),
+                              showline=True, linecolor="#999",
+                              showticklabels=True,
+                          ))
         apply_chart_animation(fig)
         return fig
 
@@ -4074,14 +4106,24 @@ def page_benchmarking():
 
     def _blt(title="", h=330):
         return dict(
-            title=dict(text=title, font=dict(size=11, color="#2C3E50"), x=0),
-            height=h, margin=dict(l=8, r=65, t=36, b=10),
+            title=dict(text=f"<b>{title}</b>",
+                       font=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"), x=0),
+            height=h, margin=dict(l=55, r=110, t=50, b=60),
             plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-            xaxis=dict(showgrid=False, linecolor="#CCCCCC", tickfont=dict(size=10, color="#666")),
-            yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)", zeroline=False,
-                       tickfont=dict(size=10, color="#666")),
+            xaxis=dict(
+                showgrid=False, linecolor="#999", linewidth=1.2,
+                showline=True, mirror=False,
+                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                tickangle=0, type="category",
+            ),
+            yaxis=dict(
+                showgrid=True, gridcolor="rgba(0,0,0,0.07)", zeroline=False,
+                showline=True, linecolor="#999", linewidth=1.2,
+                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                showticklabels=True,
+            ),
             legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.24,
-                        font=dict(size=10.5), bgcolor="rgba(0,0,0,0)"),
+                        font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified", showlegend=True,
         )
 
@@ -4103,8 +4145,13 @@ def page_benchmarking():
         ), secondary_y=True)
         lay = _blt(title, h)
         lay["yaxis"]["title"] = dict(text=byt, font=dict(size=9, color="#666"))
-        lay["yaxis2"] = dict(tickfont=dict(size=10, color="#888"), showgrid=False,
-                             zeroline=False, title=dict(text=lyt, font=dict(size=9, color="#888")))
+        lay["yaxis2"] = dict(
+            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            showgrid=False, zeroline=False,
+            showline=True, linecolor="#999", linewidth=1.2,
+            showticklabels=True,
+            title=dict(text=lyt, font=dict(size=11, color="#444")),
+        )
         fig.update_layout(**lay)
         return fig
 
@@ -4139,8 +4186,13 @@ def page_benchmarking():
             lay = _blt(title, h)
             lay["yaxis"]["title"] = dict(text=yt, font=dict(size=9, color="#666"))
             lay["yaxis"]["ticksuffix"] = "%"
-            lay["yaxis2"] = dict(tickfont=dict(size=10, color="#888"), showgrid=False,
-                                 zeroline=False, title=dict(text=s2yt, font=dict(size=9, color="#888")))
+            lay["yaxis2"] = dict(
+            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            showgrid=False, zeroline=False,
+            showline=True, linecolor="#999", linewidth=1.2,
+            showticklabels=True,
+            title=dict(text=s2yt, font=dict(size=11, color="#444")),
+        )
         else:
             fig.add_trace(go.Scatter(**kw1))
             fig.add_trace(go.Scatter(**kw2))

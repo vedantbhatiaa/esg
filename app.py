@@ -5018,7 +5018,7 @@ def page_home():
                                arrowcolor=GREEN)
         fig.update_layout(
             **chart_layout_defaults("Total CO₂ Emissions (Scope 1 + 2) with Intensity", height=320),
-            yaxis=dict(title=dict(text="tCO₂", font=dict(color=CAT_CO2)), tickformat=","),
+            yaxis=dict(title=dict(text="tCO₂", font=dict(color=CAT_CO2)), tickformat=",", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
             yaxis2=dict(title=dict(text="tCO₂/t", font=dict(color="#C8102E")),
                         overlaying="y", side="right", tickformat=".3f"),
             hovermode="x unified",
@@ -5071,7 +5071,7 @@ def page_home():
         ))
         fig3.update_layout(
             **chart_layout_defaults("Water Withdrawals & Intensity", height=320),
-            yaxis=dict(title=dict(text="m³", font=dict(color=CAT_WATER)), tickformat=","),
+            yaxis=dict(title=dict(text="m³", font=dict(color=CAT_WATER)), tickformat=",", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
             yaxis2=dict(title=dict(text="m³/t (intensity)", font=dict(color="#0E7490")),
                         overlaying="y", side="right", tickformat=".2f"),
             hovermode="x unified",
@@ -5105,7 +5105,7 @@ def page_home():
             fig4.update_layout(
                 barmode="overlay",
                 **chart_layout_defaults("Waste Recovery (T)", height=300),
-                yaxis=dict(title="Metric T", tickformat=","),
+                yaxis=dict(title="Metric t", tickformat=",", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
                 yaxis2=dict(title="Recovery %", overlaying="y", side="right",
                             range=[0, 110], ticksuffix="%"),
                 hovermode="x unified",
@@ -5139,7 +5139,7 @@ def page_home():
             fig_rec.update_layout(
                 **chart_layout_defaults("Waste Recovery Trend (%)", height=300,
                                         showlegend=False),
-                yaxis=dict(range=[0, 105], ticksuffix="%", gridcolor="#F1F5F9",
+                yaxis=dict(range=[0, 105], ticksuffix="%", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F"),
                            zeroline=False),
                 xaxis=dict(gridcolor="#F1F5F9"),
             )
@@ -5445,7 +5445,7 @@ def page_my_dashboard():
                 hovertemplate="<b>%{x}</b><br>Renewable: %{y:.1f}%<extra></extra>",
             ))
         fig6.update_layout(**chart_layout_defaults("Renewable Electricity Share (%)", height=270),
-                           yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9"),
+                           yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
                            xaxis=dict(gridcolor="#F1F5F9"), hovermode="x unified")
         apply_chart_animation(fig6)
         st.plotly_chart(fig6, use_container_width=True,
@@ -5476,7 +5476,7 @@ def page_my_dashboard():
                 fig7.update_layout(**chart_layout_defaults(
                     f"CO₂ Intensity YoY Change (%) — {company.split()[0]}", height=270,
                     showlegend=False),
-                    yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9", zeroline=False),
+                    yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9", zeroline=False, showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
                     xaxis=dict(gridcolor="#F1F5F9"))
                 apply_chart_animation(fig7)
                 st.plotly_chart(fig7, use_container_width=True,
@@ -5930,7 +5930,7 @@ def page_reports():
             ))
             fig_co2.update_layout(**chart_layout_defaults("Total CO₂ Emissions (tCO₂)", height=220,
                                                            showlegend=False),
-                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
                                    xaxis=dict(gridcolor="#F1F5F9"))
             apply_chart_animation(fig_co2)
             st.plotly_chart(fig_co2, use_container_width=True)
@@ -5954,7 +5954,7 @@ def page_reports():
                     ))
             fig_nrg.update_layout(**chart_layout_defaults("Energy Mix by Source (GJ)", height=220),
                                    barmode="stack", bargap=0.2,
-                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9"),
+                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
                                    xaxis=dict(gridcolor="#F1F5F9"))
             apply_chart_animation(fig_nrg)
             st.plotly_chart(fig_nrg, use_container_width=True)

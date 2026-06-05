@@ -821,7 +821,7 @@ def chart_layout_defaults(
             x=0, xanchor="left",
         ),
         height=height,
-        margin=dict(l=55, r=115, t=50, b=60),
+        margin=dict(l=55, r=115, t=50, b=55),
         paper_bgcolor="#FFFFFF",
         plot_bgcolor="#FFFFFF",
         font=dict(family="Arial, sans-serif", color="#1C2E3F", size=12),
@@ -834,18 +834,6 @@ def chart_layout_defaults(
         hoverlabel=dict(
             bgcolor="#FFFFFF", bordercolor="#E2E8F0",
             font=dict(family="Arial", size=12),
-        ),
-        xaxis=dict(
-            showgrid=False, linecolor="#999", linewidth=1.2,
-            showline=True, mirror=False,
-            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
-            showticklabels=True, type="category",
-        ),
-        yaxis=dict(
-            showgrid=True, gridcolor="rgba(0,0,0,0.07)", zeroline=False,
-            showline=True, linecolor="#999", linewidth=1.2,
-            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
-            showticklabels=True,
         ),
     )
 

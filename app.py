@@ -410,15 +410,36 @@ def _build_long_data() -> tuple[dict, dict]:
                 return grp[col].mean()
             return None
 
-        energy_s  = _col_sum("Total energy", 1e6)
-        co2_s     = _col_sum("Total CO2", 1e6)
-        scope1_s  = _col_sum("Total CO2 - Scope 1", 1e6)
-        scope2_s  = _col_sum("Total CO2 - Scope 2", 1e6)
-        water_s   = _col_sum("Water intake", 1e6)
-        prod_s    = _col_sum("Production", 1e6)
+        def _col_sum_norm(col, divisor=1):
+            """Sector sum normalised by n_submitting / n_total_companies."""
+            if col not in df.columns:
+                return None
+            raw = grp[col].sum() / divisor
+            n_sub = grp["Company"].count()
+            n_all = df["Company"].nunique()
+            return raw / n_sub * n_all
+
+        energy_s  = _col_sum_norm("Total energy", 1e6)
+        co2_s     = _col_sum_norm("Total CO2", 1e6)
+        scope1_s  = _col_sum_norm("Total CO2 - Scope 1", 1e6)
+        scope2_s  = _col_sum_norm("Total CO2 - Scope 2", 1e6)
+        water_s   = _col_sum_norm("Water intake", 1e6)
+        # Use MEAN × n_submitting_companies so partial-year submissions
+        # don't cause a false cliff-drop in sector production.
+        prod_s_raw  = _col_sum("Production", 1e6)
+        n_companies = df["Company"].nunique()
+        if prod_s_raw is not None:
+            n_submitting = grp["Company"].count()
+            prod_s       = prod_s_raw / n_submitting * n_companies
+        else:
+            prod_s = prod_s_raw
         ekpi_m    = _col_mean("Total energy - KPI")
         co2kpi_m  = _col_mean("Total CO2 - KPI")
-        renew_m   = _col_mean("Renewable_Electricity_Share_%")
+        # For renewable %, only average companies that have submitted for that year
+        # (NaN values from non-submitting companies would drag the mean down)
+        renew_m   = df.groupby("Year")["Renewable_Electricity_Share_%"].apply(
+            lambda x: x.dropna().mean() if x.dropna().size > 0 else float("nan")
+        ) if "Renewable_Electricity_Share_%" in df.columns else None
 
         def _to_list(series, fallback):
             if series is None:
@@ -1249,6 +1270,25 @@ def _save_submission_to_csv(inp, out) -> str:
             # Sync CONSOLIDATED_DUMMY Excel
             _sync_consolidate_excel(combined)
 
+            # ── Auto-add electricity-by-country year columns for new submission ──
+            # If company just submitted for a year that isn't in the electricity
+            # editor yet, initialize all country columns to 0 in the master CSV.
+            _new_yr = inp.year
+            _elec_cols_all = [c for c in combined.columns
+                              if c.startswith("Elec_") and c.endswith("_GJ")]
+            _co_yr_mask = (combined["Company"] == inp.company) & (combined["Year"] == _new_yr)
+            if _co_yr_mask.any() and _elec_cols_all:
+                for _ec in _elec_cols_all:
+                    if pd.isna(combined.loc[_co_yr_mask, _ec]).all():
+                        combined.loc[_co_yr_mask, _ec] = 0.0
+                # Also ensure Total_Electricity_by_Country_GJ exists
+                if "Total_Electricity_by_Country_GJ" not in combined.columns:
+                    combined["Total_Electricity_by_Country_GJ"] = 0.0
+                elif pd.isna(combined.loc[_co_yr_mask, "Total_Electricity_by_Country_GJ"]).all():
+                    combined.loc[_co_yr_mask, "Total_Electricity_by_Country_GJ"] = 0.0
+                # Re-write master with the zero-initialized electricity columns
+                combined.to_csv(csv_path, index=False)
+
             # ── CRITICAL: update the in-memory globals so all pages in this
             #    session immediately see the new data without requiring a restart.
             global _CONSOLIDATED_DF, _COMPANIES, _SECTOR_DF, _USING_FALLBACK_DATA
@@ -1861,7 +1901,21 @@ def _save_electricity_to_master(company: str, year: int) -> str:
         yr   = int(yr_str)
         mask = (master["Company"] == company) & (master["Year"] == yr)
         if not mask.any():
-            continue
+            # KPI row not found for this year — create a minimal stub row so
+            # electricity data is not lost; user can submit KPIs later.
+            stub = pd.DataFrame([{
+                "Company": company, "Year": yr,
+                **{c: 0.0 for c in COUNTRY_COL.values()},
+                "Total_Electricity_by_Country_GJ": 0.0,
+            }])
+            # Align to master columns
+            for col in master.columns:
+                if col not in stub.columns:
+                    stub[col] = None
+            stub = stub[master.columns]
+            master = pd.concat([master, stub], ignore_index=True)
+            master = master.sort_values(["Company", "Year"]).reset_index(drop=True)
+            mask = (master["Company"] == company) & (master["Year"] == yr)
 
         year_series = elec_df.set_index("Country")[yr_str]
         for country, mwh_val in year_series.items():
@@ -1939,10 +1993,19 @@ def render_electricity_tab():
     ELEC_COUNTRIES = ELEC_ALL_COUNTRIES  # module-level list of all 31
     COUNTRY_COL_GJ = ELEC_COUNTRY_COLS  # all 31 countries stored in master
     GJ_TO_MWH = 1.0 / 3.6
-    YEARS = list(range(2009, 2024))
 
     company  = st.session_state.get("reporting_company") or st.session_state.get("user_company", "")
     rep_year = st.session_state.get("reporting_year", CURR_YEAR)
+
+    # Build YEARS dynamically: always include the latest submitted year + any
+    # year the company has data for. This ensures 2024/2025 columns appear
+    # automatically when the company submits for those years.
+    _co_yrs = []
+    if not _CONSOLIDATED_DF.empty and company:
+        _co_yrs = dl.get_years(_CONSOLIDATED_DF, company) or []
+    # Always go up to the reporting year (rep_year)
+    _max_yr = max([rep_year] + (_co_yrs or [2023]))
+    YEARS = list(range(2009, _max_yr + 1))
 
     # ── Key that tracks which company+year the editor was last initialised for ──
     # When this changes we rebuild elec_data from the master so the editor
@@ -1964,8 +2027,12 @@ def render_electricity_tab():
                 co_df = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Company"] == company]
                 for _, mrow in co_df.iterrows():
                     yr = int(mrow["Year"]) if pd.notna(mrow.get("Year")) else None
-                    if yr is None or yr not in YEARS:
+                    if yr is None or yr < 2009:
                         continue
+                    # Extend YEARS list if master has data for a year not yet in YEARS
+                    if yr not in YEARS:
+                        YEARS.append(yr)
+                        df[str(yr)] = 0.0
                     gj_val = mrow.get(col_gj)
                     if pd.notna(gj_val) and float(gj_val) != 0:
                         mwh_val = round(float(gj_val) * GJ_TO_MWH, 2)
@@ -2459,6 +2526,7 @@ def page_analysis():
                 showline=True, linecolor="#999", linewidth=1.2,
                 tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
                 showticklabels=True,
+                autorange=True,           # ensures top of chart has breathing room
             ),
             legend=dict(orientation="h", x=0.5, xanchor="center", y=leg_y,
                         font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
@@ -2472,7 +2540,9 @@ def page_analysis():
             showgrid=False, zeroline=False,
             showline=True, linecolor="#999", linewidth=1.2,
             showticklabels=True,
-            title=dict(text=label, font=dict(size=11, color="#444")),
+            autorange=True,
+            title=dict(text=f"<b>{label}</b>" if label else "",
+                       font=dict(size=12, color="#333", family="Arial")),
         )
 
     def _omk(col, sz=9):
@@ -2523,11 +2593,20 @@ def page_analysis():
         ), secondary_y=True)
 
         lay = _tlayout(title, h, r=100)
-        lay["yaxis"]["title"]  = dict(text=byt, font=dict(size=10, color="#666"))
+        # Add 20% headroom above max bar so bar labels are never clipped
+        valid_bv = [v for v in bv if v is not None and v == v]
+        if valid_bv:
+            lay["yaxis"]["range"] = [0, max(valid_bv) * 1.22]
+            lay["yaxis"].pop("autorange", None)
+        lay["yaxis"]["title"] = dict(
+            text=f"<b>{byt}</b>" if byt else "",
+            font=dict(size=12, color="#333", family="Arial, sans-serif"),
+        )
         lay["yaxis2"] = _y2(lyt)
-        lay["margin"]["t"] = 50
+        lay["margin"]["t"] = 55
         lay["margin"]["r"] = 115
         fig.update_layout(**lay)
+        fig.update_yaxes(showticklabels=True, showline=True, linecolor="#999")
         return fig
 
     def _stack100(xs, traces, title="", h=330):
@@ -4121,6 +4200,7 @@ def page_benchmarking():
                 showline=True, linecolor="#999", linewidth=1.2,
                 tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
                 showticklabels=True,
+                autorange=True,           # ensures top of chart has breathing room
             ),
             legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.24,
                         font=dict(size=11), bgcolor="rgba(0,0,0,0)"),

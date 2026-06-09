@@ -6314,71 +6314,9 @@ def page_doc_library():
 
 
 def page_sector_reports():
-    """DSS+ Sector Reports — generate annual TIP sustainability report."""
-    st.markdown(section_header_html(
-        "Sector Reports",
-        "Generate the annual TIP consolidated sustainability report",
-    ), unsafe_allow_html=True)
+    from tip_progress_report import render_tip_progress_report
+    render_tip_progress_report(_SECTOR_DF, _CONSOLIDATED_DF)
 
-    col_gen, col_prev = st.columns([1, 1], gap="large")
-
-    with col_gen:
-        st.markdown("**Generate Report**")
-        rpt_year = st.selectbox("Report Year", LONG_YEARS[::-1], key="sr_year")
-        rpt_scope = st.multiselect("Include Companies", _COMPANIES,
-                                   default=_COMPANIES, key="sr_scope")
-        rpt_format = st.radio("Format", ["PDF (Executive)", "Excel (Full Data)"],
-                              key="sr_fmt", horizontal=True)
-        st.markdown("**Sections to include:**")
-        c1, c2 = st.columns(2)
-        with c1:
-            inc_co2    = st.checkbox("CO₂ & GHG",        True, key="inc_co2")
-            inc_energy = st.checkbox("Energy",            True, key="inc_energy")
-            inc_water  = st.checkbox("Water",             True, key="inc_water")
-        with c2:
-            inc_waste  = st.checkbox("Waste",             True, key="inc_waste")
-            inc_bench  = st.checkbox("Benchmarking",      True, key="inc_bench")
-            inc_sdg    = st.checkbox("SDG Roadmap",       False, key="inc_sdg")
-
-        if st.button("🌍 Generate Sector Report", type="primary",
-                     use_container_width=True, key="gen_sector"):
-            with st.spinner(f"Generating {rpt_year} sector report…"):
-                import time; time.sleep(2)
-            if not _CONSOLIDATED_DF.empty:
-                subset = _CONSOLIDATED_DF[
-                    (_CONSOLIDATED_DF["Company"].isin(rpt_scope)) &
-                    (_CONSOLIDATED_DF["Year"] == rpt_year)
-                ]
-                csv_bytes = subset.to_csv(index=False).encode()
-                st.download_button(
-                    "⬇ Download Sector Data (CSV)",
-                    data=csv_bytes,
-                    file_name=f"TIP_Sector_Report_{rpt_year}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            st.success(f"Sector report for {rpt_year} ready.")
-
-    with col_prev:
-        st.markdown("**Previous Reports**")
-        prev_reports = [
-            (2023, "TIP Annual Sustainability Report 2023", "Published"),
-            (2022, "TIP Annual Sustainability Report 2022", "Published"),
-            (2021, "TIP Annual Sustainability Report 2021", "Archived"),
-        ]
-        for yr, name, status in prev_reports:
-            chip = status_chip_html("complete" if status == "Published" else "pending")
-            st.markdown(f"""
-            <div style="background:#fff;border:1px solid {BORDER};border-radius:8px;
-                padding:12px 14px;margin-bottom:6px">
-              <div style="display:flex;justify-content:space-between;align-items:center">
-                <div>
-                  <div style="font-size:13px;font-weight:500;color:{TEXT}">{name}</div>
-                  <div style="font-size:11px;color:{MUTED}">{yr} · {status}</div>
-                </div>
-                {chip}
-              </div>
-            </div>""", unsafe_allow_html=True)
 
 
 def page_admin():

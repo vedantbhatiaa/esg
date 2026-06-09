@@ -357,3 +357,40 @@ def load_sector_aggregated(master_df: pd.DataFrame = None) -> pd.DataFrame:
             except Exception as e:
                 print(f"[data_loader] Sector CSV error: {e}")
     return pd.DataFrame()
+
+def get_tip_graph_data(sector_df):
+    if sector_df is None or sector_df.empty:
+        return {}
+
+    df = sector_df.sort_values("Year")
+
+    renewable = df.get("Avg_Renewable_Share", [0]*len(df)).tolist()
+
+    return {
+        "years": df["Year"].tolist(),
+
+        "energy": df.get("Total_Energy", []).tolist(),
+        "energy_intensity": df.get("Avg_Energy_KPI", []).tolist(),
+
+        "co2": df.get("Total_CO2", []).tolist(),
+        "co2_intensity": df.get("Avg_CO2_KPI", []).tolist(),
+
+        "water": df.get("Total_Water", []).tolist(),
+        "water_intensity": df.get("Avg_Water_KPI", []).tolist(),
+
+        "waste": df.get("Total_Waste", []).tolist(),
+        "waste_intensity": df.get("Avg_Waste_Recovery_Rate", [0]*len(df)),
+
+        "iso": df.get("Avg_ISO_Cert", []).tolist(),
+
+        "renewable": renewable,
+        "non_renewable": [100 - r for r in renewable],
+
+        # Static (not in dataset)
+        "hs_external": [48, 50, 52, 54, 53, 56, 60, 63, 66, 68, 70, 72, 73, 74, 75],
+        "hs_internal": [32, 33, 29, 32, 29, 29, 33, 32, 34, 35, 34, 34, 34, 36, 38],
+
+        "women_board": [12, 11, 15, 15, 18, 19 ,21, 22, 23, 25, 26, 27, 28, 29, 30],
+        "women_total": [13, 13, 14, 14, 15, 20, 25, 26, 27, 28, 29, 29, 31, 32, 34],
+    }
+

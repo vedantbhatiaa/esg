@@ -64,12 +64,14 @@ C_RENEW  = HexColor("#16A34A") if REPORTLAB_OK else None
 
 # ── Page geometry ─────────────────────────────────────────────────────────────
 PAGE_W, PAGE_H = A4 if REPORTLAB_OK else (595, 842)
-MARGIN         = 14 * mm
-CONTENT_W      = PAGE_W - 2 * MARGIN
-CONTENT_H      = PAGE_H - 2 * MARGIN
+# Guard: mm is only available when reportlab imported successfully
+_mm     = mm if REPORTLAB_OK else 2.8346   # 1 mm in points fallback
+MARGIN  = 14 * _mm
+CONTENT_W = PAGE_W - 2 * MARGIN
+CONTENT_H = PAGE_H - 2 * MARGIN
 
 
-def _draw_rounded_rect(c, x, y, w, h, r=3*mm,
+def _draw_rounded_rect(c, x, y, w, h, r=None,
                         fill_color=None, stroke_color=None, stroke_width=0.5):
     """Draw a rounded rectangle on a canvas."""
     if fill_color:
@@ -77,6 +79,7 @@ def _draw_rounded_rect(c, x, y, w, h, r=3*mm,
     if stroke_color:
         c.setStrokeColor(stroke_color)
         c.setLineWidth(stroke_width)
+    if r is None: r = 3 * _mm
     c.roundRect(x, y, w, h, r,
                 fill=1 if fill_color else 0,
                 stroke=1 if stroke_color else 0)
@@ -86,7 +89,7 @@ def _draw_kpi_card(c, x, y, w, h, label, value_str, unit, delta_str,
                    delta_ok: bool = True, label_color=None):
     """Draw a single KPI card."""
     # Card background
-    _draw_rounded_rect(c, x, y, w, h, r=2*mm,
+    _draw_rounded_rect(c, x, y, w, h, r=2 * _mm,
                        fill_color=C_CARD, stroke_color=C_BORDER)
 
     # Label
@@ -110,7 +113,7 @@ def _draw_kpi_card(c, x, y, w, h, label, value_str, unit, delta_str,
         chip_color = C_GREEN if delta_ok else C_RED
         chip_bg    = HexColor("#DCFCE7") if delta_ok else HexColor("#FEE2E2")
         cw = c.stringWidth(delta_str, "Helvetica", 7) + 8
-        _draw_rounded_rect(c, x + 8, y + 7, cw, 12, r=1.5*mm, fill_color=chip_bg)
+        _draw_rounded_rect(c, x + 8, y + 7, cw, 12, r=1.5 * _mm, fill_color=chip_bg)
         c.setFont("Helvetica", 7)
         c.setFillColor(chip_color)
         c.drawString(x + 12, y + 11, delta_str)
@@ -260,7 +263,7 @@ def generate_executive_pdf(
     # Verification stamp
     if verified:
         stamp_x = W / 2 - 40
-        _draw_rounded_rect(c, stamp_x, H - band_h + 10, 80, 22, r=3*mm,
+        _draw_rounded_rect(c, stamp_x, H - band_h + 10, 80, 22, r=3 * _mm,
                            fill_color=HexColor("#166534"), stroke_color=None)
         c.setFont("Helvetica-Bold", 7)
         c.setFillColor(white)
@@ -326,7 +329,7 @@ def generate_executive_pdf(
     half_w = (CONTENT_W - 6) / 2
 
     # CO₂ trend card
-    _draw_rounded_rect(c, MARGIN, cursor - row2_h, half_w, row2_h, r=2*mm,
+    _draw_rounded_rect(c, MARGIN, cursor - row2_h, half_w, row2_h, r=2 * _mm,
                        fill_color=C_CARD, stroke_color=C_BORDER)
     c.setFont("Helvetica-Bold", 8)
     c.setFillColor(C_TEXT)
@@ -350,7 +353,7 @@ def generate_executive_pdf(
 
     # Fuel mix card
     fm_x = MARGIN + half_w + 6
-    _draw_rounded_rect(c, fm_x, cursor - row2_h, half_w, row2_h, r=2*mm,
+    _draw_rounded_rect(c, fm_x, cursor - row2_h, half_w, row2_h, r=2 * _mm,
                        fill_color=C_CARD, stroke_color=C_BORDER)
     c.setFont("Helvetica-Bold", 8)
     c.setFillColor(C_TEXT)
@@ -427,7 +430,7 @@ def generate_executive_pdf(
     # Data quality pill
     dq_color = C_GREEN if data_quality_score >= 80 else (C_AMBER if data_quality_score >= 60 else C_RED)
     pill_w = 70
-    _draw_rounded_rect(c, W - MARGIN - pill_w, foot_y + 1, pill_w, 18, r=3*mm,
+    _draw_rounded_rect(c, W - MARGIN - pill_w, foot_y + 1, pill_w, 18, r=3 * _mm,
                        fill_color=HexColor("#DCFCE7") if data_quality_score >= 80
                                   else HexColor("#FEF3C7"),
                        stroke_color=None)

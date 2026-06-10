@@ -1,4 +1,3 @@
-
 import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -287,11 +286,11 @@ def _apply_base_layout(fig: go.Figure, title: str, y1_label: str, y2_label: Opti
         paper_bgcolor=REPORT_BG,
         showlegend=False,
         bargap=0.24,
-        xaxis=dict(showline=True, linewidth=1, linecolor=AXIS_COLOR, showgrid=False, ticks="", tickfont=dict(size=9, color=MUTED_TEXT), zeroline=False),
-        yaxis=dict(title=dict(text=y1_label, font=dict(size=10, color=MUTED_TEXT)), showline=True, linewidth=1, linecolor=AXIS_COLOR, showgrid=True, gridcolor=GRID_COLOR, gridwidth=1, ticks="", tickfont=dict(size=9, color=MUTED_TEXT), range=y1_range, zeroline=False),
+        xaxis=dict(showline=True, linewidth=1, linecolor=AXIS_COLOR, showgrid=False, ticks="", tickfont=dict(size=11, color=MUTED_TEXT), zeroline=False),
+        yaxis=dict(title=dict(text=y1_label, font=dict(size=12, color=MUTED_TEXT)), showline=True, linewidth=1, linecolor=AXIS_COLOR, showgrid=True, gridcolor=GRID_COLOR, gridwidth=1, ticks="", tickfont=dict(size=11, color=MUTED_TEXT), range=y1_range, zeroline=False),
     )
     if y2_label:
-        fig.update_layout(yaxis2=dict(title=dict(text=y2_label, font=dict(size=10, color=MUTED_TEXT)), overlaying="y", side="right", showgrid=False, showline=True, linewidth=1, linecolor=AXIS_COLOR, ticks="", tickfont=dict(size=9, color=MUTED_TEXT), range=y2_range, zeroline=False))
+        fig.update_layout(yaxis2=dict(title=dict(text=y2_label, font=dict(size=12, color=MUTED_TEXT)), overlaying="y", side="right", showgrid=False, showline=True, linewidth=1, linecolor=AXIS_COLOR, ticks="", tickfont=dict(size=11, color=MUTED_TEXT), range=y2_range, zeroline=False))
 
 
 def _add_dual_value_rows(fig, x, bar_values, line_values, line_label):
@@ -302,7 +301,7 @@ def _add_dual_value_rows(fig, x, bar_values, line_values, line_label):
         yref="paper",
         text="■ Absolute KPI",
         showarrow=False,
-        font=dict(size=10, color=BAR_COLOR),
+        font=dict(size=12, color=BAR_COLOR),
         align="left",
         xanchor="left",
     )
@@ -313,7 +312,7 @@ def _add_dual_value_rows(fig, x, bar_values, line_values, line_label):
         yref="paper",
         text=f"—○— {line_label}",
         showarrow=False,
-        font=dict(size=10, color=LINE_COLOR),
+        font=dict(size=12, color=LINE_COLOR),
         align="left",
         xanchor="left",
     )
@@ -325,7 +324,7 @@ def _add_dual_value_rows(fig, x, bar_values, line_values, line_label):
             yref="paper",
             text=_format_value(bar_values[i]),
             showarrow=False,
-            font=dict(size=9, color=MUTED_TEXT),
+            font=dict(size=11, color=MUTED_TEXT),
             align="center",
         )
         fig.add_annotation(
@@ -335,7 +334,7 @@ def _add_dual_value_rows(fig, x, bar_values, line_values, line_label):
             yref="paper",
             text=_format_value(line_values[i]),
             showarrow=False,
-            font=dict(size=9, color=MUTED_TEXT),
+            font=dict(size=11, color=MUTED_TEXT),
             align="center",
         )
 
@@ -365,9 +364,8 @@ def plot_dual_axis_report_chart(data, bar_key, line_key, title, y1_label, y2_lab
     fig.add_scatter(
         x=x,
         y=line,
-        mode="lines+markers",
-        line=dict(color=LINE_COLOR, width=1.7),
-        marker=dict(size=8, color=REPORT_BG, line=dict(color=LINE_COLOR, width=2)),
+        mode="lines",
+        line=dict(color=LINE_COLOR, width=1.9),
         name=line_label,
         secondary_y=True,
     )
@@ -396,7 +394,7 @@ def plot_dual_axis_report_chart(data, bar_key, line_key, title, y1_label, y2_lab
             linecolor=AXIS_COLOR,
             showgrid=False,
             ticks="",
-            tickfont=dict(size=9, color=MUTED_TEXT),
+            tickfont=dict(size=11, color=MUTED_TEXT),
             zeroline=False,
         ),
     )
@@ -443,9 +441,8 @@ def plot_water_withdrawals_chart(data):
     fig.add_scatter(
         x=x,
         y=intensity,
-        mode="lines+markers",
+        mode="lines",
         line=dict(color=LINE_COLOR, width=1.9),
-        marker=dict(size=8, color=REPORT_BG, line=dict(color=LINE_COLOR, width=2)),
         name="Water intensity",
         secondary_y=True,
     )
@@ -463,23 +460,23 @@ def plot_water_withdrawals_chart(data):
         height=430,
         barmode="stack",
         showlegend=False,
-        xaxis=dict(domain=[0.18, 1.0], tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linewidth=1, linecolor=AXIS_COLOR, showgrid=False, ticks="", tickfont=dict(size=9, color=MUTED_TEXT), zeroline=False),
-        yaxis=dict(domain=[0.36, 1.0], title=dict(text="Total water withdrawals (million m³)", font=dict(size=10, color=MUTED_TEXT)), range=[0, max_total * 1.18], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT), zeroline=False),
-        yaxis2=dict(domain=[0.36, 1.0], title=dict(text="Water intensity", font=dict(size=10, color=MUTED_TEXT)), overlaying="y", side="right", range=_axis_range(intensity, 0.22, 0.22, False), showgrid=False, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT), zeroline=False),
+        xaxis=dict(domain=[0.18, 1.0], tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linewidth=1, linecolor=AXIS_COLOR, showgrid=False, ticks="", tickfont=dict(size=11, color=MUTED_TEXT), zeroline=False),
+        yaxis=dict(domain=[0.36, 1.0], title=dict(text="Total water withdrawals (million m³)", font=dict(size=12, color=MUTED_TEXT)), range=[0, max_total * 1.18], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT), zeroline=False),
+        yaxis2=dict(domain=[0.36, 1.0], title=dict(text="Water intensity", font=dict(size=12, color=MUTED_TEXT)), overlaying="y", side="right", range=_axis_range(intensity, 0.22, 0.22, False), showgrid=False, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT), zeroline=False),
     )
 
     for i, x_pos in enumerate(x):
         if stressed[i] > 0:
-            fig.add_annotation(x=x_pos, y=non_stressed[i] + stressed[i] / 2, text=f"{stress_pct_labels[i]:.1f}%", showarrow=False, font=dict(size=10, color=TEXT_COLOR))
+            fig.add_annotation(x=x_pos, y=non_stressed[i] + stressed[i] / 2, text=f"{stress_pct_labels[i]:.1f}%", showarrow=False, font=dict(size=12, color=TEXT_COLOR))
 
-    fig.add_annotation(x=0.01, y=0.25, xref="paper", yref="paper", text="■ Stress withdrawals", showarrow=False, font=dict(size=10, color="#b9c8d4"), align="left", xanchor="left")
-    fig.add_annotation(x=0.01, y=0.15, xref="paper", yref="paper", text="■ Non-stress withdrawals", showarrow=False, font=dict(size=10, color="#9cae7b"), align="left", xanchor="left")
-    fig.add_annotation(x=0.01, y=0.05, xref="paper", yref="paper", text="—○— Water intensity", showarrow=False, font=dict(size=10, color=LINE_COLOR), align="left", xanchor="left")
+    fig.add_annotation(x=0.01, y=0.25, xref="paper", yref="paper", text="■ Stress withdrawals", showarrow=False, font=dict(size=12, color="#b9c8d4"), align="left", xanchor="left")
+    fig.add_annotation(x=0.01, y=0.15, xref="paper", yref="paper", text="■ Non-stress withdrawals", showarrow=False, font=dict(size=12, color="#9cae7b"), align="left", xanchor="left")
+    fig.add_annotation(x=0.01, y=0.05, xref="paper", yref="paper", text="—○— Water intensity", showarrow=False, font=dict(size=12, color=LINE_COLOR), align="left", xanchor="left")
 
     for i, x_pos in enumerate(x):
-        fig.add_annotation(x=x_pos, y=0.25, xref="x", yref="paper", text=_format_value(stressed[i]), showarrow=False, font=dict(size=9, color=MUTED_TEXT))
-        fig.add_annotation(x=x_pos, y=0.15, xref="x", yref="paper", text=_format_value(non_stressed[i]), showarrow=False, font=dict(size=9, color=MUTED_TEXT))
-        fig.add_annotation(x=x_pos, y=0.05, xref="x", yref="paper", text=_format_value(intensity[i]), showarrow=False, font=dict(size=9, color=MUTED_TEXT))
+        fig.add_annotation(x=x_pos, y=0.25, xref="x", yref="paper", text=_format_value(stressed[i]), showarrow=False, font=dict(size=11, color=MUTED_TEXT))
+        fig.add_annotation(x=x_pos, y=0.15, xref="x", yref="paper", text=_format_value(non_stressed[i]), showarrow=False, font=dict(size=11, color=MUTED_TEXT))
+        fig.add_annotation(x=x_pos, y=0.05, xref="x", yref="paper", text=_format_value(intensity[i]), showarrow=False, font=dict(size=11, color=MUTED_TEXT))
 
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("water_withdrawals"))
 
@@ -516,17 +513,17 @@ def plot_electricity_chart(data):
         plot_bgcolor=REPORT_BG,
         paper_bgcolor=REPORT_BG,
         showlegend=False,
-        xaxis=dict(domain=[0.18, 1.0], tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, ticks="", tickfont=dict(size=9, color=MUTED_TEXT), zeroline=False),
-        yaxis=dict(domain=[0.32, 1.0], title="Total electricity consumption (%)", range=[0, 100], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT), zeroline=False),
+        xaxis=dict(domain=[0.18, 1.0], tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, ticks="", tickfont=dict(size=11, color=MUTED_TEXT), zeroline=False),
+        yaxis=dict(domain=[0.32, 1.0], title="Total electricity consumption (%)", range=[0, 100], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT), zeroline=False),
     )
 
     for i, x_pos in enumerate(x):
-        fig.add_annotation(x=x_pos, y=nonrenew_share[i] + renew_share[i] / 2, text=f"{renew_share[i]:.1f}%", showarrow=False, font=dict(size=9, color="white"))
-        fig.add_annotation(x=x_pos, y=0.18, xref="x", yref="paper", text=_format_value(non_renewable[i]), showarrow=False, font=dict(size=9, color=MUTED_TEXT))
-        fig.add_annotation(x=x_pos, y=0.08, xref="x", yref="paper", text=_format_value(renewable[i]), showarrow=False, font=dict(size=9, color=MUTED_TEXT))
+        fig.add_annotation(x=x_pos, y=nonrenew_share[i] + renew_share[i] / 2, text=f"{renew_share[i]:.1f}%", showarrow=False, font=dict(size=11, color="white"))
+        fig.add_annotation(x=x_pos, y=0.18, xref="x", yref="paper", text=_format_value(non_renewable[i]), showarrow=False, font=dict(size=11, color=MUTED_TEXT))
+        fig.add_annotation(x=x_pos, y=0.08, xref="x", yref="paper", text=_format_value(renewable[i]), showarrow=False, font=dict(size=11, color=MUTED_TEXT))
 
-    fig.add_annotation(x=0.01, y=0.18, xref="paper", yref="paper", text="■ Non-renewable electricity (GJ)", showarrow=False, font=dict(size=10, color=TIP_SAND), align="left", xanchor="left")
-    fig.add_annotation(x=0.01, y=0.08, xref="paper", yref="paper", text="■ Renewable electricity (GJ)", showarrow=False, font=dict(size=10, color=TIP_SPRUCE), align="left", xanchor="left")
+    fig.add_annotation(x=0.01, y=0.18, xref="paper", yref="paper", text="■ Non-renewable electricity (GJ)", showarrow=False, font=dict(size=12, color=TIP_SAND), align="left", xanchor="left")
+    fig.add_annotation(x=0.01, y=0.08, xref="paper", yref="paper", text="■ Renewable electricity (GJ)", showarrow=False, font=dict(size=12, color=TIP_SPRUCE), align="left", xanchor="left")
 
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("electricity_renewable"))
 
@@ -560,14 +557,14 @@ def plot_energy_mix_chart(master_df, years):
     fig = go.Figure()
     for label, color, _ in categories:
         fig.add_bar(x=x, y=shares[label], name=label, marker=dict(color=color, line=dict(color=REPORT_BG, width=0.4)), width=0.62)
-    fig.update_layout(title=dict(text="Energy Mix", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=dict(l=78, r=210, t=38, b=76), barmode="stack", plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=9, color=TEXT_COLOR)), yaxis=dict(title="Energy mix (%)", range=[0, 100], ticksuffix="%", dtick=10, showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=TEXT_COLOR)), legend=dict(x=1.04, y=1.0, xanchor="left", yanchor="top", font=dict(size=10), bgcolor="rgba(0,0,0,0)"))
+    fig.update_layout(title=dict(text="Energy Mix", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=dict(l=78, r=210, t=38, b=76), barmode="stack", plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=11, color=TEXT_COLOR)), yaxis=dict(title="Energy mix (%)", range=[0, 100], ticksuffix="%", dtick=10, showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=TEXT_COLOR)), legend=dict(x=1.04, y=1.0, xanchor="left", yanchor="top", font=dict(size=10), bgcolor="rgba(0,0,0,0)"))
     for i, x_pos in enumerate(x):
         cumulative = 0.0
         for label, _, _ in categories:
             val = shares[label][i]
             if val >= 3.0:
                 txt_color = "white" if label in {"Coal", "Purchased steam"} else TEXT_COLOR
-                fig.add_annotation(x=x_pos, y=cumulative + val / 2, text=f"{val:.1f}%", showarrow=False, font=dict(size=9, color=txt_color))
+                fig.add_annotation(x=x_pos, y=cumulative + val / 2, text=f"{val:.1f}%", showarrow=False, font=dict(size=11, color=txt_color))
             cumulative += val
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("energy_mix"))
 
@@ -590,10 +587,10 @@ def plot_waste_breakdown_chart(master_df, years):
     fig.add_bar(x=x, y=elimination_mt, marker=dict(color=TIP_SPRUCE), width=0.62, name="Elimination")
     for i, x_pos in enumerate(x):
         if recovery_mt[i] > 0:
-            fig.add_annotation(x=x_pos, y=recovery_mt[i] / 2, text=_format_value(recovery_mt[i]), showarrow=False, font=dict(size=9, color=TEXT_COLOR))
+            fig.add_annotation(x=x_pos, y=recovery_mt[i] / 2, text=_format_value(recovery_mt[i]), showarrow=False, font=dict(size=11, color=TEXT_COLOR))
         if elimination_mt[i] > 0:
-            fig.add_annotation(x=x_pos, y=recovery_mt[i] + elimination_mt[i] / 2, text=_format_value(elimination_mt[i]), showarrow=False, font=dict(size=9, color="white"))
-    fig.update_layout(title=dict(text="Waste Recovery and Elimination", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, barmode="stack", plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=9, color=MUTED_TEXT)), yaxis=dict(title="Waste sent for recovery or elimination (Mt)", showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT), range=_axis_range([a + b for a, b in zip(recovery_mt, elimination_mt)], 0.10, 0.15, True)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=9)))
+            fig.add_annotation(x=x_pos, y=recovery_mt[i] + elimination_mt[i] / 2, text=_format_value(elimination_mt[i]), showarrow=False, font=dict(size=11, color="white"))
+    fig.update_layout(title=dict(text="Waste Recovery and Elimination", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, barmode="stack", plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=11, color=MUTED_TEXT)), yaxis=dict(title="Waste sent for recovery or elimination (Mt)", showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT), range=_axis_range([a + b for a, b in zip(recovery_mt, elimination_mt)], 0.10, 0.15, True)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=11)))
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("waste_breakdown"))
 
 
@@ -613,7 +610,7 @@ def plot_sbt_chart(years):
             if val > 0:
                 fig.add_annotation(x=x_pos, y=y0 + val / 2, text=str(val), showarrow=False, font=dict(size=9, color=color))
             y0 += val
-    fig.update_layout(title=dict(text="Science-based Targets", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, barmode="stack", plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=9, color=MUTED_TEXT)), yaxis=dict(title="Number of TIP members", range=[0, 10], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=9)))
+    fig.update_layout(title=dict(text="Science-based Targets", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, barmode="stack", plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=year_labels, showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=11, color=MUTED_TEXT)), yaxis=dict(title="Number of TIP members", range=[0, 10], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=11)))
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("science_based_targets"))
 
 
@@ -624,8 +621,8 @@ def plot_iso_chart(data):
         return
     x = list(range(len(years)))
     fig = go.Figure()
-    fig.add_scatter(x=x, y=values, mode="lines+markers", line=dict(color=LINE_COLOR, width=1.8), marker=dict(size=7, color=REPORT_BG, line=dict(color=LINE_COLOR, width=1.6)))
-    fig.update_layout(title=dict(text="ISO Certification", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, showlegend=False, xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=9, color=MUTED_TEXT)), yaxis=dict(title="ISO 14001-certified sites (%)", range=[95, 100], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT)))
+    fig.add_scatter(x=x, y=values, mode="lines", line=dict(color=LINE_COLOR, width=1.9))
+    fig.update_layout(title=dict(text="ISO Certification", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, showlegend=False, xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=11, color=MUTED_TEXT)), yaxis=dict(title="ISO 14001-certified sites (%)", range=[95, 100], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT)))
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("iso_certification"))
 
 
@@ -637,9 +634,9 @@ def plot_hs_chart(years):
     fig.add_bar(x=x, y=external, marker=dict(color=TIP_SPRUCE), width=0.34, name="Externally audited")
     fig.add_bar(x=x, y=internal, marker=dict(color=TIP_SKY), width=0.34, name="Internally audited")
     for i, x_pos in enumerate(x):
-        fig.add_annotation(x=x_pos - 0.17, y=external[i], text=f"{external[i]}%", showarrow=False, yshift=8, font=dict(size=8, color=MUTED_TEXT))
-        fig.add_annotation(x=x_pos + 0.17, y=internal[i], text=f"{internal[i]}%", showarrow=False, yshift=8, font=dict(size=8, color=MUTED_TEXT))
-    fig.update_layout(title=dict(text="H&S Management Systems", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, barmode="group", xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=9, color=MUTED_TEXT)), yaxis=dict(title="Sites with H&S system (%)", range=[0, 80], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=9)))
+        fig.add_annotation(x=x_pos - 0.17, y=external[i], text=f"{external[i]}%", showarrow=False, yshift=8, font=dict(size=10, color=MUTED_TEXT))
+        fig.add_annotation(x=x_pos + 0.17, y=internal[i], text=f"{internal[i]}%", showarrow=False, yshift=8, font=dict(size=10, color=MUTED_TEXT))
+    fig.update_layout(title=dict(text="H&S Management Systems", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, barmode="group", xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=11, color=MUTED_TEXT)), yaxis=dict(title="Sites with H&S system (%)", range=[0, 80], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=11)))
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("hs_management_systems"))
 
 
@@ -648,9 +645,9 @@ def plot_women_chart(years):
     total = [STATIC_WOMEN_TOTAL[y] for y in years]
     x = list(range(len(years)))
     fig = go.Figure()
-    fig.add_scatter(x=x, y=board, mode="lines+markers", name="Board of Directors", line=dict(color=TIP_SPRUCE, width=1.8), marker=dict(size=7, color=REPORT_BG, line=dict(color=TIP_SPRUCE, width=1.5)))
-    fig.add_scatter(x=x, y=total, mode="lines+markers", name="Total employees", line=dict(color=TIP_SKY, width=1.8), marker=dict(size=7, color=REPORT_BG, line=dict(color=TIP_SKY, width=1.5)))
-    fig.update_layout(title=dict(text="Women Representation", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=9, color=MUTED_TEXT)), yaxis=dict(title="Women representation (%)", range=[0, 22], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=9, color=MUTED_TEXT)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=9)))
+    fig.add_scatter(x=x, y=board, mode="lines", name="Board of Directors", line=dict(color=TIP_SPRUCE, width=1.9))
+    fig.add_scatter(x=x, y=total, mode="lines", name="Total employees", line=dict(color=TIP_SKY, width=1.9))
+    fig.update_layout(title=dict(text="Women Representation", x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=CHART_MARGIN_SIMPLE, plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR, showgrid=False, tickfont=dict(size=11, color=MUTED_TEXT)), yaxis=dict(title="Women representation (%)", range=[0, 22], showgrid=True, gridcolor=GRID_COLOR, showline=True, linecolor=AXIS_COLOR, tickfont=dict(size=11, color=MUTED_TEXT)), legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=11)))
     st.plotly_chart(fig, use_container_width=True, config=_chart_config("women_representation"))
 
 
@@ -658,9 +655,9 @@ def plot_dual_axis_static_chart(years, bar_values, line_values, title, y1_label,
     x = list(range(len(years)))
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_bar(x=x, y=bar_values, marker=dict(color=BAR_COLOR), width=0.62, name="Annual")
-    fig.add_scatter(x=x, y=line_values, mode="lines+markers", line=dict(color=LINE_COLOR, width=1.7), marker=dict(size=7, color=REPORT_BG, line=dict(color=LINE_COLOR, width=1.7)), name=line_label, secondary_y=True)
+    fig.add_scatter(x=x, y=line_values, mode="lines", line=dict(color=LINE_COLOR, width=1.9), name=line_label, secondary_y=True)
     _apply_base_layout(fig, title, y1_label, y2_label, _axis_range(bar_values, 0.20, 0.20, True), _axis_range(line_values, 0.20, 0.20, True), CHART_MARGIN_SIMPLE)
-    fig.update_layout(xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR), showlegend=True, legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=9)))
+    fig.update_layout(xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR), showlegend=True, legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=11)))
     st.plotly_chart(fig, use_container_width=True, config=_chart_config(title.replace(" ", "_").lower()))
 
 
@@ -674,8 +671,8 @@ def plot_simple_bar_report_chart(years, values, title, y_label, bottom_values=Fa
     fig.update_layout(title=dict(text=title, x=0.02, font=dict(size=13)), height=CHART_HEIGHT, margin=dict(l=78, r=50, t=38, b=44) if bottom_values else CHART_MARGIN_SIMPLE, plot_bgcolor=REPORT_BG, paper_bgcolor=REPORT_BG, showlegend=False, xaxis=dict(tickmode="array", tickvals=x, ticktext=[str(y) for y in years], showline=True, linecolor=AXIS_COLOR), yaxis=yaxis_layout)
     if bottom_values:
         for i, x_pos in enumerate(x):
-            fig.add_annotation(x=x_pos, y=0.07, xref="x", yref="paper", text=_format_value(values[i]), showarrow=False, font=dict(size=9, color=MUTED_TEXT))
+            fig.add_annotation(x=x_pos, y=0.07, xref="x", yref="paper", text=_format_value(values[i]), showarrow=False, font=dict(size=11, color=MUTED_TEXT))
     else:
         for i, x_pos in enumerate(x):
-            fig.add_annotation(x=x_pos, y=values[i], text=_format_value(values[i]), showarrow=False, yshift=8, font=dict(size=8, color=MUTED_TEXT))
+            fig.add_annotation(x=x_pos, y=values[i], text=_format_value(values[i]), showarrow=False, yshift=8, font=dict(size=10, color=MUTED_TEXT))
     st.plotly_chart(fig, use_container_width=True, config=_chart_config(title.replace(" ", "_").lower()))

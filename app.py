@@ -78,6 +78,137 @@ def _write_verification_status(company: str, year: int, status: str) -> None:
         w.writerows(rows)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUPPLEMENTARY DATA STORE — fields outside TemplateInputs
+# (H&S, Diversity, SBT, Water detail, Coal breakdown)
+# Stored in data_storage/master/ESG_SUPPLEMENTARY.csv
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SUPP_PATH = Path("data_storage/master/ESG_SUPPLEMENTARY.csv")
+_SUPP_FIELDS = [
+    "Company","Year",
+    # Water detail
+    "stress_water_withdrawal","non_stress_water_withdrawal",
+    # Coal breakdown
+    "coal_sub_bituminous","coal_brown_briquettes","coal_other_bituminous",
+    # H&S
+    "hs_external_audit","hs_internal_audit",
+    # Diversity
+    "total_employees","female_employees","board_total","female_board",
+    # SBT
+    "sbt_total","sbt_validated","sbt_committed","sbt_non_committed",
+]
+
+def _load_supplementary(company: str, year: int) -> dict:
+    """Load supplementary fields for company+year. Returns {} if not found."""
+    from pathlib import Path as _P
+    import csv
+    p = _P("data_storage/master/ESG_SUPPLEMENTARY.csv")
+    if not p.exists(): return {}
+    with open(p, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("Company","").strip()==company and str(row.get("Year","")).strip()==str(year):
+                return {k: float(v) if v else 0.0 for k,v in row.items()
+                        if k not in ("Company","Year")}
+    return {}
+
+def _save_supplementary(company: str, year: int, data: dict) -> None:
+    """Upsert supplementary fields for company+year."""
+    from pathlib import Path as _P
+    import csv
+    p = _P("data_storage/master/ESG_SUPPLEMENTARY.csv")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    if p.exists():
+        with open(p, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if not (row.get("Company","").strip()==company and
+                        str(row.get("Year","")).strip()==str(year)):
+                    rows.append(row)
+    new_row = {"Company": company, "Year": str(year)}
+    for field in _SUPP_FIELDS[2:]:          # skip Company, Year
+        new_row[field] = str(data.get(field, 0) or 0)
+    rows.append(new_row)
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_SUPP_FIELDS)
+        w.writeheader(); w.writerows(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIELD COMMENT / CHANGE-REQUEST SYSTEM
+# When a client updates a PREVIOUS year, they must give a reason.
+# DSS approves/rejects from the Verification Queue.
+# Approved comments appear in RED in the template Main Input view.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_COMMENTS_PATH = Path("data_storage/field_comments.csv")
+_COMMENT_COLS  = ["Company","Year","FieldKey","FieldLabel","OldValue",
+                  "NewValue","Reason","SubmittedAt","Status","ApprovedBy","ApprovedAt"]
+
+def _save_change_comment(company, year, field_key, field_label,
+                          old_val, new_val, reason) -> None:
+    """Save a pending change-request comment."""
+    from pathlib import Path as _P
+    import csv
+    from datetime import datetime
+    p = _P("data_storage/field_comments.csv")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    if p.exists():
+        with open(p, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    # Remove existing pending for same co+yr+field
+    rows = [r for r in rows if not (
+        r["Company"]==company and str(r["Year"])==str(year) and r["FieldKey"]==field_key
+        and r["Status"]=="Pending")]
+    rows.append({"Company":company,"Year":str(year),"FieldKey":field_key,
+                 "FieldLabel":field_label,"OldValue":str(old_val),
+                 "NewValue":str(new_val),"Reason":reason,
+                 "SubmittedAt":datetime.now().strftime("%Y-%m-%d %H:%M"),
+                 "Status":"Pending","ApprovedBy":"","ApprovedAt":""})
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_COMMENT_COLS)
+        w.writeheader(); w.writerows(rows)
+
+def _load_comments(company: str = None, status: str = None) -> list:
+    """Load comments, optionally filtered by company and/or status."""
+    from pathlib import Path as _P
+    import csv
+    p = _P("data_storage/field_comments.csv")
+    if not p.exists(): return []
+    with open(p, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if company: rows = [r for r in rows if r["Company"]==company]
+    if status:  rows = [r for r in rows if r["Status"]==status]
+    return rows
+
+def _update_comment_status(company, year, field_key, status, approved_by="") -> None:
+    """Approve or reject a pending comment."""
+    from pathlib import Path as _P
+    import csv
+    from datetime import datetime
+    p = _P("data_storage/field_comments.csv")
+    if not p.exists(): return
+    rows = []
+    with open(p, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        if (r["Company"]==company and str(r["Year"])==str(year)
+                and r["FieldKey"]==field_key and r["Status"]=="Pending"):
+            r["Status"]    = status
+            r["ApprovedBy"]= approved_by
+            r["ApprovedAt"]= datetime.now().strftime("%Y-%m-%d %H:%M")
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_COMMENT_COLS)
+        w.writeheader(); w.writerows(rows)
+
+def _get_approved_comments(company: str, year: int) -> dict:
+    """Return {field_key: reason} for all approved comments for company+year."""
+    rows = _load_comments(company, "Approved")
+    return {r["FieldKey"]: r["Reason"]
+            for r in rows if str(r["Year"])==str(year)}
+
+
 def _reload_consolidated_df() -> bool:
     """
     Force-reload master CSV + rebuild ALL dependent globals.
@@ -269,6 +400,83 @@ from ui_components import (
     CAT_CO2, CAT_ENERGY, CAT_WATER, CAT_WASTE, CAT_RENEW,
 )
 inject_global_css()
+
+# ── TIP background scoped to Plotly chart containers ONLY ────────────────────
+# Targets the div Streamlit wraps each Plotly chart in.
+# Does NOT touch tabs, tables, data entry forms, or KPI metric cards.
+st.markdown("""
+<style>
+[data-testid="stPlotlyChart"] > div,
+[data-testid="stPlotlyChart"] iframe,
+.js-plotly-plot .plotly,
+.stPlotlyChart > div {
+    background-color: #f5f4f2 !important;
+    border-radius: 6px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════
+# TIP Report Design System — chart_layout_defaults (global override)
+# Replaces the ui_components version everywhere it's called in app.py.
+# Background, axes, grid, and typography aligned to TIP Annual KPI Report.
+# ═══════════════════════════════════════════════════════════════════════
+_TIP_BG    = "#f5f4f2"   # REPORT_BG — warm off-white
+_TIP_CHR   = "#2a2825"   # TIP_CHARCOAL — title / primary text
+_TIP_AX    = "#9aa1a9"   # axis lines
+_TIP_GRID  = "#e6eaed"   # y-axis grid lines
+_TIP_MUTED = "#6f7882"   # tick / caption text
+
+def chart_layout_defaults(title="", height=300, showlegend=True, **kw):
+    """TIP-aligned chart layout. Overrides ui_components version.
+
+    Uses underscore notation for xaxis/yaxis so callers can safely pass their
+    own xaxis=dict(...) or yaxis=dict(...) without Python raising 'multiple
+    values for keyword argument'.  Plotly merges underscore keys with explicit
+    dict keys, so the defaults still apply to any sub-property not overridden.
+    """
+    base = dict(
+        title=dict(
+            text=f"<b>{title}</b>",
+            font=dict(size=14, color=_TIP_CHR, family="Arial, sans-serif"),
+            x=0,
+        ),
+        height=height,
+        margin=dict(l=55, r=65, t=50, b=60),
+        plot_bgcolor=_TIP_BG,
+        paper_bgcolor=_TIP_BG,
+        # ── xaxis defaults — underscore notation avoids dict key collision ──
+        xaxis_showgrid=False,
+        xaxis_showline=True,
+        xaxis_linewidth=1.2,
+        xaxis_linecolor=_TIP_AX,
+        xaxis_mirror=False,
+        xaxis_ticks="",
+        xaxis_tickfont=dict(size=12, color=_TIP_MUTED, family="Arial"),
+        xaxis_tickangle=0,
+        xaxis_type="category",
+        xaxis_zeroline=False,
+        # ── yaxis defaults ────────────────────────────────────────────────
+        yaxis_showgrid=True,
+        yaxis_gridcolor=_TIP_GRID,
+        yaxis_zeroline=False,
+        yaxis_showline=True,
+        yaxis_linewidth=1.2,
+        yaxis_linecolor=_TIP_AX,
+        yaxis_ticks="",
+        yaxis_tickfont=dict(size=12, color=_TIP_MUTED, family="Arial"),
+        yaxis_autorange=True,
+        # ── legend & interaction ──────────────────────────────────────────
+        legend=dict(
+            orientation="h", x=0.5, xanchor="center", y=-0.24,
+            font=dict(size=12, color=_TIP_MUTED, family="Arial"),
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        hovermode="x unified",
+        showlegend=showlegend,
+    )
+    base.update(kw)
+    return base
 
 # ─────────────────────────────────────────────────────────
 # CONSTANTS
@@ -1335,23 +1543,26 @@ def _save_submission_to_csv(inp, out) -> str:
 
 def page_entry():
     """
-    Submit Data — single scrolling page with all 6 sections.
-    For the current/latest year shows blank fields (new entry).
-    For previous years shows existing records pre-filled.
-    After Submit → redirects to My Records.
-    CLIENT SIDE ONLY.
+    Submit Data — full comprehensive form covering all TIP KPI fields.
+    Sections: Global Info · Water · Energy (Electricity + Fuels) · CO₂ ·
+              Waste · Health & Safety · Diversity · Science-Based Targets
+    Auto-calculates KPIs live. On submit → saves to master CSV + supplementary
+    CSV. When editing a previous year, requires a change reason which goes
+    to the Verification Queue for DSS approval before becoming visible.
     """
+    from pathlib import Path as _P
+    from formula_engine import EF as _EF, GJ_TO_MWH as _G2M, _DEFAULT_SCOPE2_ELEC_EF as _S2EF
+
     company   = st.session_state.user_company
     comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
     all_yrs   = sorted(dl.get_years(_CONSOLIDATED_DF, company) or [])
 
-    # ── Header: company name + year dropdown ──────────────────────────────────
+    # ── Header ────────────────────────────────────────────────────────────────
     h1, h2, _ = st.columns([2, 1, 2])
     with h1:
-        st.markdown(f"""
-        <div style="font-size:22px;font-weight:800;color:{TEXT};margin-top:4px">
+        st.markdown(f"""<div style="font-size:22px;font-weight:800;color:{TEXT};margin-top:4px">
           {_html.escape(company)}</div>
-        <div style="font-size:12px;color:{MUTED}">ESG KPI Data Entry</div>
+          <div style="font-size:12px;color:{MUTED}">ESG KPI Data Entry — All TIP Fields</div>
         """, unsafe_allow_html=True)
     with h2:
         yr_options = sorted(list(set(all_yrs + [CURR_YEAR])), reverse=True)
@@ -1359,196 +1570,402 @@ def page_entry():
                               label_visibility="collapsed")
 
     is_new = sel_yr not in all_yrs
+    is_editing_prior = (not is_new) and (sel_yr < max(all_yrs + [sel_yr]))
     if is_new:
-        st.info(f"Entering new data for **{sel_yr}** — pre-filled with projected values based on last year's trend")
+        st.info(f"📋 Entering **new data** for **{sel_yr}** — fields pre-filled from last year's projection")
+    elif is_editing_prior:
+        st.warning(f"✏️ Editing **existing data** for **{sel_yr}** — any changes will require a reason and DSS approval")
     else:
-        st.info(f"Editing existing data for **{sel_yr}** (pre-filled from database)")
+        st.info(f"✏️ Editing data for **{sel_yr}** (pre-filled from database)")
 
-    # ── Pre-fill: existing data or projection from prior year ─────────────────
+    # ── Pre-fill: from DB or projected ────────────────────────────────────────
     existing = dl.get_step_data(comp_hist, sel_yr) if (comp_hist and not is_new) else {}
+    supp     = _load_supplementary(company, sel_yr)
 
     if is_new and comp_hist:
-        # Use most recent available year as projection baseline
         prior_yr   = max(all_yrs) if all_yrs else sel_yr - 1
         prior_data = dl.get_step_data(comp_hist, prior_yr)
-        # Compute a simple linear projection: prior + avg YoY change over last 3 years
-        def _projected(key, default=0.0):
-            recent_yrs = sorted([y for y in all_yrs if y >= prior_yr - 3], reverse=True)
-            if len(recent_yrs) >= 2:
-                vals = [float(dl.get_step_data(comp_hist, y).get(key, 0)) for y in recent_yrs]
-                vals = [v for v in vals if v > 0]
-                if len(vals) >= 2:
-                    avg_change = (vals[0] - vals[-1]) / max(len(vals) - 1, 1)
-                    return max(0.0, float(vals[0]) + avg_change)
-            return float(prior_data.get(key, default))
-        _num = _projected
+        def _num(key, default=0.0, supp_key=None):
+            if supp_key:
+                return float(_load_supplementary(company, prior_yr).get(supp_key, default) or default)
+            return float(prior_data.get(key, default) or default)
     else:
-        def _num(key, default=0.0):
-            return float(existing.get(key, default))
+        def _num(key, default=0.0, supp_key=None):
+            if supp_key:
+                return float(supp.get(supp_key, default) or default)
+            return float(existing.get(key, default) or default)
 
-    # Use year-scoped keys so switching year always reloads from DB (no stale form state)
-    _yk = f"_{sel_yr}"  # key suffix per year
+    _yk = f"_{sel_yr}"     # key suffix per year avoids stale state
 
-    # ── Live input sections — no st.form, calculations update as you type ──────
-    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-
-    # ── Section 1: ISO 14001 ──────────────────────────────────────────────────
-    st.markdown(f"""
-    <div style="border-left:3px solid {GREEN};padding:4px 0 4px 12px;margin-bottom:12px">
-      <div style="font-size:14px;font-weight:700;color:{TEXT}">
-        1.  ISO 14001 Certification</div>
-      <div style="font-size:11px;color:{MUTED}">Number of sites and certified sites</div>
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Global Information
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid {GREEN};padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">1. Global Information</b>
+      <div style="font-size:11px;color:{MUTED}">Sites, ISO 14001 certification, production volume</div>
     </div>""", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    total_sites = c1.number_input("Total no. of sites", min_value=0,
-                                   value=int(_num("total_sites")), step=1, key=f"e_sites{_yk}")
-    iso_sites   = c2.number_input("ISO 14001 certified sites", min_value=0,
-                                   value=int(_num("iso_sites")), step=1, key=f"e_iso{_yk}")
+
+    g1, g2, g3 = st.columns(3)
+    total_sites = g1.number_input("Total number of sites", min_value=0,
+        value=int(_num("total_sites")), step=1, key=f"e_sites{_yk}")
+    iso_sites = g2.number_input("ISO 14001 certified sites", min_value=0,
+        value=int(_num("iso_sites")), step=1, key=f"e_iso{_yk}")
     iso_pct = round(iso_sites / max(total_sites, 1) * 100, 1)
-    c3.metric("% Certified (live)", f"{iso_pct}%")
+    g3.metric("ISO 14001 % (auto)", f"{iso_pct:.1f}%")
 
+    production = st.number_input("Total Production (metric t)", min_value=0.0,
+        value=_num("production"), step=1000.0, format="%.0f", key=f"e_prod{_yk}")
     st.divider()
 
-    # ── Section 2: Production ─────────────────────────────────────────────────
-    st.markdown(f"""
-    <div style="border-left:3px solid {CAT_CO2};padding:4px 0 4px 12px;margin-bottom:12px">
-      <div style="font-size:14px;font-weight:700;color:{TEXT}">
-        2.  Production Volume</div>
-      <div style="font-size:11px;color:{MUTED}">Annual tire/rubber production in metric tonnes</div>
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Water
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid {CAT_WATER};padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">2. Water</b>
+      <div style="font-size:11px;color:{MUTED}">All figures in m³</div>
     </div>""", unsafe_allow_html=True)
-    production = st.number_input("Production (metric t)", min_value=0.0,
-                                  value=_num("production"), step=1000.0,
-                                  format="%.0f", key=f"e_prod{_yk}")
 
+    w1, w2 = st.columns(2)
+    water_intake = w1.number_input("Water intake (m³)", min_value=0.0,
+        value=_num("water_withdrawals"), step=1000.0, format="%.0f", key=f"e_wintake{_yk}",
+        help="Total water taken from all sources")
+    water_withdrawal = w2.number_input("Water withdrawal (m³)", min_value=0.0,
+        value=_num("water_withdrawals"), step=1000.0, format="%.0f", key=f"e_wdraw{_yk}",
+        help="Total water withdrawn (may equal intake)")
+
+    ws1, ws2 = st.columns(2)
+    stress_wd = ws1.number_input("Stress water withdrawal (m³)", min_value=0.0,
+        value=_num("", 0.0, "stress_water_withdrawal"), step=1000.0, format="%.0f", key=f"e_stress{_yk}",
+        help="Withdrawals from water-stressed areas")
+    non_stress_wd = round(max(water_withdrawal - stress_wd, 0), 0)
+    ws2.metric("Non-stress withdrawal (auto)", f"{non_stress_wd:,.0f} m³")
+
+    water_kpi_live = round(water_intake / max(production, 1), 4)
+    st.metric("Water Intake KPI (m³/t)", f"{water_kpi_live:.4f}",
+              help="Auto-calculated: Water intake ÷ Production")
     st.divider()
 
-    # ── Section 3: Water ──────────────────────────────────────────────────────
-    st.markdown(f"""
-    <div style="border-left:3px solid {CAT_WATER};padding:4px 0 4px 12px;margin-bottom:12px">
-      <div style="font-size:14px;font-weight:700;color:{TEXT}">
-        3.  Water Withdrawals</div>
-      <div style="font-size:11px;color:{MUTED}">Total water intake from all sources (m³)</div>
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Energy: Electricity
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid {CAT_ENERGY};padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">3. Energy — Electricity (GJ)</b>
     </div>""", unsafe_allow_html=True)
-    _wc1, _wc2 = st.columns([3, 1])
-    water_withdrawals = _wc1.number_input("Water withdrawals (m³)", min_value=0.0,
-                                          value=_num("water_withdrawals"), step=100.0,
-                                          format="%.0f", key=f"e_water{_yk}")
-    _wc2.metric("Water KPI (m³/t)", f"{round(water_withdrawals / max(production, 1), 2):.2f}")
 
+    ec1, ec2, ec3 = st.columns(3)
+    renew_elec    = ec1.number_input("Renewable electricity purchased (GJ)", min_value=0.0,
+        value=_num("renew_elec_purchased"), step=100.0, format="%.0f", key=f"e_re{_yk}")
+    nonrenew_elec = ec2.number_input("Non-renewable electricity purchased (GJ)", min_value=0.0,
+        value=_num("nonrenew_elec_purchased"), step=100.0, format="%.0f", key=f"e_nre{_yk}")
+    self_gen      = ec3.number_input("Self-generated electricity (GJ)", min_value=0.0,
+        value=_num("self_gen_elec"), step=100.0, format="%.0f", key=f"e_sg{_yk}")
+
+    ec4, ec5, ec6 = st.columns(3)
+    purchased_steam = ec4.number_input("Purchased steam (GJ)", min_value=0.0,
+        value=_num("purchased_steam"), step=100.0, format="%.0f", key=f"e_ps{_yk}")
+    sold_steam      = ec5.number_input("Sold steam (GJ)", min_value=0.0,
+        value=_num("sold_steam"), step=100.0, format="%.0f", key=f"e_ss{_yk}",
+        help="Energy sold as steam — deducted from total")
+    sold_electricity = ec6.number_input("Sold electricity (GJ)", min_value=0.0,
+        value=_num("sold_electricity"), step=100.0, format="%.0f", key=f"e_se{_yk}")
+
+    total_elec = renew_elec + nonrenew_elec + self_gen
+    st.metric("Total Electricity (auto)", f"{total_elec:,.0f} GJ")
     st.divider()
 
-    # ── Section 4: Energy ─────────────────────────────────────────────────────
-    st.markdown(f"""
-    <div style="border-left:3px solid {CAT_ENERGY};padding:4px 0 4px 12px;margin-bottom:12px">
-      <div style="font-size:14px;font-weight:700;color:{TEXT}">
-        4.  Energy Consumption</div>
-      <div style="font-size:11px;color:{MUTED}">Electricity and fuel consumption (GJ)</div>
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 4 — Energy: Fuels
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid {CAT_ENERGY};padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">4. Energy — Fuels (GJ LHV unless noted)</b>
     </div>""", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    renew_elec    = c1.number_input("Renewable elec. purchased (GJ)", min_value=0.0,
-                                     value=_num("renew_elec_purchased"), step=100.0, format="%.0f", key=f"e_re{_yk}")
-    nonrenew_elec = c2.number_input("Non-renewable elec. (GJ)", min_value=0.0,
-                                     value=_num("nonrenew_elec_purchased"), step=100.0, format="%.0f", key=f"e_nre{_yk}")
-    self_gen      = c3.number_input("Self-generated elec. (GJ)", min_value=0.0,
-                                     value=_num("self_gen_elec"), step=100.0, format="%.0f", key=f"e_sg{_yk}")
-    c1b, c2b, c3b = st.columns(3)
-    nat_gas       = c1b.number_input("Natural Gas (GJ LHV)", min_value=0.0,
-                                      value=_num("nat_gas"), step=100.0, format="%.0f", key=f"e_ng{_yk}")
-    coal_sub      = c2b.number_input("Coal (GJ LHV)", min_value=0.0,
-                                      value=_num("coal_sub"), step=100.0, format="%.0f", key=f"e_coal{_yk}")
-    diesel        = c3b.number_input("Diesel (GJ LHV)", min_value=0.0,
-                                      value=_num("diesel"), step=100.0, format="%.0f", key=f"e_diesel{_yk}")
-    c1c, c2c, c3c = st.columns(3)
-    biomass       = c1c.number_input("Biomass (GJ LHV)", min_value=0.0,
-                                      value=_num("biomass"), step=100.0, format="%.0f", key=f"e_bio{_yk}")
-    purchased_steam  = c2c.number_input("Purchased Steam (GJ)", min_value=0.0,
-                                         value=_num("purchased_steam"), step=100.0, format="%.0f", key=f"e_ps{_yk}")
-    sold_electricity = c3c.number_input("Sold Electricity (GJ)", min_value=0.0,
-                                         value=_num("sold_electricity"), step=100.0, format="%.0f", key=f"e_se{_yk}")
-    # Live energy summary
-    _telec = renew_elec + nonrenew_elec + self_gen
-    _te    = _telec + purchased_steam + nat_gas + coal_sub + diesel + biomass - sold_electricity
-    _ekpi  = round(_te / max(production, 1), 2)
-    _rs    = round((renew_elec + self_gen) / max(_telec, 1) * 100, 1)
-    _ea, _eb, _ec, _ed = st.columns(4)
-    _ea.metric("Total Electricity (GJ)", f"{_telec:,.0f}")
-    _eb.metric("Total Energy (GJ)", f"{_te:,.0f}")
-    _ec.metric("Energy KPI (GJ/t)", f"{_ekpi:.2f}")
-    _ed.metric("Renewable Share", f"{_rs:.1f}%")
 
+    fc1, fc2, fc3 = st.columns(3)
+    nat_gas  = fc1.number_input("Natural gas (GJ)", min_value=0.0,
+        value=_num("nat_gas"), step=100.0, format="%.0f", key=f"e_ng{_yk}")
+    propane  = fc2.number_input("Propane (GJ)", min_value=0.0,
+        value=_num("propane"), step=100.0, format="%.0f", key=f"e_propane{_yk}")
+    fuel_oil = fc3.number_input("Fuel oil (GJ)", min_value=0.0,
+        value=_num("fuel_oil_heavy_a"), step=100.0, format="%.0f", key=f"e_foil{_yk}")
+
+    fc4, fc5, fc6 = st.columns(3)
+    diesel  = fc4.number_input("Diesel (GJ)", min_value=0.0,
+        value=_num("diesel"), step=100.0, format="%.0f", key=f"e_diesel{_yk}")
+    petrol  = fc5.number_input("Petrol (GJ)", min_value=0.0,
+        value=_num("petrol"), step=100.0, format="%.0f", key=f"e_petrol{_yk}")
+    biomass = fc6.number_input("Biomass (GJ)", min_value=0.0,
+        value=_num("biomass"), step=100.0, format="%.0f", key=f"e_bio{_yk}")
+
+    fc7, fc8, fc9 = st.columns(3)
+    waste_tires = fc7.number_input("Waste tires (metric t)", min_value=0.0,
+        value=_num("waste_tires_mt"), step=1.0, format="%.0f", key=f"e_wt{_yk}",
+        help="Converted to GJ internally")
+    lpg         = fc8.number_input("LPG (GJ)", min_value=0.0,
+        value=_num("lpg"), step=100.0, format="%.0f", key=f"e_lpg{_yk}")
+    other_fuels = fc9.number_input("Other fuels (GJ)", min_value=0.0,
+        value=_num("other_fuels"), step=100.0, format="%.0f", key=f"e_other{_yk}")
+
+    # Coal with expandable breakdown
+    with st.expander("🪨 Coal detail (expand to enter breakdown)", expanded=False):
+        cc1, cc2, cc3 = st.columns(3)
+        coal_sub_bit  = cc1.number_input("Sub-bituminous coal (GJ)", min_value=0.0,
+            value=_num("", 0.0, "coal_sub_bituminous"), step=100.0, format="%.0f", key=f"e_csub{_yk}")
+        coal_brown    = cc2.number_input("Brown coal briquettes (GJ)", min_value=0.0,
+            value=_num("", 0.0, "coal_brown_briquettes"), step=100.0, format="%.0f", key=f"e_cbrown{_yk}")
+        coal_other    = cc3.number_input("Other bituminous coal (GJ)", min_value=0.0,
+            value=_num("", 0.0, "coal_other_bituminous"), step=100.0, format="%.0f", key=f"e_cother{_yk}")
+        coal_detail_total = coal_sub_bit + coal_brown + coal_other
+        st.info(f"Coal breakdown total: **{coal_detail_total:,.0f} GJ** — enter total below if not using breakdown")
+
+    coal_total = st.number_input("Total coal (GJ) — enter directly or sum from breakdown above",
+        min_value=0.0,
+        value=max(_num("coal_sub"), coal_sub_bit + coal_brown + coal_other),
+        step=100.0, format="%.0f", key=f"e_coal{_yk}")
+
+    # Live energy totals
+    _waste_tire_gj = waste_tires * 28.0   # approx GJ per tonne waste tires
+    total_energy_live = (total_elec + purchased_steam + nat_gas + coal_total + propane +
+                         fuel_oil + diesel + petrol + biomass + _waste_tire_gj + lpg +
+                         other_fuels - sold_steam - sold_electricity)
+    energy_kpi_live  = round(total_energy_live / max(production, 1), 4)
+    renew_share_live = round((renew_elec + self_gen) / max(total_elec, 1) * 100, 1)
+
+    em1, em2, em3, em4 = st.columns(4)
+    em1.metric("Total Electricity (GJ)", f"{total_elec:,.0f}")
+    em2.metric("Total Energy (GJ)", f"{total_energy_live:,.0f}")
+    em3.metric("Energy KPI (GJ/t)", f"{energy_kpi_live:.4f}")
+    em4.metric("Renewable Share", f"{renew_share_live:.1f}%")
     st.divider()
 
-    # ── Section 5: CO₂ ────────────────────────────────────────────────────────
-    st.markdown(f"""
-    <div style="border-left:3px solid {RED};padding:4px 0 4px 12px;margin-bottom:12px">
-      <div style="font-size:14px;font-weight:700;color:{TEXT}">
-        5.  CO₂ Emissions — Scope 2 Steam</div>
-      <div style="font-size:11px;color:{MUTED}">
-        Scope 1 auto-calculated from fuel inputs. Enter Scope 2 steam separately.</div>
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 5 — CO₂ Emissions
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid {RED};padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">5. CO₂ Emissions</b>
+      <div style="font-size:11px;color:{MUTED}">Scope 1 auto-calculated from fuels. Enter Scope 2 steam manually.</div>
     </div>""", unsafe_allow_html=True)
-    _cc1, _cc2 = st.columns([2, 2])
-    co2_scope2_steam = _cc1.number_input("CO₂ Scope 2 Steam (tCO₂)", min_value=0.0,
-                                          value=_num("co2_scope2_steam"), step=10.0,
-                                          format="%.0f", key=f"e_s2s{_yk}")
-    from formula_engine import EF as _EF, GJ_TO_MWH as _G2M, _DEFAULT_SCOPE2_ELEC_EF as _S2EF
-    _s1 = (nat_gas*_EF["Natural Gas"] + coal_sub*_EF["Coal"]
-           + diesel*_EF["Diesel"] + biomass*_EF["Biomass"])
-    _s2 = co2_scope2_steam + (nonrenew_elec * _G2M) * _S2EF
-    _co2t = _s1 + _s2
-    _cc2.metric("CO₂ KPI (t/t)", f"{round(_co2t / max(production, 1), 3):.3f}")
-    _ca, _cb, _ccc = st.columns(3)
-    _ca.metric("Scope 1 (tCO₂)", f"{_s1:,.0f}")
-    _cb.metric("Scope 2 (tCO₂)", f"{_s2:,.0f}")
-    _ccc.metric("Total CO₂ (tCO₂)", f"{_co2t:,.0f}")
 
+    # Scope 1 auto from fuels
+    _s1_ng   = nat_gas      * _EF.get("Natural Gas", 0.0561)
+    _s1_coal = coal_total   * _EF.get("Coal",        0.0946)
+    _s1_prop = propane      * _EF.get("Propane",     0.0631)
+    _s1_foil = fuel_oil     * _EF.get("Fuel Oil",    0.0745)
+    _s1_dies = diesel       * _EF.get("Diesel",      0.0741)
+    _s1_pet  = petrol       * _EF.get("Petrol",      0.0693)
+    _s1_wt   = _waste_tire_gj * _EF.get("Waste Tires", 0.085)
+    _s1_lpg  = lpg          * _EF.get("LPG",         0.0639)
+    _s1_oth  = other_fuels  * _EF.get("Other",       0.075)
+    scope1_total = _s1_ng + _s1_coal + _s1_prop + _s1_foil + _s1_dies + _s1_pet + _s1_wt + _s1_lpg + _s1_oth
+
+    # Show Scope 1 breakdown
+    with st.expander("📊 Scope 1 breakdown by fuel (auto-calculated)", expanded=False):
+        sb1,sb2,sb3 = st.columns(3)
+        sb1.metric("Natural Gas",  f"{_s1_ng:,.1f} tCO₂")
+        sb2.metric("Coal",         f"{_s1_coal:,.1f} tCO₂")
+        sb3.metric("Propane",      f"{_s1_prop:,.1f} tCO₂")
+        sb4,sb5,sb6 = st.columns(3)
+        sb4.metric("Fuel Oil",     f"{_s1_foil:,.1f} tCO₂")
+        sb5.metric("Diesel",       f"{_s1_dies:,.1f} tCO₂")
+        sb6.metric("Petrol",       f"{_s1_pet:,.1f} tCO₂")
+        sb7,sb8,sb9 = st.columns(3)
+        sb7.metric("Waste Tires",  f"{_s1_wt:,.1f} tCO₂")
+        sb8.metric("LPG",          f"{_s1_lpg:,.1f} tCO₂")
+        sb9.metric("Other",        f"{_s1_oth:,.1f} tCO₂")
+
+    # Scope 2 inputs
+    co2s2_col1, co2s2_col2 = st.columns(2)
+    co2_scope2_steam = co2s2_col1.number_input("CO₂ Scope 2 — purchased steam (tCO₂)", min_value=0.0,
+        value=_num("co2_scope2_steam"), step=10.0, format="%.0f", key=f"e_s2s{_yk}",
+        help="Provided by steam supplier")
+    scope2_elec_auto = (nonrenew_elec * _G2M) * _S2EF
+    co2s2_col2.metric("CO₂ Scope 2 — electricity (auto)", f"{scope2_elec_auto:,.1f} tCO₂",
+        help="Non-renewable electricity × grid emission factor")
+
+    scope2_total = co2_scope2_steam + scope2_elec_auto
+    co2_total    = scope1_total + scope2_total
+    co2_kpi_live = round(co2_total / max(production, 1), 4)
+
+    cx1,cx2,cx3,cx4 = st.columns(4)
+    cx1.metric("Total CO₂ Scope 1 (tCO₂)",   f"{scope1_total:,.1f}")
+    cx2.metric("Total CO₂ Scope 2 (tCO₂)",   f"{scope2_total:,.1f}")
+    cx3.metric("Total CO₂ Scope 1+2 (tCO₂)", f"{co2_total:,.1f}")
+    cx4.metric("CO₂ KPI (tCO₂/t)",            f"{co2_kpi_live:.4f}")
     st.divider()
 
-    # ── Section 6: Waste ──────────────────────────────────────────────────────
-    st.markdown(f"""
-    <div style="border-left:3px solid {CAT_WASTE};padding:4px 0 4px 12px;margin-bottom:12px">
-      <div style="font-size:14px;font-weight:700;color:{TEXT}">
-        6.  Waste Management</div>
-      <div style="font-size:11px;color:{MUTED}">Total waste generated and recovered (metric t)</div>
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 6 — Waste
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid {CAT_WASTE};padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">6. Waste Management</b>
+      <div style="font-size:11px;color:{MUTED}">Metric tonnes</div>
     </div>""", unsafe_allow_html=True)
-    c1w, c2w = st.columns(2)
-    waste_total    = c1w.number_input("Total waste (metric t)", min_value=0.0,
-                                       value=_num("waste_total"), step=10.0, format="%.0f", key=f"e_wt{_yk}")
-    waste_recovery = c2w.number_input("Waste recovered (metric t)", min_value=0.0,
-                                       value=_num("waste_recovery"), step=10.0, format="%.0f", key=f"e_wr{_yk}")
-    _wrpct = round(waste_recovery / max(waste_total, 1) * 100, 1)
-    _wa, _wb, _wc = st.columns(3)
-    _wa.metric("Eliminated (T)", f"{waste_total - waste_recovery:,.0f}")
-    _wb.metric("Recovery Rate", f"{_wrpct:.1f}%")
-    _wc.metric("Waste KPI (kg/t)", f"{round(waste_total / max(production, 1) * 1000, 1):.1f}")
+
+    ww1, ww2 = st.columns(2)
+    waste_total    = ww1.number_input("Total amount of waste (metric t)", min_value=0.0,
+        value=_num("waste_total"), step=10.0, format="%.0f", key=f"e_wastot{_yk}")
+    waste_recovery = ww2.number_input("Amount sent to recovery (metric t)", min_value=0.0,
+        value=_num("waste_recovery"), step=10.0, format="%.0f", key=f"e_wasrec{_yk}")
+
+    waste_elim   = max(waste_total - waste_recovery, 0)
+    waste_rr_pct = round(waste_recovery / max(waste_total, 1) * 100, 1)
+    wa1,wa2,wa3 = st.columns(3)
+    wa1.metric("Sent to elimination (auto)", f"{waste_elim:,.0f} t")
+    wa2.metric("Recovery rate (auto)",       f"{waste_rr_pct:.1f}%")
+    wa3.metric("Waste intensity (kg/t)",     f"{waste_total/max(production,1)*1000:.1f}")
     if waste_recovery > waste_total > 0:
         st.error("⚠ Waste recovered cannot exceed total waste.")
+    st.divider()
 
-    # ── Submit button ─────────────────────────────────────────────────────────
-    st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 7 — Health & Safety
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid #0EA5E9;padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">7. Health & Safety</b>
+      <div style="font-size:11px;color:{MUTED}">Site-level audit coverage</div>
+    </div>""", unsafe_allow_html=True)
+
+    hs1, hs2, hs3 = st.columns(3)
+    hs_total_sites = hs1.number_input("Total sites (H&S)", min_value=0,
+        value=int(_num("", int(total_sites), "hs_external_audit") or int(total_sites)),
+        step=1, key=f"e_hstot{_yk}", help="Defaults to total sites above")
+    hs_external = hs2.number_input("Sites with external H&S audit", min_value=0,
+        value=int(_num("", 0, "hs_external_audit")), step=1, key=f"e_hsext{_yk}")
+    hs_internal = hs3.number_input("Sites with internal H&S audit", min_value=0,
+        value=int(_num("", 0, "hs_internal_audit")), step=1, key=f"e_hsint{_yk}")
+
+    hs_ext_pct = round(hs_external / max(hs_total_sites, 1) * 100, 1)
+    hs_int_pct = round(hs_internal / max(hs_total_sites, 1) * 100, 1)
+    ha1,ha2 = st.columns(2)
+    ha1.metric("External audit coverage (auto)", f"{hs_ext_pct:.1f}%")
+    ha2.metric("Internal audit coverage (auto)", f"{hs_int_pct:.1f}%")
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 8 — Diversity & Inclusion
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid #8B5CF6;padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">8. Diversity & Inclusion</b>
+    </div>""", unsafe_allow_html=True)
+
+    di1,di2,di3,di4 = st.columns(4)
+    total_employees = di1.number_input("Total employees", min_value=0,
+        value=int(_num("", 0, "total_employees")), step=10, key=f"e_emp{_yk}")
+    female_employees = di2.number_input("Total female employees", min_value=0,
+        value=int(_num("", 0, "female_employees")), step=1, key=f"e_femp{_yk}")
+    board_total  = di3.number_input("Total Board of Directors", min_value=0,
+        value=int(_num("", 0, "board_total")), step=1, key=f"e_bod{_yk}")
+    female_board = di4.number_input("Female Board of Directors", min_value=0,
+        value=int(_num("", 0, "female_board")), step=1, key=f"e_fbod{_yk}")
+
+    fem_emp_pct = round(female_employees / max(total_employees, 1) * 100, 1)
+    fem_bod_pct = round(female_board / max(board_total, 1) * 100, 1)
+    da1,da2 = st.columns(2)
+    da1.metric("% Female employees (auto)", f"{fem_emp_pct:.1f}%")
+    da2.metric("% Female BOD (auto)",       f"{fem_bod_pct:.1f}%")
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 9 — Science-Based Targets
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""<div style="border-left:4px solid #F59E0B;padding:4px 12px;margin:16px 0 8px">
+      <b style="font-size:15px;color:{TEXT}">9. Science-Based Targets (SBTs)</b>
+      <div style="font-size:11px;color:{MUTED}">Number of companies — enter 0 or 1 per field as applicable</div>
+    </div>""", unsafe_allow_html=True)
+
+    sb1,sb2,sb3,sb4 = st.columns(4)
+    sbt_total      = sb1.number_input("Total with SBT", min_value=0,
+        value=int(_num("", 0, "sbt_total")), step=1, key=f"e_sbttot{_yk}")
+    sbt_validated  = sb2.number_input("Validated", min_value=0,
+        value=int(_num("", 0, "sbt_validated")), step=1, key=f"e_sbtval{_yk}")
+    sbt_committed  = sb3.number_input("Committed", min_value=0,
+        value=int(_num("", 0, "sbt_committed")), step=1, key=f"e_sbtcom{_yk}")
+    sbt_non        = sb4.number_input("Non-committed", min_value=0,
+        value=int(max(_num("", 0, "sbt_total") - _num("", 0, "sbt_validated") - _num("", 0, "sbt_committed"), 0)),
+        step=1, key=f"e_sbtnon{_yk}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHANGE REASON (shown only when editing a PREVIOUS year's record)
+    # ══════════════════════════════════════════════════════════════════════════
+    change_reason = ""
+    if is_editing_prior:
+        st.divider()
+        st.markdown(f"""<div style="border-left:4px solid {AMBER};padding:4px 12px;margin:16px 0 8px">
+          <b style="font-size:14px;color:{TEXT}">⚠ Change Reason Required</b>
+          <div style="font-size:11px;color:{MUTED}">
+            Editing a previous year requires a reason. This will be sent to DSS for approval
+            before the comment is visible in the template.</div>
+        </div>""", unsafe_allow_html=True)
+        change_reason = st.text_area(
+            "Reason for updating this record",
+            placeholder="e.g. Corrected energy consumption figure after audit — original data included double-counted site",
+            key=f"entry_reason{_yk}", height=80,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUBMIT
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    if is_editing_prior and not change_reason.strip():
+        st.warning("Please enter a change reason before submitting.")
     submitted = st.button("✅  Submit & Save Data", type="primary",
                           use_container_width=True, key=f"entry_submit_btn{_yk}")
 
     if submitted:
+        if is_editing_prior and not change_reason.strip():
+            st.error("A change reason is required when editing a previous year.")
+            st.stop()
+
+        # Build TemplateInputs (fields that formula engine knows about)
         inp = TemplateInputs(
             company=company, year=sel_yr,
             total_sites=total_sites, iso_sites=iso_sites,
-            production=production, water_withdrawals=water_withdrawals,
-            renew_elec_purchased=renew_elec, nonrenew_elec_purchased=nonrenew_elec,
-            self_gen_elec=self_gen, purchased_steam=purchased_steam,
-            sold_electricity=sold_electricity, nat_gas=nat_gas,
-            coal_sub=coal_sub, diesel=diesel, biomass=biomass,
+            production=production,
+            water_withdrawals=water_intake,      # water_intake feeds formula engine
+            renew_elec_purchased=renew_elec,
+            nonrenew_elec_purchased=nonrenew_elec,
+            self_gen_elec=self_gen,
+            purchased_steam=purchased_steam,
+            sold_electricity=sold_electricity,
+            sold_steam=sold_steam,
+            nat_gas=nat_gas, coal_sub=coal_total, propane=propane,
+            fuel_oil_heavy_a=fuel_oil, diesel=diesel, petrol=petrol,
+            biomass=biomass, waste_tires_mt=waste_tires,
+            lpg=lpg, other_fuels=other_fuels,
             co2_scope2_steam=co2_scope2_steam,
             waste_total=waste_total, waste_recovery=waste_recovery,
         )
         out = calculate(inp)
 
-        # 1. Update session state fully — both old step_data dict AND new _codata_inp
-        new_step_data = {
-            fld: getattr(inp, fld)
-            for fld in _VALID_TEMPLATE_FIELDS
+        # Save supplementary fields
+        supp_data = {
+            "stress_water_withdrawal":   stress_wd,
+            "non_stress_water_withdrawal": non_stress_wd,
+            "coal_sub_bituminous":       coal_sub_bit,
+            "coal_brown_briquettes":     coal_brown,
+            "coal_other_bituminous":     coal_other,
+            "hs_external_audit":         hs_external,
+            "hs_internal_audit":         hs_internal,
+            "total_employees":           total_employees,
+            "female_employees":          female_employees,
+            "board_total":               board_total,
+            "female_board":              female_board,
+            "sbt_total":                 sbt_total,
+            "sbt_validated":             sbt_validated,
+            "sbt_committed":             sbt_committed,
+            "sbt_non_committed":         sbt_non,
         }
-        st.session_state.step_data          = new_step_data   # keeps get_current_outputs() in sync
-        st.session_state["_codata_inp"]     = inp             # used by render_template_table
+        _save_supplementary(company, sel_yr, supp_data)
+
+        # Save change reason for modified fields (if editing previous year)
+        if is_editing_prior and change_reason.strip():
+            _save_change_comment(company, sel_yr, "SUBMISSION", "Data Submission",
+                                 old_val="(previous values)", new_val="(updated values)",
+                                 reason=change_reason.strip())
+
+        # Save to master CSV via standard mechanism
+        new_step_data = {fld: getattr(inp, fld) for fld in _VALID_TEMPLATE_FIELDS}
+        st.session_state.step_data          = new_step_data
+        st.session_state["_codata_inp"]     = inp
         st.session_state["_codata_out"]     = out
         st.session_state.reporting_company  = company
         st.session_state.reporting_year     = sel_yr
@@ -1558,11 +1975,11 @@ def page_entry():
         for fld in _VALID_TEMPLATE_FIELDS:
             st.session_state[fld] = getattr(inp, fld)
 
-        # 2. Save → master CSV + parquet version + sync TIP files + updates _CONSOLIDATED_DF global
         msg = _save_submission_to_csv(inp, out)
         st.session_state["_last_save_msg"] = msg
+        if is_editing_prior and change_reason.strip():
+            st.session_state["_last_save_msg"] += " · Change reason submitted for DSS review."
         st.session_state.page = "my_records"
-        # Clear persisted selectbox key so My Records opens on the submitted year
         st.session_state.pop("myrec_year", None)
         st.rerun()
 
@@ -2312,7 +2729,7 @@ def page_analysis():
     C = {
         "navy":"#0A2240","red":"#C8102E","green":"#00916E","blue":"#1D4ED8",
         "teal":"#0891B2","amber":"#D97706","purple":"#7C3AED","coral":"#EA580C",
-        "gray":"#6B7280","grid":"#F3F4F6","bg":"#FFFFFF",
+        "gray":"#6B7280","grid":"#e6eaed","bg":"#f5f4f2",
     }
     PALETTE_10 = ["#C8102E","#0A2240","#00916E","#1D4ED8","#D97706",
                   "#7C3AED","#0891B2","#EA580C","#059669","#DB2777"]
@@ -2322,10 +2739,10 @@ def page_analysis():
             title=dict(text=title, font=dict(size=13, color=C["navy"])),
             height=height, margin=dict(l=10,r=10,t=40,b=30),
             plot_bgcolor=C["bg"], paper_bgcolor=C["bg"],
-            xaxis=dict(gridcolor=C["grid"], tickfont=dict(size=10)),
-            yaxis=dict(gridcolor=C["grid"], tickfont=dict(size=10)),
+            xaxis=dict(gridcolor=C["grid"], showline=True, linecolor="#9aa1a9", tickfont=dict(size=12, color="#6f7882")),
+            yaxis=dict(gridcolor=C["grid"], showline=True, linecolor="#9aa1a9", tickfont=dict(size=12, color="#6f7882")),
             legend=dict(orientation="h" if legend_h else "v",
-                        y=1.12 if legend_h else 1, font=dict(size=10)),
+                        y=-0.22 if legend_h else 1, font=dict(size=12, color="#6f7882")),
             hovermode="x unified",
         )
         base.update(kw)
@@ -2511,38 +2928,38 @@ def page_analysis():
     def _tlayout(title="", h=330, r=65, show_legend=True, leg_y=-0.24):
         return dict(
             title=dict(text=f"<b>{title}</b>",
-                       font=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"), x=0),
+                       font=dict(size=14, color="#2a2825", family="Arial, sans-serif"), x=0),
             height=h, margin=dict(l=55, r=r, t=50, b=60),
-            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#f5f4f2", paper_bgcolor="#f5f4f2",
             xaxis=dict(
-                showgrid=False, linecolor="#999", linewidth=1.2,
+                showgrid=False, linecolor="#9aa1a9", linewidth=1.2,
                 showline=True, mirror=False,
-                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                tickfont=dict(size=12, color="#6f7882", family="Arial"),
                 tickangle=0,
                 type="category",
             ),
             yaxis=dict(
-                showgrid=True, gridcolor="rgba(0,0,0,0.07)", zeroline=False,
-                showline=True, linecolor="#999", linewidth=1.2,
-                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                showgrid=True, gridcolor="#e6eaed", zeroline=False,
+                showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                tickfont=dict(size=12, color="#6f7882", family="Arial"),
                 showticklabels=True,
-                autorange=True,           # ensures top of chart has breathing room
+                autorange=True,
             ),
             legend=dict(orientation="h", x=0.5, xanchor="center", y=leg_y,
-                        font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
+                        font=dict(size=12, color="#6f7882"), bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified", showlegend=show_legend,
         )
 
     def _y2(label=""):
-        """Right Y-axis — fully visible, properly sized."""
+        """Right Y-axis — TIP report styling."""
         return dict(
-            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            tickfont=dict(size=12, color="#6f7882", family="Arial"),
             showgrid=False, zeroline=False,
-            showline=True, linecolor="#999", linewidth=1.2,
+            showline=True, linecolor="#9aa1a9", linewidth=1.2,
             showticklabels=True,
             autorange=True,
             title=dict(text=f"<b>{label}</b>" if label else "",
-                       font=dict(size=12, color="#333", family="Arial")),
+                       font=dict(size=12, color="#6f7882", family="Arial")),
         )
 
     def _omk(col, sz=9):
@@ -2551,65 +2968,97 @@ def page_analysis():
                     line=dict(color=col, width=2))
 
 
-    def _dual(xs, bv, bl, bc, lv, ll, lc, title="", h=330,
+    def _dual(xs, bv, bl, bc, lv, ll, lc, title="", h=430,
               bfmt=".1f", lfmt=".2f", byt="", lyt=""):
-        """Dual-axis bar (left) + line (right).
-        TIP report style:
-        - Bar value centred vertically in the MIDDLE of the bar (clearly readable)
-        - Line value alternates top/bottom near marker (never inside bar)
-        - Right Y-axis fully visible; wide right margin prevents label clipping
+        """Dual-axis bar (left y) + line (right y).
+        TIP Annual Report style: values printed in two rows BELOW the x-axis.
+        Row 1 (paper y≈0.21): bar label (left) + bar values per year
+        Row 2 (paper y≈0.10): line label (left) + line values per year
+        Plot area occupies the top 68% of the figure (domain [0.42, 1.0]).
         """
+        n     = len(xs)
+        x_idx = list(range(n))
+
+        def _fv(v, fmt):
+            if v is None: return ""
+            try:
+                fv = float(v)
+                return "" if fv != fv else format(fv, fmt)
+            except Exception:
+                return ""
+
         fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-        # ── Bar trace — value centred in bar middle ────────────────────────────
-        max_bv = max((v for v in bv if v is not None and v == v), default=1) or 1
-        bar_texts = [
-            f"<b>{v:{bfmt}}</b>" if (v is not None and v == v and abs(v) / max_bv > 0.12)
-            else ""
-            for v in bv
-        ]
+        # ── Bar trace (no inline text — values go below x-axis) ──────────────
         fig.add_trace(go.Bar(
-            x=xs, y=bv, name=bl, marker_color=bc, marker_line_width=0, width=0.5,
-            text=bar_texts,
-            textposition="inside",
-            insidetextanchor="middle",          # ← centred in the bar
-            textfont=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"),
+            x=x_idx, y=bv, name=bl,
+            marker_color=bc, marker_line_width=0, width=0.52,
             hovertemplate=f"{bl}: %{{y:{bfmt}}}<extra></extra>",
             cliponaxis=False,
         ), secondary_y=False)
 
-        # ── Line trace — values alternate above/below marker ─────────────────
-        n = len(lv)
-        line_texts = [f"{v:{lfmt}}" if v is not None and v == v else "" for v in lv]
-        text_pos   = ["top center" if i % 2 == 0 else "bottom center" for i in range(n)]
+        # ── Line trace (no inline text) ───────────────────────────────────────
         fig.add_trace(go.Scatter(
-            x=xs, y=lv, name=ll, mode="lines+markers+text",
-            line=dict(color=lc, width=2.5), marker=_omk(lc, 10),
-            text=line_texts,
-            textposition=text_pos,
-            textfont=dict(size=12, color="#1C2E3F", family="Arial, sans-serif"),
+            x=x_idx, y=lv, name=ll,
+            mode="lines",                      # no markers — removes top-left circle
+            line=dict(color=lc, width=2.2),
             hovertemplate=f"{ll}: %{{y:{lfmt}}}<extra></extra>",
             cliponaxis=False,
         ), secondary_y=True)
 
-        lay = _tlayout(title, h, r=100)
-        # Add 20% headroom above max bar so bar labels are never clipped
+        lay = _tlayout(title, h, r=115)
+        lay["showlegend"] = False   # annotations serve as legend
+
+        # Headroom above max bar
         valid_bv = [v for v in bv if v is not None and v == v]
         if valid_bv:
             lay["yaxis"]["range"] = [0, max(valid_bv) * 1.22]
             lay["yaxis"].pop("autorange", None)
         lay["yaxis"]["title"] = dict(
             text=f"<b>{byt}</b>" if byt else "",
-            font=dict(size=12, color="#333", family="Arial, sans-serif"),
+            font=dict(size=12, color="#6f7882", family="Arial"),
         )
+
+        # ── Domain: top 68% for chart, bottom 32% for annotation rows ────────
+        lay["yaxis"]["domain"]  = [0.42, 1.0]
         lay["yaxis2"] = _y2(lyt)
+        lay["yaxis2"]["domain"] = [0.42, 1.0]
+
+        # x-axis: numeric indices + year text labels, 18% left gap for y-label
+        lay["xaxis"].update(dict(
+            domain=[0.18, 1.0],
+            tickmode="array",
+            tickvals=x_idx,
+            ticktext=[str(x) for x in xs],
+            type="linear",
+        ))
         lay["margin"]["t"] = 55
-        lay["margin"]["r"] = 115
+        lay["margin"]["b"] = 30
+
         fig.update_layout(**lay)
-        fig.update_yaxes(showticklabels=True, showline=True, linecolor="#999")
+        fig.update_yaxes(showticklabels=True, showline=True, linecolor="#9aa1a9")
+
+        # ── Annotation rows below x-axis ─────────────────────────────────────
+        fig.add_annotation(x=0.01, y=0.28, xref="paper", yref="paper",
+            text=f"■ {bl}", showarrow=False,
+            font=dict(size=12, color=bc, family="Arial"),
+            align="left", xanchor="left")
+        fig.add_annotation(x=0.01, y=0.13, xref="paper", yref="paper",
+            text=f"—○— {ll}", showarrow=False,
+            font=dict(size=12, color=lc, family="Arial"),
+            align="left", xanchor="left")
+        for i in x_idx:
+            fig.add_annotation(x=i, y=0.28, xref="x", yref="paper",
+                text=_fv(bv[i] if i < len(bv) else None, bfmt),
+                showarrow=False, font=dict(size=11, color="#6f7882", family="Arial"),
+                align="center")
+            fig.add_annotation(x=i, y=0.13, xref="x", yref="paper",
+                text=_fv(lv[i] if i < len(lv) else None, lfmt),
+                showarrow=False, font=dict(size=11, color="#6f7882", family="Arial"),
+                align="center")
         return fig
 
-    def _stack100(xs, traces, title="", h=330):
+    def _stack100(xs, traces, title="", h=430):
         """100% stacked bar. Text colour chosen per bar colour. Larger, bold labels."""
         fig = go.Figure()
         _dark = ("#2D4A5A", "#7BAF74", "#E0935A", "#9FB8C5")
@@ -2620,7 +3069,7 @@ def page_analysis():
                 text=[f"<b>{v:.1f}%</b>" if v and v > 6 else "" for v in vals],
                 textposition="inside",
                 insidetextanchor="middle",
-                textfont=dict(size=12, color=tc_col, family="Arial, sans-serif"),
+                textfont=dict(size=13, color=tc_col, family="Arial, sans-serif"),
                 hovertemplate=f"{lbl}: %{{y:.1f}}%<extra></extra>",
             ))
         lay = _tlayout(title, h)
@@ -2641,7 +3090,7 @@ def page_analysis():
                 x=xs, y=pct_vals, name=lbl, marker_color=bc, marker_line_width=0,
                 text=bold_txts, textposition="inside",
                 insidetextanchor="middle",
-                textfont=dict(size=12, color=tc_col, family="Arial, sans-serif"),
+                textfont=dict(size=13, color=tc_col, family="Arial, sans-serif"),
                 hovertemplate=f"{lbl}: %{{y:.1f}}%<extra></extra>",
             ))
         lay = _tlayout(title, h)
@@ -2651,7 +3100,7 @@ def page_analysis():
         fig.update_layout(**lay)
         return fig
 
-    def _dline(xs, s1v, s1l, s1c, s2v, s2l, s2c, title="", h=300,
+    def _dline(xs, s1v, s1l, s1c, s2v, s2l, s2c, title="", h=430,
                s1f=".1f", s2f=".1f", yt="", s2yt="", right_y=False):
         """Dual-line chart with open-circle markers. Larger labels, alternating positions."""
         def _line_txt(vals, fmt):
@@ -2664,18 +3113,18 @@ def page_analysis():
         if right_y:
             fig = make_subplots(specs=[[{"secondary_y": True}]])
             fig.add_trace(go.Scatter(x=xs, y=s1v, name=s1l,
-                mode="lines+markers+text",
-                line=dict(color=s1c, width=2.5), marker=_omk(s1c, 10),
+                mode="lines+text",
+                line=dict(color=s1c, width=2.5),
                 text=_line_txt(s1v, s1f),
                 textposition=_alt_pos(n),
-                textfont=dict(size=11, color="#1C2E3F", family="Arial, sans-serif"),
+                textfont=dict(size=12, color="#1C2E3F", family="Arial, sans-serif"),
             ), secondary_y=False)
             fig.add_trace(go.Scatter(x=xs, y=s2v, name=s2l,
-                mode="lines+markers+text",
-                line=dict(color=s2c, width=2.5), marker=_omk(s2c, 10),
+                mode="lines+text",
+                line=dict(color=s2c, width=2.5),
                 text=_line_txt(s2v, s2f),
                 textposition=_alt_pos(n),
-                textfont=dict(size=11, color="#1C2E3F", family="Arial, sans-serif"),
+                textfont=dict(size=12, color="#1C2E3F", family="Arial, sans-serif"),
             ), secondary_y=True)
             lay = _tlayout(title, h)
             lay["yaxis"]["title"]  = dict(text=yt, font=dict(size=10, color="#666"))
@@ -2685,18 +3134,18 @@ def page_analysis():
         else:
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=xs, y=s1v, name=s1l,
-                mode="lines+markers+text",
-                line=dict(color=s1c, width=2.5), marker=_omk(s1c, 10),
+                mode="lines+text",
+                line=dict(color=s1c, width=2.5),
                 text=_line_txt(s1v, s1f),
                 textposition=_alt_pos(n),
-                textfont=dict(size=11, color="#1C2E3F", family="Arial, sans-serif"),
+                textfont=dict(size=12, color="#1C2E3F", family="Arial, sans-serif"),
             ))
             fig.add_trace(go.Scatter(x=xs, y=s2v, name=s2l,
-                mode="lines+markers+text",
-                line=dict(color=s2c, width=2.5), marker=_omk(s2c, 10),
+                mode="lines+text",
+                line=dict(color=s2c, width=2.5),
                 text=_line_txt(s2v, s2f),
                 textposition=_alt_pos(n),
-                textfont=dict(size=11, color="#1C2E3F", family="Arial, sans-serif"),
+                textfont=dict(size=12, color="#1C2E3F", family="Arial, sans-serif"),
             ))
             lay = _tlayout(title, h)
             lay["yaxis"]["title"] = dict(text=yt, font=dict(size=10, color="#666"))
@@ -2874,9 +3323,9 @@ def page_analysis():
                             marker=_omk(TC["line_light"], 7)))
                         _f.add_trace(go.Scatter(x=yrs, y=_cv, name=client_co.split()[0],
                             mode="lines+markers+text", line=dict(color=TC["line_dark"], width=2.5),
-                            marker=_omk(TC["line_dark"]),
+                            marker=_omk(TC["line_dark"], 5),
                             text=[f"{v:.2f}" if v else "" for v in _cv],
-                            textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial")))
+                            textposition="top center", textfont=dict(size=13, color="#2a2825", family="Arial")))
                         lay = _tlayout("Energy intensity vs sector (GJ/t)", 280)
                         _f.update_layout(**lay)
                         st.plotly_chart(_f, use_container_width=True, key=_ck("ov03"))
@@ -2890,9 +3339,9 @@ def page_analysis():
                             marker=_omk(TC["line_light"], 7)))
                         _f2.add_trace(go.Scatter(x=yrs, y=_cv2, name=client_co.split()[0],
                             mode="lines+markers+text", line=dict(color=TC["line_dark"], width=2.5),
-                            marker=_omk(TC["line_dark"]),
+                            marker=_omk(TC["line_dark"], 5),
                             text=[f"{v:.3f}" if v else "" for v in _cv2],
-                            textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial")))
+                            textposition="top center", textfont=dict(size=13, color="#2a2825", family="Arial")))
                         lay2 = _tlayout("CO₂ intensity vs sector (tCO₂/t)", 280)
                         _f2.update_layout(**lay2)
                         st.plotly_chart(_f2, use_container_width=True, key=_ck("ov04"))
@@ -2957,32 +3406,74 @@ def page_analysis():
                 "Electricity from renewable sources (%)",
             ), use_container_width=True, key=_ck("e04"))
 
-        # When a company is selected: show that company's trend vs sector (all companies)
-        if is_dss_user and overlay_company and has_wide:
+        # Energy intensity trend vs sector — visible for all users with data
+        if has_wide:
             st.markdown("---")
-            st.markdown(f"##### {overlay_company} — energy intensity trend vs sector")
+            _co_label = overlay_company if overlay_company else "All TIP Companies"
+            st.markdown(f"##### {_co_label} — energy intensity trend vs sector")
+
             f_co = go.Figure()
-            # Sector average line
-            f_co.add_trace(go.Scatter(
-                x=yrs, y=energy_kpi, name="TIP Sector Avg",
-                mode="lines", line=dict(color=TC["line_light"], width=1.8, dash="dot"),
-                marker=_omk(TC["line_light"], 6),
-            ))
-            # Selected company line
-            _s_co = _co_series(overlay_company, "Total energy - KPI")
-            if _s_co is not None:
-                _co_vals = [float(v) if (v == v and v is not None) else None
-                            for v in _s_co.reindex(yrs_int).values]
+
+            if overlay_company:
+                # ── Selected company: show company line (bold) + sector avg (dotted) ──
+                _s_co = _co_series(overlay_company, "Total energy - KPI")
+                _co_vals = ([float(v) if (v == v and v is not None) else None
+                              for v in _s_co.reindex(yrs_int).values]
+                             if _s_co is not None else [None]*len(yrs))
+
+                # Sector avg (dotted, behind)
+                f_co.add_trace(go.Scatter(
+                    x=yrs, y=energy_kpi, name="TIP Sector Avg",
+                    mode="lines+markers",
+                    line=dict(color=TC["line_light"], width=1.6, dash="dot"),
+                    marker=_omk(TC["line_light"], 6),
+                ))
+                # Company line (bold, with value labels)
+                _alt = ["top center" if i % 2 == 0 else "bottom center"
+                        for i in range(len(yrs))]
                 f_co.add_trace(go.Scatter(
                     x=yrs, y=_co_vals, name=overlay_company.split()[0],
                     mode="lines+markers+text",
                     line=dict(color=TC["line_dark"], width=2.5),
-                    marker=_omk(TC["line_dark"]),
-                    text=[f"{v:.1f}" if v else "" for v in _co_vals],
-                    textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                    marker=_omk(TC["line_dark"], 5),
+                    text=[f"{v:.1f}" if v is not None else "" for v in _co_vals],
+                    textposition=_alt,
+                    textfont=dict(size=12, color="#2a2825", family="Arial"),
                 ))
-            lay_co = _tlayout(
-                f"Energy intensity (GJ/t) — {overlay_company.split()[0]} vs sector avg", 300)
+                _e_title = (f"Energy intensity (GJ/t) — "
+                            f"{overlay_company.split()[0]} vs sector avg")
+            else:
+                # ── All Companies: one light line per company + sector avg ──────────
+                _COMPANY_PALETTE = [
+                    "#B8CDD9","#7BAF74","#C8B49A","#E0935A","#9FB8C5",
+                    "#2D4A5A","#D4C5A9","#8FA5B5","#465c66","#cab6a5",
+                ]
+                for _ci, _co in enumerate(companies):
+                    _s = _co_series(_co, "Total energy - KPI")
+                    if _s is None: continue
+                    _v = [float(x) if (x == x and x is not None) else None
+                          for x in _s.reindex(yrs_int).values]
+                    f_co.add_trace(go.Scatter(
+                        x=yrs, y=_v, name=_co.split()[0],
+                        mode="lines+markers",
+                        line=dict(color=_COMPANY_PALETTE[_ci % len(_COMPANY_PALETTE)],
+                                  width=1.4),
+                        marker=_omk(_COMPANY_PALETTE[_ci % len(_COMPANY_PALETTE)], 5),
+                        opacity=0.7,
+                    ))
+                # Sector avg on top
+                f_co.add_trace(go.Scatter(
+                    x=yrs, y=energy_kpi, name="TIP Sector Avg",
+                    mode="lines+markers",
+                    line=dict(color=TC["line_dark"], width=2.4, dash="dot"),
+                    marker=_omk(TC["line_dark"], 7),
+                ))
+                _e_title = "Energy intensity (GJ/t) — all TIP companies"
+
+            lay_co = _tlayout(_e_title, 320)
+            lay_co["legend"] = dict(orientation="h", x=0.5, xanchor="center",
+                                    y=-0.22, font=dict(size=12, color="#6f7882"),
+                                    bgcolor="rgba(0,0,0,0)")
             f_co.update_layout(**lay_co)
             st.plotly_chart(f_co, use_container_width=True, key=_ck("e05"))
 
@@ -3010,14 +3501,14 @@ def page_analysis():
             f_sc.add_trace(go.Bar(x=yrs, y=plot_s1, name="Scope 1 — direct emissions",
                 marker_color=TC["bar_blue"], marker_line_width=0,
                 text=[f"{v:.2f}" if v else "" for v in plot_s1],
-                textposition="inside", insidetextanchor="middle", textfont=dict(size=12, color="#1C2E3F", family="Arial")))
+                textposition="inside", insidetextanchor="middle", textfont=dict(size=13, color="#2a2825", family="Arial")))
             f_sc.add_trace(go.Bar(x=yrs, y=plot_s2, name="Scope 2 — indirect emissions",
                 marker_color=TC["bar_blue2"], marker_line_width=0,
                 text=[f"{v:.2f}" if v else "" for v in plot_s2],
-                textposition="inside", insidetextanchor="middle", textfont=dict(size=12, color="white", family="Arial")))
-            lay_sc = _tlayout("CO₂ Scope 1 vs Scope 2 (Mt CO₂e)", 330)
+                textposition="inside", insidetextanchor="middle", textfont=dict(size=13, color="white", family="Arial")))
+            lay_sc = _tlayout("CO₂ Scope 1 vs Scope 2 (Mt CO₂e)", 430)
             lay_sc["barmode"] = "stack"
-            lay_sc["yaxis"]["title"] = dict(text="Mt CO₂e", font=dict(size=9))
+            lay_sc["yaxis"]["title"] = dict(text="Mt CO₂e", font=dict(size=11))
             f_sc.update_layout(**lay_sc)
             st.plotly_chart(f_sc, use_container_width=True, key=_ck("c02"))
 
@@ -3039,39 +3530,78 @@ def page_analysis():
                             text=[str(int(v)) if v is not None else "" for v in vals],
                             textposition="inside", insidetextanchor="middle", textfont=dict(size=13, family="Arial",
                                 color="white" if bc in (TC["bar_blue2"],TC["bar_green"]) else "#1C2E3F")))
-                lay8 = _tlayout("Members with science-based targets", 310)
+                lay8 = _tlayout("Members with science-based targets", 430)
                 lay8["barmode"] = "stack"
-                lay8["yaxis"]["title"] = dict(text="Number of TIP members", font=dict(size=9))
+                lay8["yaxis"]["title"] = dict(text="Number of TIP members", font=dict(size=11))
                 fig8.update_layout(**lay8)
                 st.plotly_chart(fig8, use_container_width=True, key=_ck("c03"))
         else:
             _no_data_msg("Science-based targets (SBT)",
                 "Operations — Manufacturing (CO₂ pathway)")
 
-        # When a company is selected: show that company's CO₂ trend vs sector
-        if is_dss_user and overlay_company and has_wide:
+        # CO₂ intensity trend vs sector — visible for all users with data
+        if has_wide:
             st.markdown("---")
-            st.markdown(f"##### {overlay_company} — CO₂ intensity trend vs sector")
+            _co_label2 = overlay_company if overlay_company else "All TIP Companies"
+            st.markdown(f"##### {_co_label2} — CO₂ intensity trend vs sector")
+
             f_cr = go.Figure()
-            f_cr.add_trace(go.Scatter(
-                x=yrs, y=co2_kpi, name="TIP Sector Avg",
-                mode="lines", line=dict(color=TC["line_light"], width=1.8, dash="dot"),
-                marker=_omk(TC["line_light"], 6),
-            ))
-            _s_co2 = _co_series(overlay_company, "Total CO2 - KPI")
-            if _s_co2 is not None:
-                _co2_vals = [float(v) if (v == v and v is not None) else None
-                             for v in _s_co2.reindex(yrs_int).values]
+
+            if overlay_company:
+                # Selected company: company line (bold) + sector avg (dotted)
+                _s_co2 = _co_series(overlay_company, "Total CO2 - KPI")
+                _co2_vals = ([float(v) if (v == v and v is not None) else None
+                               for v in _s_co2.reindex(yrs_int).values]
+                              if _s_co2 is not None else [None]*len(yrs))
+                f_cr.add_trace(go.Scatter(
+                    x=yrs, y=co2_kpi, name="TIP Sector Avg",
+                    mode="lines+markers",
+                    line=dict(color=TC["line_light"], width=1.6, dash="dot"),
+                    marker=_omk(TC["line_light"], 6),
+                ))
+                _alt2 = ["top center" if i % 2 == 0 else "bottom center"
+                         for i in range(len(yrs))]
                 f_cr.add_trace(go.Scatter(
                     x=yrs, y=_co2_vals, name=overlay_company.split()[0],
                     mode="lines+markers+text",
                     line=dict(color=TC["line_dark"], width=2.5),
-                    marker=_omk(TC["line_dark"]),
-                    text=[f"{v:.3f}" if v else "" for v in _co2_vals],
-                    textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                    marker=_omk(TC["line_dark"], 5),
+                    text=[f"{v:.3f}" if v is not None else "" for v in _co2_vals],
+                    textposition=_alt2,
+                    textfont=dict(size=12, color="#2a2825", family="Arial"),
                 ))
-            lay_cr = _tlayout(
-                f"CO₂ intensity (tCO₂/t) — {overlay_company.split()[0]} vs sector avg", 300)
+                _c_title = (f"CO₂ intensity (tCO₂/t) — "
+                            f"{overlay_company.split()[0]} vs sector avg")
+            else:
+                # All Companies: light line per company + bold sector avg
+                _CO2_PALETTE = [
+                    "#B8CDD9","#7BAF74","#C8B49A","#E0935A","#9FB8C5",
+                    "#2D4A5A","#D4C5A9","#8FA5B5","#465c66","#cab6a5",
+                ]
+                for _ci2, _co2 in enumerate(companies):
+                    _s2 = _co_series(_co2, "Total CO2 - KPI")
+                    if _s2 is None: continue
+                    _v2 = [float(x) if (x == x and x is not None) else None
+                           for x in _s2.reindex(yrs_int).values]
+                    f_cr.add_trace(go.Scatter(
+                        x=yrs, y=_v2, name=_co2.split()[0],
+                        mode="lines+markers",
+                        line=dict(color=_CO2_PALETTE[_ci2 % len(_CO2_PALETTE)], width=1.4),
+                        marker=_omk(_CO2_PALETTE[_ci2 % len(_CO2_PALETTE)], 5),
+                        opacity=0.7,
+                    ))
+                f_cr.add_trace(go.Scatter(
+                    x=yrs, y=co2_kpi, name="TIP Sector Avg",
+                    mode="lines+markers",
+                    line=dict(color=TC["line_dark"], width=2.4, dash="dot"),
+                    marker=_omk(TC["line_dark"], 7),
+                ))
+                _c_title = "CO₂ intensity (tCO₂/t) — all TIP companies"
+
+            lay_cr = _tlayout(_c_title, 320)
+            lay_cr["legend"] = dict(orientation="h", x=0.5, xanchor="center",
+                                    y=-0.22, font=dict(size=12, color="#6f7882"),
+                                    bgcolor="rgba(0,0,0,0)")
             f_cr.update_layout(**lay_cr)
             st.plotly_chart(f_cr, use_container_width=True, key=_ck("c04"))
 
@@ -3114,7 +3644,7 @@ def page_analysis():
                         ))
                 f_wt.add_trace(go.Scatter(x=yrs, y=water_kpi_v, name="Sector avg",
                     mode="lines", line=dict(color="#000", width=2, dash="dot")))
-                lay_wt = _tlayout("Water intensity by company vs sector avg (m³/t)", 330, r=12)
+                lay_wt = _tlayout("Water intensity by company vs sector avg (m³/t)", 430, r=12)
                 lay_wt["xaxis"]["type"] = "category"
                 f_wt.update_layout(**lay_wt)
                 st.plotly_chart(f_wt, use_container_width=True, key=_ck("w02"))
@@ -3122,13 +3652,12 @@ def page_analysis():
                 # No company selected: show sector trend only
                 f_wt2 = go.Figure()
                 f_wt2.add_trace(go.Scatter(x=yrs, y=water_kpi_v, name="Sector avg water intensity",
-                    mode="lines+markers+text",
+                    mode="lines+text",
                     line=dict(color=TC["line_dark"], width=2.5),
-                    marker=_omk(TC["line_dark"]),
                     text=[f"{v:.1f}" if v else "" for v in water_kpi_v],
-                    textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                    textposition="top center", textfont=dict(size=12, color="#2a2825", family="Arial"),
                 ))
-                lay_wt2 = _tlayout("Sector avg water intensity (m³/t)", 330, r=12)
+                lay_wt2 = _tlayout("Sector avg water intensity (m³/t)", 430, r=12)
                 lay_wt2["xaxis"]["type"] = "category"
                 lay_wt2["showlegend"] = False
                 f_wt2.update_layout(**lay_wt2)
@@ -3150,27 +3679,55 @@ def page_analysis():
             ), use_container_width=True, key=_ck("wst01"))
         with c2:
             # Waste recovery vs disposal stacked 100% — percentages inside bars
-            # Absolute tonnage table shown below (matches TIP report Fig 11 layout)
             st.plotly_chart(_stack100(
                 yrs,
-                # Order: recovery (beige, bottom) then disposal (dark, top) —
-                # matches TIP report where recovery is the dominant lower section
                 [(waste_recov_pct, "Sent for recovery (%)",  TC["bar_beige"]),
                  (waste_elim_pct,  "Sent for disposal (%)",  TC["bar_blue2"])],
                 "Waste sent for recovery vs disposal (%)",
             ), use_container_width=True, key=_ck("wst02"))
 
-            # ── Absolute tonnage table below chart (TIP report Fig 11 style) ──
-            # Build rows: label | yr1 | yr2 | ...
-            _hdr = "| Metric |" + "".join(f" {y} |" for y in yrs)
-            _sep = "| --- |" + " --- |" * len(yrs)
-            _rec_vals = "| Sent for recovery (t) |" + "".join(
-                f" {int(v):,} |" if v else " — |" for v in waste_recov_a)
-            _dis_vals = "| Sent for disposal (t) |" + "".join(
-                f" {int(max(t-r,0)):,} |" if (t and r) else " — |"
-                for t, r in zip(waste_total_v, waste_recov_a))
-            _table_md = "\n".join([_hdr, _sep, _rec_vals, _dis_vals])
-            st.markdown(_table_md, unsafe_allow_html=False)
+        # ── 5th chart: grouped bar — recovery vs disposal absolute tonnage ──────
+        _wt_xi   = list(range(len(yrs)))
+        _dis_abs = [int(max(t - r, 0)) if (t and r) else 0
+                    for t, r in zip(waste_total_v, waste_recov_a)]
+        fig_wabs = go.Figure()
+        fig_wabs.add_trace(go.Bar(
+            x=_wt_xi, y=waste_recov_a, name="Sent for recovery (t)",
+            marker_color="#7BAF74", marker_line_width=0, width=0.38,
+            customdata=[str(y) for y in yrs],
+            text=[f"{int(v):,}" if v else "" for v in waste_recov_a],
+            textposition="outside",
+            textfont=dict(size=11, color="#2a2825", family="Arial"),
+            hovertemplate="<b>%{customdata}</b><br>Recovery: %{y:,.0f} t<extra></extra>",
+        ))
+        fig_wabs.add_trace(go.Bar(
+            x=_wt_xi, y=_dis_abs, name="Sent for disposal (t)",
+            marker_color="#2D4A5A", marker_line_width=0, width=0.38,
+            customdata=[str(y) for y in yrs],
+            text=[f"{int(v):,}" if v else "" for v in _dis_abs],
+            textposition="outside",
+            textfont=dict(size=11, color="#2a2825", family="Arial"),
+            hovertemplate="<b>%{customdata}</b><br>Disposal: %{y:,.0f} t<extra></extra>",
+        ))
+        fig_wabs.update_layout(
+            barmode="group",
+            plot_bgcolor="#f5f4f2", paper_bgcolor="#f5f4f2",
+            height=370,
+            bargap=0.20, bargroupgap=0.06,
+            margin=dict(l=60, r=50, t=50, b=55),
+            title=dict(text="<b>Waste sent for recovery vs disposal (absolute tonnes)</b>",
+                       font=dict(size=14, color="#2a2825"), x=0),
+            xaxis=dict(tickmode="array", tickvals=_wt_xi, ticktext=[str(y) for y in yrs],
+                       showgrid=False, showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                       tickfont=dict(size=12, color="#6f7882"), zeroline=False),
+            yaxis=dict(title=dict(text="Tonnes", font=dict(size=12, color="#6f7882")),
+                       showgrid=True, gridcolor="#e6eaed", showline=True, linecolor="#9aa1a9",
+                       tickfont=dict(size=12, color="#6f7882"), zeroline=False),
+            legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.22,
+                        font=dict(size=12, color="#6f7882"), bgcolor="rgba(0,0,0,0)"),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_wabs, use_container_width=True, key=_ck("wabs"))
 
         c3, c4 = st.columns(2)
         with c3:
@@ -3771,8 +4328,10 @@ def page_benchmarking():
             hovertemplate=f"<b>You</b>: {your_val:.3f}<extra></extra>",
         ))
         fig.update_layout(**chart_layout_defaults(title, height=250, showlegend=False),
-                          xaxis=dict(title=dict(text=xlab), gridcolor="#F1F5F9"),
-                          yaxis=dict(title=dict(text=ylab), gridcolor="#F1F5F9"))
+                          xaxis=dict(title=dict(text=xlab, font=dict(size=12, color="#6f7882")),
+                                     showgrid=False, showline=True, linecolor="#9aa1a9"),
+                          yaxis=dict(title=dict(text=ylab, font=dict(size=12, color="#6f7882")),
+                                     gridcolor="#e6eaed", showline=True, linecolor="#9aa1a9"))
         apply_chart_animation(fig)
         return fig
 
@@ -3806,47 +4365,46 @@ def page_benchmarking():
             fig.add_trace(go.Scatter(
                 x=yr_str, y=[sec_q25.get(y) for y in yr_list],
                 mode="lines", name="Q1 (25th pct)",
-                line=dict(color="#94A3B8", width=1, dash="dot"),
+                line=dict(color="#9aa1a9", width=1, dash="dot"),
                 hovertemplate="Q1: %{y:.3f}<extra></extra>",
             ))
             fig.add_trace(go.Scatter(
                 x=yr_str, y=[sec_mean.get(y) for y in yr_list],
                 mode="lines", name="Sector Median",
-                line=dict(color="#64748B", width=1.5, dash="dashdot"),
+                line=dict(color="#6f7882", width=1.5, dash="dashdot"),
                 hovertemplate="Median: %{y:.3f}<extra></extra>",
             ))
             fig.add_trace(go.Scatter(
                 x=yr_str, y=[sec_q75.get(y) for y in yr_list],
                 mode="lines", name="Q3 (75th pct)",
-                line=dict(color="#94A3B8", width=1, dash="dot"),
+                line=dict(color="#9aa1a9", width=1, dash="dot"),
                 hovertemplate="Q3: %{y:.3f}<extra></extra>",
             ))
         # Company line — only years that exist in trend data
         co_y = [trend[y][kpi_key] for y in _ys_int if y in trend]
         fig.add_trace(go.Scatter(
-            x=ys_str, y=co_y, mode="lines+markers",
+            x=ys_str, y=co_y, mode="lines",
             name=company.split()[0],
-            line=dict(color=color, width=2.5),
-            marker=dict(size=6, color=color),
+            line=dict(color=color, width=2.2),
+            marker=dict(size=7, color="#f5f4f2", line=dict(color=color, width=2)),
             hovertemplate="%{y:.3f}<extra>" + company.split()[0] + "</extra>",
         ))
-        fig.update_layout(**chart_layout_defaults(label, height=270),
-                          hovermode="x unified",
+        fig.update_layout(**chart_layout_defaults(label, height=430),
                           yaxis=dict(
-                              gridcolor="#F1F5F9",
-                              tickfont=dict(size=12, color="#1C2E3F"),
-                              showline=True, linecolor="#999",
+                              gridcolor="#e6eaed",
+                              tickfont=dict(size=12, color="#6f7882", family="Arial"),
+                              showline=True, linecolor="#9aa1a9", linewidth=1.2,
                               showticklabels=True,
                           ),
                           yaxis2=dict(
-                              tickfont=dict(size=12, color="#1C2E3F"),
-                              showgrid=False, showline=True, linecolor="#999",
+                              tickfont=dict(size=12, color="#6f7882", family="Arial"),
+                              showgrid=False, showline=True, linecolor="#9aa1a9",
                               showticklabels=True,
                           ),
                           xaxis=dict(
-                              gridcolor="#F1F5F9", type="category",
-                              tickfont=dict(size=12, color="#1C2E3F"),
-                              showline=True, linecolor="#999",
+                              showgrid=False, type="category",
+                              tickfont=dict(size=12, color="#6f7882", family="Arial"),
+                              showline=True, linecolor="#9aa1a9", linewidth=1.2,
                               showticklabels=True,
                           ))
         apply_chart_animation(fig)
@@ -4137,35 +4695,6 @@ def page_benchmarking():
                 pass
             return None
 
-    _pdf_col, _ = st.columns([2, 4])
-    with _pdf_col:
-        _pdf_all = _full_bench_pdf()
-        if _pdf_all:
-            # Clear any previous error on success
-            st.session_state.pop("_pdf_bench_error", None)
-            st.download_button(
-                "⬇  Download Full Benchmarking Report (PDF)",
-                data=_pdf_all,
-                file_name=f"{company.replace(' ','_')}_Benchmarking_{rep_year}.pdf",
-                mime="application/pdf", key="dl_full_bench",
-                use_container_width=True, type="primary",
-            )
-        else:
-            _pdf_err = st.session_state.pop("_pdf_bench_error", "")
-            if _pdf_err:
-                st.error(
-                    f"⚠ PDF generation failed: {_pdf_err}\n\n"
-                    f"Install with the **same Python that runs Streamlit**: "
-                    f"`pip install reportlab matplotlib`",
-                    icon=None,
-                )
-            else:
-                st.warning(
-                    "⚠ PDF requires `reportlab` and `matplotlib`. "
-                    "Install with the **same Python** that runs Streamlit: "
-                    "`pip install reportlab matplotlib`",
-                    icon=None,
-                )
 
     # ── KPI Tabs ──────────────────────────────────────────────────────────────
     tab_co2, tab_energy, tab_elec, tab_water, tab_waste = st.tabs([
@@ -4183,64 +4712,137 @@ def page_benchmarking():
         "line_dark":  "#2D4A5A", "line_light": "#8FA5B5",
     }
 
-    def _blt(title="", h=330):
+    def _blt(title="", h=330, r=115):
+        """Benchmarking layout — TIP report design system."""
         return dict(
             title=dict(text=f"<b>{title}</b>",
-                       font=dict(size=14, color="#1C2E3F", family="Arial, sans-serif"), x=0),
-            height=h, margin=dict(l=55, r=110, t=50, b=60),
-            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                       font=dict(size=14, color="#2a2825", family="Arial, sans-serif"), x=0),
+            height=h, margin=dict(l=55, r=r, t=50, b=30),
+            plot_bgcolor="#f5f4f2", paper_bgcolor="#f5f4f2",
             xaxis=dict(
-                showgrid=False, linecolor="#999", linewidth=1.2,
+                showgrid=False, linecolor="#9aa1a9", linewidth=1.2,
                 showline=True, mirror=False,
-                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                tickfont=dict(size=12, color="#6f7882", family="Arial"),
                 tickangle=0, type="category",
             ),
             yaxis=dict(
-                showgrid=True, gridcolor="rgba(0,0,0,0.07)", zeroline=False,
-                showline=True, linecolor="#999", linewidth=1.2,
-                tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+                showgrid=True, gridcolor="#e6eaed", zeroline=False,
+                showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                tickfont=dict(size=12, color="#6f7882", family="Arial"),
                 showticklabels=True,
-                autorange=True,           # ensures top of chart has breathing room
+                autorange=True,
             ),
             legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.24,
-                        font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
+                        font=dict(size=12, color="#6f7882"), bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified", showlegend=True,
         )
 
     def _open_mk(col, sz=9):
         return dict(symbol="circle", size=sz, color="white", line=dict(color=col, width=2))
 
-    def _b_dbline(xs, bv, bl, bc, lv, ll, lc, title="", h=330,
+    def _b_dbline(xs, bv, bl, bc, lv, ll, lc, title="", h=430,
                   bfmt=".1f", lfmt=".2f", byt="", lyt=""):
+        """Dual-axis bar+line — TIP report style with values in two rows below x-axis.
+        Same pattern as _dual() in page_analysis:
+          Row 1 (paper y≈0.21): ■ bar label + bar value per year
+          Row 2 (paper y≈0.10): —○— line label + line value per year
+        Chart area occupies top 68% of figure (domain [0.42, 1.0]).
+        """
+        n     = len(xs)
+        x_idx = list(range(n))
+
+        def _fv(v, fmt):
+            if v is None: return ""
+            try:
+                fv = float(v)
+                return "" if fv != fv else format(fv, fmt)
+            except Exception:
+                return ""
+
         fig = _msp(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Bar(x=xs, y=bv, name=bl, marker_color=bc, marker_line_width=0,
-            text=[f"{v:{bfmt}}" if v is not None and v==v else "" for v in bv],
-            textposition="outside", textfont=dict(size=12, color="#1C2E3F", family="Arial"), width=0.5,
+
+        # ── Bar trace (no inline text — values go below x-axis) ──────────────
+        fig.add_trace(go.Bar(
+            x=x_idx, y=bv, name=bl,
+            marker_color=bc, marker_line_width=0, width=0.52,
+            hovertemplate=f"{bl}: %{{y:{bfmt}}}<extra></extra>",
+            cliponaxis=False,
         ), secondary_y=False)
-        fig.add_trace(go.Scatter(x=xs, y=lv, name=ll,
-            mode="lines+markers+text", line=dict(color=lc, width=2.5),
-            marker=_open_mk(lc),
-            text=[f"{v:{lfmt}}" if v is not None and v==v else "" for v in lv],
-            textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial"),
+
+        # ── Line trace (open-circle markers, no inline text) ─────────────────
+        fig.add_trace(go.Scatter(
+            x=x_idx, y=lv, name=ll,
+            mode="lines",                      # no markers — removes the visible circle
+            line=dict(color=lc, width=2.2),
+            hovertemplate=f"{ll}: %{{y:{lfmt}}}<extra></extra>",
+            cliponaxis=False,
         ), secondary_y=True)
-        lay = _blt(title, h)
-        lay["yaxis"]["title"] = dict(text=byt, font=dict(size=9, color="#666"))
-        lay["yaxis2"] = dict(
-            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
-            showgrid=False, zeroline=False,
-            showline=True, linecolor="#999", linewidth=1.2,
-            showticklabels=True,
-            title=dict(text=lyt, font=dict(size=11, color="#444")),
+
+        lay = _blt(title, h, r=115)
+        lay["showlegend"] = False   # annotations serve as legend
+
+        # Headroom: 20% above max bar so bars don't clip at domain top
+        valid_bv = [v for v in bv if v is not None and v == v]
+        if valid_bv:
+            lay["yaxis"]["range"] = [0, max(valid_bv) * 1.22]
+            lay["yaxis"].pop("autorange", None)
+        lay["yaxis"]["title"] = dict(
+            text=f"<b>{byt}</b>" if byt else "",
+            font=dict(size=12, color="#6f7882", family="Arial"),
         )
+
+        # ── Domain: top 68% for chart, bottom 32% for annotation rows ────────
+        lay["yaxis"]["domain"]  = [0.42, 1.0]
+        lay["yaxis2"] = dict(
+            tickfont=dict(size=12, color="#6f7882", family="Arial"),
+            showgrid=False, zeroline=False,
+            showline=True, linecolor="#9aa1a9", linewidth=1.2,
+            showticklabels=True, autorange=True, domain=[0.42, 1.0],
+            title=dict(text=f"<b>{lyt}</b>" if lyt else "",
+                       font=dict(size=12, color="#6f7882", family="Arial")),
+        )
+
+        # x-axis: numeric indices + year text labels, 18% left gap for y-label
+        lay["xaxis"].update(dict(
+            domain=[0.18, 1.0],
+            tickmode="array",
+            tickvals=x_idx,
+            ticktext=[str(x) for x in xs],
+            type="linear",
+        ))
+        lay["margin"]["b"] = 30
+
         fig.update_layout(**lay)
+        fig.update_yaxes(showticklabels=True, showline=True, linecolor="#9aa1a9")
+
+        # ── Annotation rows below x-axis ─────────────────────────────────────
+        # Left legend labels
+        fig.add_annotation(x=0.01, y=0.28, xref="paper", yref="paper",
+            text=f"■ {bl}", showarrow=False,
+            font=dict(size=12, color=bc, family="Arial"),
+            align="left", xanchor="left")
+        fig.add_annotation(x=0.01, y=0.13, xref="paper", yref="paper",
+            text=f"—○— {ll}", showarrow=False,
+            font=dict(size=12, color=lc, family="Arial"),
+            align="left", xanchor="left")
+        # Per-year values
+        for i in x_idx:
+            fig.add_annotation(x=i, y=0.28, xref="x", yref="paper",
+                text=_fv(bv[i] if i < len(bv) else None, bfmt),
+                showarrow=False, font=dict(size=11, color="#6f7882", family="Arial"),
+                align="center")
+            fig.add_annotation(x=i, y=0.13, xref="x", yref="paper",
+                text=_fv(lv[i] if i < len(lv) else None, lfmt),
+                showarrow=False, font=dict(size=11, color="#6f7882", family="Arial"),
+                align="center")
         return fig
 
-    def _b_stack100(xs, traces, title="", h=330):
+    def _b_stack100(xs, traces, title="", h=430):
         fig = go.Figure()
         for (vals, lbl, col) in traces:
             fig.add_trace(go.Bar(x=xs, y=vals, name=lbl, marker_color=col, marker_line_width=0,
                 text=[f"{v:.1f}%" if v and v>5 else "" for v in vals],
-                textposition="inside", textfont=dict(size=12, color="white", family="Arial"),
+                textposition="inside", textfont=dict(size=13, color="white", family="Arial"),
                 hovertemplate=f"{lbl}: %{{y:.1f}}%<extra></extra>"))
         lay = _blt(title, h)
         lay["barmode"] = "stack"
@@ -4249,27 +4851,27 @@ def page_benchmarking():
         fig.update_layout(**lay)
         return fig
 
-    def _b_dline(xs, s1v, s1l, s1c, s2v, s2l, s2c, title="", h=300,
+    def _b_dline(xs, s1v, s1l, s1c, s2v, s2l, s2c, title="", h=430,
                  s1f=".1f", s2f=".1f", yt="", s2yt="", right_y=False):
         fig = _msp(specs=[[{"secondary_y": True}]]) if right_y else go.Figure()
         kw1 = dict(x=xs, y=s1v, name=s1l, mode="lines+markers+text",
                    line=dict(color=s1c, width=2.5), marker=_open_mk(s1c),
                    text=[f"{v:{s1f}}" if v is not None else "" for v in s1v],
-                   textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial"))
+                   textposition="top center", textfont=dict(size=13, color="#2a2825", family="Arial"))
         kw2 = dict(x=xs, y=s2v, name=s2l, mode="lines+markers+text",
                    line=dict(color=s2c, width=2.5), marker=_open_mk(s2c),
                    text=[f"{v:{s2f}}" if v is not None else "" for v in s2v],
-                   textposition="top center", textfont=dict(size=12, color="#1C2E3F", family="Arial"))
+                   textposition="top center", textfont=dict(size=13, color="#2a2825", family="Arial"))
         if right_y:
             fig.add_trace(go.Scatter(**kw1), secondary_y=False)
             fig.add_trace(go.Scatter(**kw2), secondary_y=True)
             lay = _blt(title, h)
-            lay["yaxis"]["title"] = dict(text=yt, font=dict(size=9, color="#666"))
+            lay["yaxis"]["title"] = dict(text=yt, font=dict(size=11, color="#666"))
             lay["yaxis"]["ticksuffix"] = "%"
             lay["yaxis2"] = dict(
-            tickfont=dict(size=12, color="#1C2E3F", family="Arial"),
+            tickfont=dict(size=12, color="#6f7882", family="Arial"),
             showgrid=False, zeroline=False,
-            showline=True, linecolor="#999", linewidth=1.2,
+            showline=True, linecolor="#9aa1a9", linewidth=1.2,
             showticklabels=True,
             title=dict(text=s2yt, font=dict(size=11, color="#444")),
         )
@@ -4277,7 +4879,7 @@ def page_benchmarking():
             fig.add_trace(go.Scatter(**kw1))
             fig.add_trace(go.Scatter(**kw2))
             lay = _blt(title, h)
-            lay["yaxis"]["title"] = dict(text=yt, font=dict(size=9, color="#666"))
+            lay["yaxis"]["title"] = dict(text=yt, font=dict(size=11, color="#666"))
             lay["yaxis"]["ticksuffix"] = "%"
         fig.update_layout(**lay)
         return fig
@@ -4301,20 +4903,17 @@ def page_benchmarking():
             fig_sc.add_trace(go.Bar(x=_ys_str, y=s1v, name="Scope 1 (direct)",
                 marker_color=_TC["bar_blue"], marker_line_width=0,
                 text=[f"{v:.2f}" if v else "" for v in s1v],
-                textposition="inside", textfont=dict(size=12, color="white", family="Arial")))
+                textposition="inside", textfont=dict(size=13, color="white", family="Arial")))
             fig_sc.add_trace(go.Bar(x=_ys_str, y=s2v, name="Scope 2 (indirect)",
                 marker_color=_TC["bar_blue2"], marker_line_width=0,
                 text=[f"{v:.2f}" if v else "" for v in s2v],
-                textposition="inside", textfont=dict(size=12, color="white", family="Arial")))
-            lay_sc = _blt("CO₂ Scope 1 vs Scope 2 trend (tCO₂)", 310)
+                textposition="inside", textfont=dict(size=13, color="white", family="Arial")))
+            lay_sc = _blt("CO₂ Scope 1 vs Scope 2 trend (tCO₂)", 430)
             lay_sc["barmode"] = "stack"
-            lay_sc["yaxis"]["title"] = dict(text="tCO₂", font=dict(size=9))
+            lay_sc["yaxis"]["title"] = dict(text="tCO₂", font=dict(size=11))
             fig_sc.update_layout(**lay_sc)
             st.plotly_chart(fig_sc, use_container_width=True, key=_chart_key(company, rep_year, "4"))
-        _pdf_download_btn("CO2", "dl_bench_co2", [
-            ("line_vs_sector", "Total CO2 - KPI", "co2_kpi",
-             "CO₂ Intensity Trend vs Sector", _TC["bar_blue2"]),
-        ])
+
 
     with tab_energy:
         st.caption("Energy intensity & consumption mix — Q1/Median/Q3 reference bands shown")
@@ -4340,12 +4939,9 @@ def page_benchmarking():
                 if any(p>0 for p in pcts):
                     traces_e.append((pcts, flbl, fcol))
             st.plotly_chart(_b_stack100(_ys_str, traces_e,
-                "Energy mix (%)", 310),
+                "Energy mix (%)", 430),
                 use_container_width=True, key=_chart_key(company, rep_year, "6"))
-        _pdf_download_btn("Energy", "dl_bench_energy", [
-            ("line_vs_sector", "Total energy - KPI", "energy_kpi",
-             "Energy Intensity vs Sector (GJ/t)", _TC["bar_blue2"]),
-        ])
+
 
     with tab_elec:
         st.caption("Electricity from renewable sources — company trend vs sector")
@@ -4360,13 +4956,13 @@ def page_benchmarking():
                 name="Renewable electricity (GJ)", marker_color=_TC["bar_blue2"],
                 marker_line_width=0,
                 text=[f"{v:.1f}%" if v else "" for v in renew_pct_co],
-                textposition="inside", textfont=dict(size=12, color="white", family="Arial")))
+                textposition="inside", textfont=dict(size=13, color="white", family="Arial")))
             fig_e6.add_trace(go.Bar(x=_ys_str, y=nonren_pct_co,
                 name="Non-renewable electricity (GJ)", marker_color=_TC["bar_sand"],
                 marker_line_width=0,
                 text=[f"{v:.1f}%" if v else "" for v in nonren_pct_co],
-                textposition="inside", textfont=dict(size=12, color="#1C2E3F", family="Arial")))
-            lay_e6 = _blt("Electricity from renewable sources (%)", 310)
+                textposition="inside", textfont=dict(size=13, color="#2a2825", family="Arial")))
+            lay_e6 = _blt("Electricity from renewable sources (%)", 430)
             lay_e6["barmode"] = "stack"
             lay_e6["yaxis"]["ticksuffix"] = "%"
             lay_e6["yaxis"]["range"] = [0,100]
@@ -4377,10 +4973,7 @@ def page_benchmarking():
                 _trend_vs_sector("renew_pct","Renewable_Electricity_Share_%",
                     "Renewable Electricity Share vs Sector (%)", _TC["bar_green"]),
                 use_container_width=True, key=_chart_key(company, rep_year, "8"))
-        _pdf_download_btn("Electricity", "dl_bench_elec", [
-            ("line_vs_sector", "Renewable_Electricity_Share_%", "renew_pct",
-             "Renewable Electricity Share vs Sector (%)", _TC["bar_green"]),
-        ])
+
 
     with tab_water:
         st.caption("Water withdrawals & intensity — company trend vs sector Q1/Median/Q3")
@@ -4401,10 +4994,7 @@ def page_benchmarking():
                 title="Water withdrawals & intensity",
                 byt="Million m³", lyt="m³/t", bfmt=".2f", lfmt=".2f",
             ), use_container_width=True, key=_chart_key(company, rep_year, "10"))
-        _pdf_download_btn("Water", "dl_bench_water", [
-            ("line_vs_sector", "Water intake - KPI", "water_kpi",
-             "Water Intensity Trend vs Sector", _TC["bar_blue2"]),
-        ])
+
 
     with tab_waste:
         st.caption("Waste recovery rate & volumes — company trend vs sector Q1/Median/Q3")
@@ -4426,11 +5016,31 @@ def page_benchmarking():
                 _ys_str,
                 [(wr_pct, "Sent for recovery (%)",  _TC["bar_beige"]),
                  (we_pct, "Sent for disposal (%)",  _TC["bar_blue2"])],
-                title="Waste recovery vs disposal (%)", h=310,
+                title="Waste recovery vs disposal (%)", h=430,
             ), use_container_width=True, key=_chart_key(company, rep_year, "12"))
-        _pdf_download_btn("Waste", "dl_bench_waste", [
-            ("waste_area", "Waste Recovery Rate vs Sector (%)"),
-        ])
+
+
+    # ── Full Benchmarking Report Download (replaces per-section buttons) ──────
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    _pdf_col2, _ = st.columns([2, 4])
+    with _pdf_col2:
+        _pdf_all2 = _full_bench_pdf()
+        if _pdf_all2:
+            st.download_button(
+                "⬇  Download Full Benchmarking Report (PDF)",
+                data=_pdf_all2,
+                file_name=f"{company.replace(' ','_')}_Benchmarking_{rep_year}.pdf",
+                mime="application/pdf", key="dl_full_bench_bottom",
+                use_container_width=True, type="primary",
+            )
+        else:
+            _pdf_err2 = st.session_state.pop("_pdf_bench_error", "")
+            if _pdf_err2:
+                st.error(
+                    f"⚠ PDF generation failed: {_pdf_err2}\n\n"
+                    f"Install with `pip install reportlab matplotlib`",
+                    icon=None,
+                )
 
 
 # ─────────────────────────────────────────────────────────
@@ -4597,6 +5207,42 @@ def page_verification():
         st.session_state["flags_resolved_real"] = set()
 
     resolved_set = st.session_state["flags_resolved_real"]
+
+    # ── Pending Change-Request Comments from clients ───────────────────────────
+    pending_comments = _load_comments(status="Pending")
+    if pending_comments:
+        st.markdown(f"""<div style="border-left:4px solid {AMBER};padding:6px 12px;
+          background:#FFFBEB;border-radius:4px;margin-bottom:12px">
+          <b>🔔 {len(pending_comments)} pending change request(s) from clients</b>
+          <div style="font-size:12px;color:{MUTED}">Review and approve/reject below. Approved comments will appear in red in the template.</div>
+        </div>""", unsafe_allow_html=True)
+        for idx_c, cmt in enumerate(pending_comments):
+            with st.expander(
+                f"🏢 {cmt['Company']} · {cmt['Year']} · submitted {cmt['SubmittedAt']}",
+                expanded=True
+            ):
+                cc1, cc2 = st.columns([3, 1])
+                with cc1:
+                    st.markdown(f"""
+                    **Field:** {cmt['FieldLabel']}
+                    **Reason given:** {cmt['Reason']}
+                    """)
+                with cc2:
+                    approve_key = f"approve_cmt_{idx_c}"
+                    reject_key  = f"reject_cmt_{idx_c}"
+                    if st.button("✅ Approve", key=approve_key, use_container_width=True, type="primary"):
+                        _update_comment_status(cmt['Company'], int(cmt['Year']),
+                                               cmt['FieldKey'], "Approved",
+                                               approved_by=st.session_state.get("username","DSS Analyst"))
+                        st.success(f"Approved — comment will now appear in {cmt['Company']} {cmt['Year']} template.")
+                        st.rerun()
+                    if st.button("❌ Reject", key=reject_key, use_container_width=True):
+                        _update_comment_status(cmt['Company'], int(cmt['Year']),
+                                               cmt['FieldKey'], "Rejected",
+                                               approved_by=st.session_state.get("username","DSS Analyst"))
+                        st.info("Rejected.")
+                        st.rerun()
+        st.divider()
 
     for i, flag in enumerate(all_flags):
         flag_id  = f"flag_{sel_co}_{sel_yr}_{i}"
@@ -5063,44 +5709,85 @@ def page_home():
             "water_m3": ii.water_withdrawals, "production": ii.production,
         }
 
-    ys = years
+    # Filter to years that have actual production data (non-zero) to avoid
+    # invisible zero bars squashing the chart. Cap at last 10 years max.
+    ys = [y for y in years if yr_kpis.get(y, {}).get("production", 0) > 0]
+    if not ys:
+        ys = years  # fallback: use all years if filter removes everything
+    ys = ys[-10:]   # cap at last 10 years for readability
+    ys_str = [str(y) for y in ys]  # string labels for Plotly category x-axis
+
+    # Note: stackgroup Scatter traces force Plotly to linear axis — each chart
+    # must explicitly override xaxis with type="category" in update_layout.
 
     with t1:
-        # Stacked area: Scope 1 + Scope 2 with intensity overlay
+        # Stacked bar: Scope 1 + Scope 2 with CO₂ intensity line on y2.
+        # Uses 0-based indices as x (not year numbers) so Plotly auto-spaces
+        # bars evenly regardless of the gap between year values (e.g. 2016-2025).
+        # Year labels are applied via tickvals/ticktext.
+        _xi = list(range(len(ys)))   # 0, 1, 2, ..., n-1
+
         fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=ys, y=[yr_kpis[y]["scope2"] for y in ys],
-            name="Scope 2", fill="tonexty", stackgroup="co2",
-            mode="none", fillcolor="rgba(71,85,105,0.25)",
-            hovertemplate="<b>%{x}</b> · Scope 2<br>%{y:,.0f} tCO₂<extra></extra>",
+        fig.add_trace(go.Bar(
+            x=_xi, y=[yr_kpis[y]["scope2"] for y in ys],
+            name="Scope 2 (indirect)",
+            marker_color="rgba(185,200,212,0.88)", marker_line_width=0,
+            width=0.62,
+            customdata=ys_str,
+            hovertemplate="<b>%{customdata}</b> · Scope 2<br>%{y:,.0f} tCO₂<extra></extra>",
         ))
-        fig.add_trace(go.Scatter(
-            x=ys, y=[yr_kpis[y]["scope1"] for y in ys],
-            name="Scope 1", fill="tonexty", stackgroup="co2",
-            mode="none", fillcolor="rgba(71,85,105,0.5)",
-            hovertemplate="<b>%{x}</b> · Scope 1<br>%{y:,.0f} tCO₂<extra></extra>",
+        fig.add_trace(go.Bar(
+            x=_xi, y=[yr_kpis[y]["scope1"] for y in ys],
+            name="Scope 1 (direct)",
+            marker_color="rgba(70,92,102,0.88)", marker_line_width=0,
+            width=0.62,
+            customdata=ys_str,
+            hovertemplate="<b>%{customdata}</b> · Scope 1<br>%{y:,.0f} tCO₂<extra></extra>",
         ))
-        # Intensity as secondary line
+        # Intensity line — same index-based x
         fig.add_trace(go.Scatter(
-            x=ys, y=[yr_kpis[y]["co2_kpi"] for y in ys],
+            x=_xi, y=[yr_kpis[y]["co2_kpi"] for y in ys],
             name="CO₂ Intensity (t/t)", yaxis="y2",
-            mode="lines+markers",
-            line=dict(color="#8B0000", width=2.5, dash="dot"),
-            marker=dict(size=6, color="#8B0000"),
-            hovertemplate="<b>%{x}</b><br>Intensity: %{y:.3f} t/t<extra></extra>",
+            mode="lines",
+            line=dict(color="#cab6a5", width=2.2),
+            customdata=ys_str,
+            hovertemplate="<b>%{customdata}</b><br>Intensity: %{y:.3f} t/t<extra></extra>",
         ))
-        # Annotate best/worst year
+        # Best-intensity-year annotation
         if len(ys) >= 2:
-            best_y = min(ys, key=lambda y: yr_kpis[y]["co2_kpi"])
-            fig.add_annotation(x=best_y, y=yr_kpis[best_y]["co2_kpi"], yref="y2",
+            best_y  = min(ys, key=lambda y: yr_kpis[y]["co2_kpi"])
+            best_xi = ys.index(best_y)
+            fig.add_annotation(x=best_xi, y=yr_kpis[best_y]["co2_kpi"], yref="y2",
                                text="Best", showarrow=True, arrowhead=2,
-                               ax=0, ay=-30, font=dict(size=10, color=GREEN),
+                               ax=0, ay=-30, font=dict(size=11, color=GREEN),
                                arrowcolor=GREEN)
         fig.update_layout(
-            **chart_layout_defaults("Total CO₂ Emissions (Scope 1 + 2) with Intensity", height=320),
-            yaxis=dict(title=dict(text="tCO₂", font=dict(color=CAT_CO2)), tickformat=",", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
-            yaxis2=dict(title=dict(text="tCO₂/t", font=dict(color="#C8102E")),
-                        overlaying="y", side="right", tickformat=".3f"),
+            barmode="stack",
+            plot_bgcolor="#f5f4f2", paper_bgcolor="#f5f4f2",
+            height=320,
+            bargap=0.24,
+            margin=dict(l=55, r=70, t=50, b=55),
+            title=dict(text="<b>Total CO₂ Emissions (Scope 1 + 2) with Intensity</b>",
+                       font=dict(size=14, color="#2a2825"), x=0),
+            xaxis=dict(
+                tickmode="array", tickvals=_xi, ticktext=ys_str,
+                showgrid=False, showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                tickfont=dict(size=12, color="#6f7882"), zeroline=False,
+            ),
+            yaxis=dict(
+                title=dict(text="tCO₂", font=dict(size=12, color="#6f7882")),
+                tickformat=",", showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                showticklabels=True, tickfont=dict(size=12, color="#6f7882"),
+                gridcolor="#e6eaed", zeroline=False,
+            ),
+            yaxis2=dict(
+                title=dict(text="CO₂ Intensity (t/t)", font=dict(size=11, color="#cab6a5")),
+                overlaying="y", side="right", tickformat=".3f",
+                showgrid=False, showline=True, linecolor="#9aa1a9",
+                tickfont=dict(size=12, color="#6f7882"),
+            ),
+            legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.22,
+                        font=dict(size=12, color="#6f7882"), bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified",
         )
         apply_chart_animation(fig)
@@ -5108,26 +5795,38 @@ def page_home():
 
     with t2:
         fuel_cfg = [
-            ("Renewable Elec.",    [yr_kpis[y]["renew_elec"]    for y in ys], CAT_RENEW),
-            ("Non-Renew. Elec.",   [yr_kpis[y]["nonrenew_elec"] for y in ys], "#94A3B8"),
-            ("Natural Gas",        [yr_kpis[y]["nat_gas"]        for y in ys], CAT_ENERGY),
-            ("Coal",               [yr_kpis[y]["coal"]           for y in ys], "#475569"),
-            ("Diesel",             [yr_kpis[y]["diesel"]         for y in ys], "#78716C"),
-            ("Biomass",            [yr_kpis[y]["biomass"]        for y in ys], "#16A34A"),
+            ("Renewable Elec.",  [yr_kpis[y]["renew_elec"]    for y in ys], "#7BAF74"),   # TIP bar_green
+            ("Non-Renew. Elec.", [yr_kpis[y]["nonrenew_elec"] for y in ys], "#B8CDD9"),   # TIP bar_blue
+            ("Natural Gas",      [yr_kpis[y]["nat_gas"]        for y in ys], "#C8B49A"),   # TIP bar_beige
+            ("Coal",             [yr_kpis[y]["coal"]           for y in ys], "#2D4A5A"),   # TIP bar_blue2
+            ("Diesel",           [yr_kpis[y]["diesel"]         for y in ys], "#E0935A"),   # TIP bar_orange
+            ("Biomass",          [yr_kpis[y]["biomass"]        for y in ys], "#9FB8C5"),   # TIP bar_commit
         ]
         fig2 = go.Figure()
         for label, vals, color in fuel_cfg:
             if any(v > 0 for v in vals):
                 fig2.add_trace(go.Bar(
-                    name=label, x=ys, y=vals, marker_color=color,
+                    name=label, x=list(range(len(ys))), y=vals, marker_color=color,
                     marker_line_width=0,
                     hovertemplate=f"<b>{label}</b><br>%{{x}}: %{{y:,.0f}} GJ<br>%{{customdata:.1f}}% of total<extra></extra>",
                 ))
         fig2.update_layout(
             barmode="stack",
-            **chart_layout_defaults("Energy Mix by Source (GJ)", height=320),
-            hovermode="x unified",
-            bargap=0.3,
+            plot_bgcolor="#f5f4f2", paper_bgcolor="#f5f4f2",
+            height=320, bargap=0.28,
+            margin=dict(l=55, r=65, t=50, b=55),
+            title=dict(text="<b>Energy Mix by Source (GJ)</b>",
+                       font=dict(size=14, color="#2a2825"), x=0),
+            xaxis=dict(tickmode="array", tickvals=list(range(len(ys))),
+                       ticktext=ys_str, showgrid=False, showline=True,
+                       linecolor="#9aa1a9", linewidth=1.2,
+                       tickfont=dict(size=12, color="#6f7882"), zeroline=False),
+            yaxis=dict(showgrid=True, gridcolor="#e6eaed", showline=True,
+                       linecolor="#9aa1a9", linewidth=1.2,
+                       tickfont=dict(size=12, color="#6f7882"), zeroline=False),
+            legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.22,
+                        font=dict(size=12, color="#6f7882"), bgcolor="rgba(0,0,0,0)"),
+            hovermode="x unified", showlegend=True,
         )
         apply_chart_animation(fig2)
         st.plotly_chart(fig2, use_container_width=True)
@@ -5137,23 +5836,36 @@ def page_home():
         w_kpi = [yr_kpis[y]["water_kpi"] for y in ys]
         fig3  = go.Figure()
         fig3.add_trace(go.Bar(
-            x=ys, y=w_m3, name="Total Withdrawals",
-            marker_color=CAT_WATER, marker_line_width=0,
-            opacity=0.8,
+            x=list(range(len(ys))), y=w_m3, name="Total Withdrawals",
+            marker_color="#B8CDD9", marker_line_width=0,    # TIP bar_blue
+            width=0.62,
             hovertemplate="<b>%{x}</b><br>%{y:,.0f} m³<extra></extra>",
         ))
         fig3.add_trace(go.Scatter(
-            x=ys, y=w_kpi, name="Intensity (m³/t)",
-            yaxis="y2", mode="lines+markers",
-            line=dict(color="#0E7490", width=2.5),
-            marker=dict(size=7, color="#0E7490", symbol="diamond"),
+            x=list(range(len(ys))), y=w_kpi, name="Intensity (m³/t)",
+            yaxis="y2", mode="lines",
+            line=dict(color="#2D4A5A", width=2.2),          # TIP line_dark
             hovertemplate="<b>%{x}</b><br>Intensity: %{y:.2f} m³/t<extra></extra>",
         ))
         fig3.update_layout(
-            **chart_layout_defaults("Water Withdrawals & Intensity", height=320),
-            yaxis=dict(title=dict(text="m³", font=dict(color=CAT_WATER)), tickformat=",", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
-            yaxis2=dict(title=dict(text="m³/t (intensity)", font=dict(color="#0E7490")),
-                        overlaying="y", side="right", tickformat=".2f"),
+            plot_bgcolor="#f5f4f2", paper_bgcolor="#f5f4f2",
+            height=320, bargap=0.24,
+            margin=dict(l=55, r=70, t=50, b=55),
+            title=dict(text="<b>Water Withdrawals & Intensity</b>",
+                       font=dict(size=14, color="#2a2825"), x=0),
+            xaxis=dict(tickmode="array", tickvals=list(range(len(ys))),
+                       ticktext=ys_str, showgrid=False, showline=True,
+                       linecolor="#9aa1a9", linewidth=1.2,
+                       tickfont=dict(size=12, color="#6f7882"), zeroline=False),
+            yaxis=dict(title=dict(text="m³", font=dict(size=12, color="#6f7882")),
+                       tickformat=",", showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                       showticklabels=True, tickfont=dict(size=12, color="#6f7882"),
+                       gridcolor="#e6eaed", zeroline=False),
+            yaxis2=dict(title=dict(text="Water Intensity (m³/t)",
+                        font=dict(size=11, color="#2D4A5A")),
+                        overlaying="y", side="right", tickformat=".2f",
+                        showgrid=False, showline=True, linecolor="#9aa1a9",
+                        tickfont=dict(size=12, color="#6f7882")),
             hovermode="x unified",
         )
         apply_chart_animation(fig3)
@@ -5168,26 +5880,40 @@ def page_home():
         with c1:
             fig4 = go.Figure()
             fig4.add_trace(go.Bar(
-                x=ys, y=w_total, name="Total Waste",
-                marker_color="#E2E8F0", marker_line_width=0, opacity=0.8,
+                x=list(range(len(ys))), y=w_total, name="Total Waste",
+                marker_color="#B8CDD9", marker_line_width=0,   # TIP bar_blue
+                width=0.62,
             ))
             fig4.add_trace(go.Bar(
-                x=ys, y=w_recovery, name="Recovered",
-                marker_color=CAT_WASTE, marker_line_width=0,
+                x=list(range(len(ys))), y=w_recovery, name="Recovered",
+                marker_color="#7BAF74", marker_line_width=0,   # TIP bar_green
+                width=0.62,
             ))
             fig4.add_trace(go.Scatter(
-                x=ys, y=w_pcts, name="Recovery %",
-                yaxis="y2", mode="lines+markers",
-                line=dict(color="#6D28D9", width=2.5),
-                marker=dict(size=7, color="#6D28D9"),
+                x=list(range(len(ys))), y=w_pcts, name="Recovery %",
+                yaxis="y2", mode="lines",
+                line=dict(color="#2D4A5A", width=2.2),         # TIP line_dark
                 hovertemplate="Recovery: %{y:.1f}%<extra></extra>",
             ))
             fig4.update_layout(
                 barmode="overlay",
-                **chart_layout_defaults("Waste Recovery (T)", height=300),
-                yaxis=dict(title="Metric t", tickformat=",", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
-                yaxis2=dict(title="Recovery %", overlaying="y", side="right",
-                            range=[0, 110], ticksuffix="%"),
+                plot_bgcolor="#f5f4f2", paper_bgcolor="#f5f4f2",
+                height=300, bargap=0.24,
+                margin=dict(l=55, r=70, t=50, b=55),
+                title=dict(text="<b>Waste Recovery (T)</b>",
+                           font=dict(size=14, color="#2a2825"), x=0),
+                xaxis=dict(tickmode="array", tickvals=list(range(len(ys))),
+                           ticktext=ys_str, showgrid=False, showline=True,
+                           linecolor="#9aa1a9", linewidth=1.2,
+                           tickfont=dict(size=12, color="#6f7882"), zeroline=False),
+                yaxis=dict(title=dict(text="Metric t", font=dict(size=12, color="#6f7882")),
+                           tickformat=",", showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                           showticklabels=True, tickfont=dict(size=12, color="#6f7882"),
+                           gridcolor="#e6eaed", zeroline=False),
+                yaxis2=dict(title=dict(text="Recovery %", font=dict(size=11, color="#2D4A5A")),
+                            overlaying="y", side="right", range=[0, 110], ticksuffix="%",
+                            showgrid=False, showline=True, linecolor="#9aa1a9",
+                            tickfont=dict(size=12, color="#6f7882")),
                 hovermode="x unified",
             )
             apply_chart_animation(fig4)
@@ -5207,21 +5933,23 @@ def page_home():
                               annotation_font=dict(size=9, color=GREEN))
             # Recovery trend
             fig_rec.add_trace(go.Scatter(
-                x=ys, y=rec_pcts, mode="lines+markers",
+                x=list(range(len(ys))), y=rec_pcts, mode="lines+markers",
                 fill="tozeroy",
-                fillcolor="rgba(124,58,237,0.10)",
-                line=dict(color=CAT_WASTE, width=2.5),
-                marker=dict(size=7, color=CAT_WASTE, symbol="circle",
-                            line=dict(color="white", width=1.5)),
+                fillcolor="rgba(123,175,116,0.12)",    # TIP bar_green faint
+                line=dict(color="#465c66", width=2.2),  # TIP_SPRUCE
+                marker=dict(size=7, color="#f5f4f2", symbol="circle",
+                            line=dict(color="#465c66", width=2)),
                 hovertemplate="<b>%{x}</b><br>Recovery: %{y:.1f}%<extra></extra>",
                 name="Recovery %",
             ))
             fig_rec.update_layout(
                 **chart_layout_defaults("Waste Recovery Trend (%)", height=300,
                                         showlegend=False),
-                yaxis=dict(range=[0, 105], ticksuffix="%", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F"),
+                yaxis=dict(range=[0, 105], ticksuffix="%", gridcolor="#e6eaed",
+                           showline=True, linecolor="#9aa1a9", linewidth=1.2,
+                           showticklabels=True, tickfont=dict(size=12, color="#6f7882"),
                            zeroline=False),
-                xaxis=dict(gridcolor="#F1F5F9"),
+                xaxis=dict(showgrid=False, showline=True, linecolor="#9aa1a9"),
             )
             apply_chart_animation(fig_rec)
             st.plotly_chart(fig_rec, use_container_width=True)
@@ -5352,7 +6080,7 @@ def page_my_dashboard():
             x=sec_range["Year"].tolist(),
             y=sec_range["Total_CO2"].tolist() if "Total_CO2" in sec_range else [],
             name="Sector Total CO₂",
-            marker_color="#CBD5E1", marker_line_width=0, opacity=0.75,
+            marker_color="#B8CDD9", marker_line_width=0, width=0.62,
             hovertemplate="<b>%{x}</b><br>Sector: %{y:,.0f} tCO₂<extra></extra>",
         ))
         if co_kpis and show_company:
@@ -5369,7 +6097,6 @@ def page_my_dashboard():
             **chart_layout_defaults("Sector CO₂ vs Your Performance", height=300),
             yaxis2=dict(overlaying="y", side="right",
                         title=dict(text=f"{company.split()[0]} CO₂", font=dict(color=CAT_CO2, size=10))),
-            hovermode="x unified",
         )
         apply_chart_animation(fig1)
         st.plotly_chart(fig1, use_container_width=True)
@@ -5381,25 +6108,24 @@ def page_my_dashboard():
             fig2.add_trace(go.Scatter(
                 x=sec_range["Year"].tolist(), y=sec_range["Avg_CO2_KPI"].tolist(),
                 name="Sector Average", mode="lines+markers",
-                line=dict(color="#94A3B8", width=2, dash="dot"),
-                marker=dict(size=5, color="#94A3B8"),
-                fill="tozeroy", fillcolor="rgba(148,163,184,0.08)",
+                line=dict(color="#9aa1a9", width=1.8, dash="dot"),
+                marker=dict(size=5, color="#9aa1a9"),
+                fill="tozeroy", fillcolor="rgba(185,200,212,0.12)",
                 hovertemplate="Sector avg: %{y:.3f}<extra></extra>",
             ))
         if co_kpis and show_company:
             co_yrs = sorted(co_kpis.keys())
             fig2.add_trace(go.Scatter(
-                x=co_yrs, y=[co_kpis[y]["co2_kpi"] for y in co_yrs],
+                x=[str(y) for y in co_yrs], y=[co_kpis[y]["co2_kpi"] for y in co_yrs],
                 name=company.split()[0],
                 mode="lines+markers",
-                line=dict(color="#8B0000", width=3.5),
-                marker=dict(size=9, color="#8B0000", symbol="diamond",
+                line=dict(color="#cab6a5", width=2.2),
+                marker=dict(size=7, color="#f5f4f2", symbol="circle",
                             line=dict(color="white", width=1.5)),
                 hovertemplate=f"{company.split()[0]}: %{{y:.3f}}<extra></extra>",
             ))
         fig2.update_layout(
             **chart_layout_defaults("CO₂ Intensity Trend (tCO₂/t)", height=300),
-            hovermode="x unified",
         )
         apply_chart_animation(fig2)
         st.plotly_chart(fig2, use_container_width=True)
@@ -5418,7 +6144,7 @@ def page_my_dashboard():
         if co_kpis and show_company:
             co_yrs = sorted(co_kpis.keys())
             fig3.add_trace(go.Scatter(
-                x=co_yrs, y=[co_kpis[y]["energy_kpi"] for y in co_yrs],
+                x=[str(y) for y in co_yrs], y=[co_kpis[y]["energy_kpi"] for y in co_yrs],
                 name=company.split()[0], mode="lines+markers",
                 line=dict(color="#5C2700", width=3.5),
                 marker=dict(size=8, color="#5C2700",
@@ -5436,7 +6162,6 @@ def page_my_dashboard():
             **chart_layout_defaults("Energy KPI vs Renewable Share", height=300),
             yaxis2=dict(overlaying="y", side="right", ticksuffix="%",
                         title=dict(font=dict(color=CAT_RENEW, size=10))),
-            hovermode="x unified",
         )
         apply_chart_animation(fig3)
         st.plotly_chart(fig3, use_container_width=True)
@@ -5455,7 +6180,7 @@ def page_my_dashboard():
         if co_kpis and show_company:
             co_yrs = sorted(co_kpis.keys())
             fig4.add_trace(go.Scatter(
-                x=co_yrs, y=[co_kpis[y]["water_kpi"] for y in co_yrs],
+                x=[str(y) for y in co_yrs], y=[co_kpis[y]["water_kpi"] for y in co_yrs],
                 name=company.split()[0], mode="lines+markers",
                 line=dict(color="#0C4A6E", width=3.5),
                 marker=dict(size=8, color="#0C4A6E", symbol="square",
@@ -5464,7 +6189,6 @@ def page_my_dashboard():
             ))
         fig4.update_layout(
             **chart_layout_defaults("Water Intensity Trend (m³/t)", height=300),
-            hovermode="x unified",
         )
         apply_chart_animation(fig4)
         st.plotly_chart(fig4, use_container_width=True)
@@ -5525,8 +6249,9 @@ def page_my_dashboard():
                 hovertemplate="<b>%{x}</b><br>Renewable: %{y:.1f}%<extra></extra>",
             ))
         fig6.update_layout(**chart_layout_defaults("Renewable Electricity Share (%)", height=270),
-                           yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
-                           xaxis=dict(gridcolor="#F1F5F9"), hovermode="x unified")
+                           yaxis=dict(ticksuffix="%", gridcolor="#e6eaed", showline=True,
+                                      linecolor="#9aa1a9", showticklabels=True,
+                                      tickfont=dict(size=12, color="#6f7882")))
         apply_chart_animation(fig6)
         st.plotly_chart(fig6, use_container_width=True,
                         key=_chart_key(company, sel_yr if 'sel_yr' in dir() else 0, "renew_dash"))
@@ -5556,8 +6281,9 @@ def page_my_dashboard():
                 fig7.update_layout(**chart_layout_defaults(
                     f"CO₂ Intensity YoY Change (%) — {company.split()[0]}", height=270,
                     showlegend=False),
-                    yaxis=dict(ticksuffix="%", gridcolor="#F1F5F9", zeroline=False, showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
-                    xaxis=dict(gridcolor="#F1F5F9"))
+                    yaxis=dict(ticksuffix="%", gridcolor="#e6eaed", zeroline=False,
+                               showline=True, linecolor="#9aa1a9",
+                               tickfont=dict(size=12, color="#6f7882")))
                 apply_chart_animation(fig7)
                 st.plotly_chart(fig7, use_container_width=True,
                                 key=_chart_key(company, "yoy_co2_dash"))
@@ -5658,6 +6384,7 @@ def page_reports():
     company   = st.session_state.user_company
     comp_hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
     years     = sorted(dl.get_years(_CONSOLIDATED_DF, company) or [CURR_YEAR])
+    years_str = [str(y) for y in years]   # string labels for Plotly x-axis
 
     # ── Header with Download button top-right ─────────────────────────────────
     hdr_col, btn_col = st.columns([3, 1])
@@ -6010,8 +6737,8 @@ def page_reports():
             ))
             fig_co2.update_layout(**chart_layout_defaults("Total CO₂ Emissions (tCO₂)", height=220,
                                                            showlegend=False),
-                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
-                                   xaxis=dict(gridcolor="#F1F5F9"))
+                                   yaxis=dict(tickformat=",", gridcolor="#e6eaed", showline=True, linecolor="#9aa1a9",
+                                            tickfont=dict(size=12, color="#6f7882")))
             apply_chart_animation(fig_co2)
             st.plotly_chart(fig_co2, use_container_width=True)
 
@@ -6034,8 +6761,8 @@ def page_reports():
                     ))
             fig_nrg.update_layout(**chart_layout_defaults("Energy Mix by Source (GJ)", height=220),
                                    barmode="stack", bargap=0.2,
-                                   yaxis=dict(tickformat=",", gridcolor="#F1F5F9", showline=True, linecolor="#999", showticklabels=True, tickfont=dict(size=12, color="#1C2E3F")),
-                                   xaxis=dict(gridcolor="#F1F5F9"))
+                                   yaxis=dict(tickformat=",", gridcolor="#e6eaed", showline=True, linecolor="#9aa1a9",
+                                            tickfont=dict(size=12, color="#6f7882")))
             apply_chart_animation(fig_nrg)
             st.plotly_chart(fig_nrg, use_container_width=True)
 
@@ -6060,8 +6787,7 @@ def page_reports():
             ))
             fig_wat.update_layout(**chart_layout_defaults("Water Withdrawals (M m³)", height=200,
                                                            showlegend=False),
-                                   yaxis=dict(gridcolor="#F1F5F9"),
-                                   xaxis=dict(gridcolor="#F1F5F9"))
+                                   yaxis=dict(gridcolor="#e6eaed"))
             apply_chart_animation(fig_wat)
             st.plotly_chart(fig_wat, use_container_width=True)
 
@@ -6088,9 +6814,7 @@ def page_reports():
             ))
             fig_wr.update_layout(**chart_layout_defaults("Waste Recovery Rate (%)", height=200,
                                                           showlegend=False),
-                                  yaxis=dict(range=[0,105], ticksuffix="%",
-                                             gridcolor="#F1F5F9"),
-                                  xaxis=dict(gridcolor="#F1F5F9"))
+                                  yaxis=dict(range=[0, 105], ticksuffix="%", gridcolor="#e6eaed"))
             apply_chart_animation(fig_wr)
             st.plotly_chart(fig_wr, use_container_width=True)
 

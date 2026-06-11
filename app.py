@@ -46,6 +46,7 @@ import data_loader as dl
 # data_loader checks data_storage/master/ first, then falls back to raw/ etc.
 _CONSOLIDATED_DF = dl.load_consolidated()
 _COMPANIES       = dl.get_companies(_CONSOLIDATED_DF)
+
 _SECTOR_DF       = dl.load_sector_aggregated(_CONSOLIDATED_DF)
 
 
@@ -147,7 +148,7 @@ _COMMENT_COLS  = ["Company","Year","FieldKey","FieldLabel","OldValue",
 
 def _save_change_comment(company, year, field_key, field_label,
                           old_val, new_val, reason) -> None:
-    """Save a pending change-request comment."""
+    """Save Pending comment to CSV + master file + version parquet immediately."""
     from pathlib import Path as _P
     import csv
     from datetime import datetime
@@ -157,10 +158,10 @@ def _save_change_comment(company, year, field_key, field_label,
     if p.exists():
         with open(p, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
-    # Remove existing pending for same co+yr+field
+    # Replace any existing entry for same co+yr+field
     rows = [r for r in rows if not (
-        r["Company"]==company and str(r["Year"])==str(year) and r["FieldKey"]==field_key
-        and r["Status"]=="Pending")]
+        r["Company"]==company and str(r["Year"])==str(year)
+        and r["FieldKey"]==field_key)]
     rows.append({"Company":company,"Year":str(year),"FieldKey":field_key,
                  "FieldLabel":field_label,"OldValue":str(old_val),
                  "NewValue":str(new_val),"Reason":reason,
@@ -169,6 +170,10 @@ def _save_change_comment(company, year, field_key, field_label,
     with open(p, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=_COMMENT_COLS)
         w.writeheader(); w.writerows(rows)
+    try: _update_master_comment_cell(company, year, field_key, reason)
+    except Exception: pass
+    try: _save_comment_version(company, year, field_key, reason, "Pending", "Client")
+    except Exception: pass
 
 def _load_comments(company: str = None, status: str = None) -> list:
     """Load comments, optionally filtered by company and/or status."""
@@ -183,30 +188,126 @@ def _load_comments(company: str = None, status: str = None) -> list:
     return rows
 
 def _update_comment_status(company, year, field_key, status, approved_by="") -> None:
-    """Approve or reject a pending comment."""
+    """Update comment status: Accepted|Seen|Rejected.
+    Accepted → removes record + clears master CSV cell.
+    Seen     → ⏳ prefix in master CSV.
+    Rejected → ⚠ prefix in master CSV."""
     from pathlib import Path as _P
     import csv
-    from datetime import datetime
+    from datetime import datetime as _dt
     p = _P("data_storage/field_comments.csv")
     if not p.exists(): return
-    rows = []
     with open(p, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    for r in rows:
-        if (r["Company"]==company and str(r["Year"])==str(year)
-                and r["FieldKey"]==field_key and r["Status"]=="Pending"):
-            r["Status"]    = status
-            r["ApprovedBy"]= approved_by
-            r["ApprovedAt"]= datetime.now().strftime("%Y-%m-%d %H:%M")
+    reason_text = next((r.get("Reason","") for r in rows
+                        if r["Company"]==company and str(r["Year"])==str(year)
+                        and r["FieldKey"]==field_key), "")
+    if status == "Accepted":
+        rows = [r for r in rows if not (
+            r["Company"]==company and str(r["Year"])==str(year)
+            and r["FieldKey"]==field_key)]
+        _update_master_comment_cell(company, year, field_key, "")
+    else:
+        prefix = {"Seen": "⏳ ", "Rejected": "⚠ "}.get(status, "")
+        for r in rows:
+            if (r["Company"]==company and str(r["Year"])==str(year)
+                    and r["FieldKey"]==field_key):
+                r["Status"]     = status
+                r["ApprovedBy"] = approved_by
+                r["ApprovedAt"] = _dt.now().strftime("%Y-%m-%d %H:%M")
+        _update_master_comment_cell(company, year, field_key,
+                                     prefix + reason_text)
     with open(p, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=_COMMENT_COLS)
         w.writeheader(); w.writerows(rows)
+    _save_comment_version(company, year, field_key,
+                           reason_text, status, approved_by)
 
 def _get_approved_comments(company: str, year: int) -> dict:
     """Return {field_key: reason} for all approved comments for company+year."""
     rows = _load_comments(company, "Approved")
     return {r["FieldKey"]: r["Reason"]
             for r in rows if str(r["Year"])==str(year)}
+
+
+def _get_all_active_comments(company: str, year: int) -> dict:
+    """{field_key: (status, display_text)} for every non-Accepted comment."""
+    result = {}
+    for r in _load_comments(company=company):
+        if str(r["Year"]) != str(year): continue
+        st_ = r.get("Status", "Pending")
+        rsn = r.get("Reason", "")
+        if st_ == "Accepted": continue
+        if   st_ == "Pending":  result[r["FieldKey"]] = ("Pending",  rsn)
+        elif st_ == "Seen":     result[r["FieldKey"]] = ("Seen",    f"⏳ {rsn}")
+        elif st_ == "Rejected": result[r["FieldKey"]] = ("Rejected", f"⚠ {rsn}")
+        elif st_ == "Approved": result[r["FieldKey"]] = ("Approved", rsn)
+    return result
+
+
+def _update_master_comment_cell(company: str, year, field_key: str,
+                                 value: str) -> None:
+    """Write value into change_comment column of master CSV for company+year row.
+    Empty string clears the entry for this field_key."""
+    try:
+        import pandas as _pd
+        _ecands = dl._get_csv_candidates()
+        csv_p = next((pp for pp in _ecands if pp.exists()
+                      and pp.name.startswith("ESG_MASTER_WIDE_ALL_COMPANIES_")), None)
+        if not csv_p: return
+        mdf = _pd.read_csv(csv_p)
+        if "change_comment" not in mdf.columns:
+            mdf["change_comment"] = ""
+        mask = ((mdf["Company"] == company)
+                & (mdf["Year"].astype(str) == str(year)))
+        if not mask.any(): return
+        existing = str(mdf.loc[mask, "change_comment"].fillna("").iloc[0])
+        parts = [p for p in existing.split(" | ")
+                 if not p.startswith(field_key + ":") and p.strip()]
+        if value:
+            parts.append(f"{field_key}: {value}")
+        mdf.loc[mask, "change_comment"] = " | ".join(parts)
+        mdf.to_csv(csv_p, index=False)
+    except Exception:
+        pass
+
+
+def _delete_comment(company: str, year, field_key: str) -> None:
+    """Remove a comment from CSV + master file (when client clears cell)."""
+    from pathlib import Path as _P
+    import csv
+    p = _P("data_storage/field_comments.csv")
+    if not p.exists(): return
+    with open(p, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    rows = [r for r in rows if not (
+        r["Company"] == company and str(r["Year"]) == str(year)
+        and r["FieldKey"] == field_key)]
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_COMMENT_COLS)
+        w.writeheader(); w.writerows(rows)
+    _update_master_comment_cell(company, year, field_key, "")
+
+
+def _save_comment_version(company: str, year, field_key: str, reason: str,
+                           status: str, actor: str) -> None:
+    """Version parquet snapshot for every comment event."""
+    try:
+        import pandas as _pd
+        from pathlib import Path as _P
+        from datetime import datetime as _dt
+        _vdir = _P("data_storage/versions") / company.replace(" ", "_")
+        _vdir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        _pd.DataFrame([{
+            "Company": company, "Year": year, "FieldKey": field_key,
+            "Reason": reason, "Status": status, "Actor": actor,
+            "Timestamp": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }]).to_parquet(
+            _vdir / f"{company.replace(' ','_')}_{year}_cmt_{status}_{ts}.parquet",
+            index=False)
+    except Exception:
+        pass
 
 
 def _reload_consolidated_df() -> bool:
@@ -1135,7 +1236,7 @@ STEP_FIELDS = [
 # ─────────────────────────────────────────────────────────
 # PAGE 1 -- KPI DATA ENTRY
 # ─────────────────────────────────────────────────────────
-def _build_master_row(inp, out) -> dict:
+def _build_master_row(inp, out, supp: dict = None) -> dict:
     """
     Build a dict whose keys exactly match the master wide CSV column names.
     Ensures no duplicate columns when appended to the master CSV.
@@ -1203,6 +1304,50 @@ def _build_master_row(inp, out) -> dict:
         "Waste_Recovery_Rate_%":         recovery_rate,
         "Total_Electricity_by_Country_GJ": None,  # filled after country save
     }
+
+    # ── People & Governance fields (from supplementary) ────────────────────
+    s = supp or {}
+    def _sf(k, default=0.0):
+        try: return float(s.get(k, default) or default)
+        except: return default
+
+    stress_wd     = _sf("stress_water_withdrawal")
+    non_stress_wd = _sf("non_stress_water_withdrawal",
+                         max(inp.water_withdrawals - stress_wd, 0))
+    hs_ext   = _sf("hs_external_audit")
+    hs_int   = _sf("hs_internal_audit")
+    hs_tot   = max(int(_sf("hs_external_audit", inp.total_sites)), int(inp.total_sites))
+    emp_tot  = _sf("total_employees")
+    emp_fem  = _sf("female_employees")
+    bod_tot  = _sf("board_total")
+    bod_fem  = _sf("female_board")
+
+    row.update({
+        # Water detail
+        "Stress Water Withdrawal":     round(stress_wd, 4),
+        "Non-Stress Water Withdrawal": round(non_stress_wd, 4),
+        # Coal breakdown
+        "Coal Sub-Bituminous":         round(_sf("coal_sub_bituminous"), 4),
+        "Coal Brown Briquettes":       round(_sf("coal_brown_briquettes"), 4),
+        "Coal Other Bituminous":       round(_sf("coal_other_bituminous"), 4),
+        # H&S
+        "HS External Audit Sites":     round(hs_ext),
+        "HS Internal Audit Sites":     round(hs_int),
+        "HS External Audit %":         round(hs_ext / max(hs_tot, 1) * 100, 2),
+        "HS Internal Audit %":         round(hs_int / max(hs_tot, 1) * 100, 2),
+        # Diversity
+        "Total Employees":             round(emp_tot),
+        "Female Employees":            round(emp_fem),
+        "Female Employees %":          round(emp_fem / max(emp_tot, 1) * 100, 2),
+        "Board Total":                 round(bod_tot),
+        "Female Board":                round(bod_fem),
+        "Female Board %":              round(bod_fem / max(bod_tot, 1) * 100, 2),
+        # Science-Based Targets
+        "SBT Total":       round(_sf("sbt_total")),
+        "SBT Validated":   round(_sf("sbt_validated")),
+        "SBT Committed":   round(_sf("sbt_committed")),
+        "SBT Non-Committed": round(_sf("sbt_non_committed")),
+    })
     return row
 
 
@@ -1231,6 +1376,61 @@ def _save_version_parquet(inp, combined_df: pd.DataFrame) -> str:
     except Exception as e:
         return f"[version save failed: {e}]"
 
+
+
+
+def _migrate_supplementary_to_master() -> str:
+    """
+    One-time (idempotent) migration: read every row in ESG_SUPPLEMENTARY.csv
+    and upsert it into the master CSV so the People & Governance columns are
+    populated for all previously-submitted records.
+    Safe to call on every startup — skips companies/years already promoted.
+    """
+    import csv as _csv
+    from pathlib import Path as _P
+    supp_path = _P("data_storage/master/ESG_SUPPLEMENTARY.csv")
+    if not supp_path.exists():
+        return "no supplementary file — skipped"
+
+    migrated = 0
+    with open(supp_path, newline="", encoding="utf-8") as f:
+        rows = list(_csv.DictReader(f))
+
+    for row in rows:
+        company = row.get("Company","").strip()
+        year_s  = row.get("Year","").strip()
+        if not company or not year_s:
+            continue
+        try:
+            year = int(year_s)
+        except ValueError:
+            continue
+
+        # Build supp dict for this row
+        supp = {k: float(v) if v else 0.0
+                for k, v in row.items() if k not in ("Company","Year")}
+
+        # Load existing TemplateInputs for this company+year
+        hist = dl.get_company_hist(_CONSOLIDATED_DF, company)
+        if not hist:
+            continue
+        sd = dl.get_step_data(hist, year)
+        sd_clean = {k: v for k, v in sd.items() if k in _VALID_TEMPLATE_FIELDS}
+        if not sd_clean:
+            continue
+
+        inp = TemplateInputs(company=company, year=year, **sd_clean)
+        out = calculate(inp)
+
+        # Re-save the master row with supplementary data included
+        _save_submission_to_csv(inp, out)   # supp auto-loaded inside
+        migrated += 1
+
+    return f"migrated {migrated} supplementary records into master"
+
+# Monkey-patch _save_submission_to_csv to support direct supp argument
+# (used by migration only — normal path loads supp inside the function)
+import functools as _functools
 
 
 def _drop_zero_elec_cols(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -1296,6 +1496,26 @@ def _sync_consolidate_excel(master_df: "pd.DataFrame") -> None:
         "Waste Recovered":                                 ("Waste",        "Waste Recovered"),
         "Recovery Rate":                                   ("Waste",        "Recovery Rate"),
         **{_elec_col(c): ("Energy", f"Electricity - {c}") for c in ELEC_ALL_COUNTRIES},
+        # People & Governance (promoted from supplementary)
+        "Stress Water Withdrawal":     ("Water",       "Stress water withdrawal"),
+        "Non-Stress Water Withdrawal": ("Water",       "Non-stress water withdrawal"),
+        "Coal Sub-Bituminous":         ("Energy",      "Coal — Sub-bituminous"),
+        "Coal Brown Briquettes":       ("Energy",      "Coal — Brown briquettes"),
+        "Coal Other Bituminous":       ("Energy",      "Coal — Other bituminous"),
+        "HS External Audit Sites":     ("H&S",         "Externally audited H&S sites"),
+        "HS Internal Audit Sites":     ("H&S",         "Internally audited H&S sites"),
+        "HS External Audit %":         ("H&S",         "H&S external audit coverage %"),
+        "HS Internal Audit %":         ("H&S",         "H&S internal audit coverage %"),
+        "Total Employees":             ("Diversity",   "Total employees"),
+        "Female Employees":            ("Diversity",   "Female employees"),
+        "Female Employees %":          ("Diversity",   "% Female employees"),
+        "Board Total":                 ("Diversity",   "Board of Directors total"),
+        "Female Board":                ("Diversity",   "Female Board members"),
+        "Female Board %":              ("Diversity",   "% Female Board"),
+        "SBT Total":                   ("SBT",         "Total with science-based target"),
+        "SBT Validated":               ("SBT",         "SBT — Validated"),
+        "SBT Committed":               ("SBT",         "SBT — Committed"),
+        "SBT Non-Committed":           ("SBT",         "SBT — Non-committed"),
     }
 
     # Build long rows from master_df
@@ -1409,7 +1629,9 @@ def _save_submission_to_csv(inp, out) -> str:
                     None) or Path("data_storage/master/ESG_MASTER_WIDE_ALL_COMPANIES_2009_2023.csv")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    new_row     = pd.DataFrame([_build_master_row(inp, out)])
+    # Load supplementary fields so they are promoted into the master CSV
+    _supp_data = _load_supplementary(inp.company, inp.year)
+    new_row    = pd.DataFrame([_build_master_row(inp, out, supp=_supp_data)])
     master_cols = list(new_row.columns)
 
     def _align(df):
@@ -1705,19 +1927,18 @@ def page_entry():
     other_fuels = fc9.number_input("Other fuels (GJ)", min_value=0.0,
         value=_num("other_fuels"), step=100.0, format="%.0f", key=f"e_other{_yk}")
 
-    # Coal with expandable breakdown
-    with st.expander("🪨 Coal detail (expand to enter breakdown)", expanded=False):
-        cc1, cc2, cc3 = st.columns(3)
-        coal_sub_bit  = cc1.number_input("Sub-bituminous coal (GJ)", min_value=0.0,
-            value=_num("", 0.0, "coal_sub_bituminous"), step=100.0, format="%.0f", key=f"e_csub{_yk}")
-        coal_brown    = cc2.number_input("Brown coal briquettes (GJ)", min_value=0.0,
-            value=_num("", 0.0, "coal_brown_briquettes"), step=100.0, format="%.0f", key=f"e_cbrown{_yk}")
-        coal_other    = cc3.number_input("Other bituminous coal (GJ)", min_value=0.0,
-            value=_num("", 0.0, "coal_other_bituminous"), step=100.0, format="%.0f", key=f"e_cother{_yk}")
-        coal_detail_total = coal_sub_bit + coal_brown + coal_other
-        st.info(f"Coal breakdown total: **{coal_detail_total:,.0f} GJ** — enter total below if not using breakdown")
+    # ── Coal breakdown (inline, no expander) ─────────────────────────────────
+    st.markdown(f"<div style='font-size:13px;font-weight:600;color:{TEXT};margin:8px 0 4px'>Coal breakdown (GJ LHV)</div>", unsafe_allow_html=True)
+    cc1, cc2, cc3 = st.columns(3)
+    coal_sub_bit  = cc1.number_input("Sub-bituminous coal (GJ)", min_value=0.0,
+        value=_num("", 0.0, "coal_sub_bituminous"), step=100.0, format="%.0f", key=f"e_csub{_yk}")
+    coal_brown    = cc2.number_input("Brown coal briquettes (GJ)", min_value=0.0,
+        value=_num("", 0.0, "coal_brown_briquettes"), step=100.0, format="%.0f", key=f"e_cbrown{_yk}")
+    coal_other    = cc3.number_input("Other bituminous coal (GJ)", min_value=0.0,
+        value=_num("", 0.0, "coal_other_bituminous"), step=100.0, format="%.0f", key=f"e_cother{_yk}")
 
-    coal_total = st.number_input("Total coal (GJ) — enter directly or sum from breakdown above",
+    coal_total = st.number_input(
+        "Total coal (GJ) — auto-filled from breakdown above, or enter directly",
         min_value=0.0,
         value=max(_num("coal_sub"), coal_sub_bit + coal_brown + coal_other),
         step=100.0, format="%.0f", key=f"e_coal{_yk}")
@@ -1738,58 +1959,61 @@ def page_entry():
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # SECTION 5 — CO₂ Emissions
+    # SECTION 5 — CO₂ Emissions (all fields manual input)
     # ══════════════════════════════════════════════════════════════════════════
     st.markdown(f"""<div style="border-left:4px solid {RED};padding:4px 12px;margin:16px 0 8px">
-      <b style="font-size:15px;color:{TEXT}">5. CO₂ Emissions</b>
-      <div style="font-size:11px;color:{MUTED}">Scope 1 auto-calculated from fuels. Enter Scope 2 steam manually.</div>
+      <b style="font-size:15px;color:{TEXT}">5. CO₂ Emissions (tCO₂)</b>
+      <div style="font-size:11px;color:{MUTED}">Enter CO₂ values per fuel source. Total Scope 1 auto-sums. CO₂ KPI auto-calculated.</div>
     </div>""", unsafe_allow_html=True)
 
-    # Scope 1 auto from fuels
-    _s1_ng   = nat_gas      * _EF.get("Natural Gas", 0.0561)
-    _s1_coal = coal_total   * _EF.get("Coal",        0.0946)
-    _s1_prop = propane      * _EF.get("Propane",     0.0631)
-    _s1_foil = fuel_oil     * _EF.get("Fuel Oil",    0.0745)
-    _s1_dies = diesel       * _EF.get("Diesel",      0.0741)
-    _s1_pet  = petrol       * _EF.get("Petrol",      0.0693)
-    _s1_wt   = _waste_tire_gj * _EF.get("Waste Tires", 0.085)
-    _s1_lpg  = lpg          * _EF.get("LPG",         0.0639)
-    _s1_oth  = other_fuels  * _EF.get("Other",       0.075)
-    scope1_total = _s1_ng + _s1_coal + _s1_prop + _s1_foil + _s1_dies + _s1_pet + _s1_wt + _s1_lpg + _s1_oth
+    # ── CO₂ Scope 1 — manual input per fuel ──────────────────────────────────
+    ca1,ca2,ca3 = st.columns(3)
+    co2_nat_gas  = ca1.number_input("Natural Gas (tCO₂)", min_value=0.0,
+        value=_num("", nat_gas*_EF.get("Natural Gas",0.0561), "co2_nat_gas"),
+        step=10.0, format="%.1f", key=f"e_c_ng{_yk}")
+    co2_coal_inp = ca2.number_input("Coal (tCO₂)", min_value=0.0,
+        value=_num("", coal_total*_EF.get("Coal",0.0946), "co2_coal"),
+        step=10.0, format="%.1f", key=f"e_c_coal{_yk}")
+    co2_propane  = ca3.number_input("Propane (tCO₂)", min_value=0.0,
+        value=_num("", propane*_EF.get("Propane",0.0631), "co2_propane"),
+        step=10.0, format="%.1f", key=f"e_c_prop{_yk}")
 
-    # Show Scope 1 breakdown
-    with st.expander("📊 Scope 1 breakdown by fuel (auto-calculated)", expanded=False):
-        sb1,sb2,sb3 = st.columns(3)
-        sb1.metric("Natural Gas",  f"{_s1_ng:,.1f} tCO₂")
-        sb2.metric("Coal",         f"{_s1_coal:,.1f} tCO₂")
-        sb3.metric("Propane",      f"{_s1_prop:,.1f} tCO₂")
-        sb4,sb5,sb6 = st.columns(3)
-        sb4.metric("Fuel Oil",     f"{_s1_foil:,.1f} tCO₂")
-        sb5.metric("Diesel",       f"{_s1_dies:,.1f} tCO₂")
-        sb6.metric("Petrol",       f"{_s1_pet:,.1f} tCO₂")
-        sb7,sb8,sb9 = st.columns(3)
-        sb7.metric("Waste Tires",  f"{_s1_wt:,.1f} tCO₂")
-        sb8.metric("LPG",          f"{_s1_lpg:,.1f} tCO₂")
-        sb9.metric("Other",        f"{_s1_oth:,.1f} tCO₂")
+    cb1,cb2,cb3 = st.columns(3)
+    co2_fuel_oil = cb1.number_input("Fuel Oil (tCO₂)", min_value=0.0,
+        value=_num("", fuel_oil*_EF.get("Fuel Oil",0.0745), "co2_fuel_oil"),
+        step=10.0, format="%.1f", key=f"e_c_foil{_yk}")
+    co2_diesel   = cb2.number_input("Diesel (tCO₂)", min_value=0.0,
+        value=_num("", diesel*_EF.get("Diesel",0.0741), "co2_diesel"),
+        step=10.0, format="%.1f", key=f"e_c_dies{_yk}")
+    co2_petrol   = cb3.number_input("Petrol (tCO₂)", min_value=0.0,
+        value=_num("", petrol*_EF.get("Petrol",0.0693), "co2_petrol"),
+        step=10.0, format="%.1f", key=f"e_c_pet{_yk}")
 
-    # Scope 2 inputs
-    co2s2_col1, co2s2_col2 = st.columns(2)
-    co2_scope2_steam = co2s2_col1.number_input("CO₂ Scope 2 — purchased steam (tCO₂)", min_value=0.0,
-        value=_num("co2_scope2_steam"), step=10.0, format="%.0f", key=f"e_s2s{_yk}",
-        help="Provided by steam supplier")
+    cc1,cc2,cc3 = st.columns(3)
+    co2_waste_tires = cc1.number_input("Waste Tires (tCO₂)", min_value=0.0,
+        value=_num("", _waste_tire_gj*_EF.get("Waste Tires",0.085), "co2_waste_tires"),
+        step=10.0, format="%.1f", key=f"e_c_wt{_yk}")
+    co2_lpg      = cc2.number_input("LPG (tCO₂)", min_value=0.0,
+        value=_num("", lpg*_EF.get("LPG",0.0639), "co2_lpg"),
+        step=10.0, format="%.1f", key=f"e_c_lpg{_yk}")
+    co2_other    = cc3.number_input("Other (tCO₂)", min_value=0.0,
+        value=_num("", other_fuels*_EF.get("Other",0.075), "co2_other"),
+        step=10.0, format="%.1f", key=f"e_c_oth{_yk}")
+
+    # ── Scope 2 (keep steam for formula engine compatibility) ─────────────────
+    co2_scope2_steam = 0.0   # removed from UI — set to 0
+    scope1_total = (co2_nat_gas + co2_coal_inp + co2_propane + co2_fuel_oil +
+                    co2_diesel + co2_petrol + co2_waste_tires + co2_lpg + co2_other)
     scope2_elec_auto = (nonrenew_elec * _G2M) * _S2EF
-    co2s2_col2.metric("CO₂ Scope 2 — electricity (auto)", f"{scope2_elec_auto:,.1f} tCO₂",
-        help="Non-renewable electricity × grid emission factor")
+    scope2_total     = scope2_elec_auto        # only electricity scope 2 remains
+    co2_total        = scope1_total + scope2_total
+    co2_kpi_live     = round(co2_total / max(production, 1), 4)
 
-    scope2_total = co2_scope2_steam + scope2_elec_auto
-    co2_total    = scope1_total + scope2_total
-    co2_kpi_live = round(co2_total / max(production, 1), 4)
-
-    cx1,cx2,cx3,cx4 = st.columns(4)
-    cx1.metric("Total CO₂ Scope 1 (tCO₂)",   f"{scope1_total:,.1f}")
-    cx2.metric("Total CO₂ Scope 2 (tCO₂)",   f"{scope2_total:,.1f}")
-    cx3.metric("Total CO₂ Scope 1+2 (tCO₂)", f"{co2_total:,.1f}")
-    cx4.metric("CO₂ KPI (tCO₂/t)",            f"{co2_kpi_live:.4f}")
+    cd1,cd2,cd3,cd4 = st.columns(4)
+    cd1.metric("Total CO₂ Scope 1 (tCO₂)",   f"{scope1_total:,.1f}")
+    cd2.metric("Total CO₂ Scope 2 (tCO₂)",   f"{scope2_total:,.1f}")
+    cd3.metric("Total CO₂ Scope 1+2 (tCO₂)", f"{co2_total:,.1f}")
+    cd4.metric("CO₂ KPI (tCO₂/t)",            f"{co2_kpi_live:.4f}")
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1984,6 +2208,139 @@ def page_entry():
         st.rerun()
 
 
+def _render_people_governance_tab():
+    """
+    People & Governance tab shown in My Records and Company Data.
+    Reads live data from master CSV (promoted from supplementary) and displays
+    as a structured table with all H&S, Diversity, and SBT fields across all years.
+    """
+    company  = st.session_state.get("reporting_company") or st.session_state.get("user_company") or ""
+    rep_year = st.session_state.get("reporting_year", CURR_YEAR)
+    hist     = get_hist_outputs()
+
+    st.markdown(f"""<div style="border-left:4px solid #8B5CF6;padding:6px 12px;margin-bottom:12px">
+      <b style="font-size:15px;color:#2a2825">People & Governance</b>
+      <div style="font-size:11px;color:#6f7882">Health & Safety · Diversity & Inclusion · Science-Based Targets</div>
+    </div>""", unsafe_allow_html=True)
+    st.caption("Data entered via Submit Data → Sections 7–9. Submit new year to update.")
+
+    # Row definitions: (label, unit, supp_key, master_col, is_section)
+    PG_ROWS = [
+        # H&S
+        (True,  "Health & Safety",                  None,    None,       None),
+        (False, "Total sites (H&S)",                "no.",   "hs_total_sites", None),
+        (False, "Externally audited H&S sites",     "no.",   "hs_external_audit", "HS External Audit Sites"),
+        (False, "— External audit coverage",        "%",     "hs_ext_pct",        "HS External Audit %"),
+        (False, "Internally audited H&S sites",     "no.",   "hs_internal_audit", "HS Internal Audit Sites"),
+        (False, "— Internal audit coverage",        "%",     "hs_int_pct",        "HS Internal Audit %"),
+        # Diversity
+        (True,  "Diversity & Inclusion",            None,    None,       None),
+        (False, "Total employees",                  "no.",   "total_employees",   "Total Employees"),
+        (False, "Female employees",                 "no.",   "female_employees",  "Female Employees"),
+        (False, "— % Female employees",             "%",     "fem_emp_pct",       "Female Employees %"),
+        (False, "Board of Directors (total)",       "no.",   "board_total",       "Board Total"),
+        (False, "Female Board members",             "no.",   "female_board",      "Female Board"),
+        (False, "— % Female Board",                 "%",     "fem_bod_pct",       "Female Board %"),
+        # SBT
+        (True,  "Science-Based Targets",            None,    None,       None),
+        (False, "Total with SBT",                   "no.",   "sbt_total",         "SBT Total"),
+        (False, "Validated",                        "no.",   "sbt_validated",     "SBT Validated"),
+        (False, "Committed",                        "no.",   "sbt_committed",     "SBT Committed"),
+        (False, "Non-committed",                    "no.",   "sbt_non_committed", "SBT Non-Committed"),
+    ]
+
+    def _get_supp_val(yr, supp_key, master_col, yr_supp, hi):
+        """Read from master CSV first (post-migration), fall back to supplementary."""
+        if master_col and not _CONSOLIDATED_DF.empty and "Company" in _CONSOLIDATED_DF.columns:
+            mdf = _CONSOLIDATED_DF[
+                (_CONSOLIDATED_DF["Company"] == company) &
+                (_CONSOLIDATED_DF["Year"] == yr)
+            ]
+            if not mdf.empty and master_col in mdf.columns:
+                v = mdf[master_col].values[0]
+                if pd.notna(v): return float(v)
+        # Fall back to supplementary file
+        return float(yr_supp.get(supp_key, 0) or 0)
+
+    table_data = []
+    yr_cols    = [str(yr) for yr, *_ in hist]
+
+    for is_sec, label, unit, supp_key, master_col in PG_ROWS:
+        row = {"Indicator": f"▸ {label}" if is_sec else ("  " + label), "Unit": unit or ""}
+        if is_sec:
+            for yc in yr_cols: row[yc] = ""
+            row["YoY %"] = ""
+            table_data.append(row); continue
+
+        vals_num = []
+        for yr, hi, ho in hist:
+            yr_supp = _load_supplementary(company, yr)
+            ts  = int(hi.total_sites) or 1   # total sites for % calc
+
+            if supp_key == "hs_total_sites":
+                v = _get_supp_val(yr, "hs_external_audit", "HS External Audit Sites", yr_supp, hi) or ts
+            elif supp_key == "hs_ext_pct":
+                ext = _get_supp_val(yr, "hs_external_audit", "HS External Audit Sites", yr_supp, hi)
+                v = round(ext / max(ts, 1) * 100, 1)
+            elif supp_key == "hs_int_pct":
+                intr = _get_supp_val(yr, "hs_internal_audit", "HS Internal Audit Sites", yr_supp, hi)
+                v = round(intr / max(ts, 1) * 100, 1)
+            elif supp_key == "fem_emp_pct":
+                emp = _get_supp_val(yr, "total_employees", "Total Employees", yr_supp, hi)
+                fem = _get_supp_val(yr, "female_employees", "Female Employees", yr_supp, hi)
+                v = round(fem / max(emp, 1) * 100, 1)
+            elif supp_key == "fem_bod_pct":
+                bod = _get_supp_val(yr, "board_total", "Board Total", yr_supp, hi)
+                fem = _get_supp_val(yr, "female_board", "Female Board", yr_supp, hi)
+                v = round(fem / max(bod, 1) * 100, 1)
+            else:
+                v = _get_supp_val(yr, supp_key, master_col, yr_supp, hi)
+
+            try:
+                fv = float(v)
+                if unit == "%":
+                    row[str(yr)] = f"{fv:.1f}%"
+                elif fv == int(fv):
+                    row[str(yr)] = f"{int(fv):,}" if fv else "—"
+                else:
+                    row[str(yr)] = f"{fv:,.1f}"
+                if fv: vals_num.append(fv)
+            except:
+                row[str(yr)] = "—"
+
+        row["YoY %"] = "—"
+        if len(vals_num) >= 2:
+            pv, lv = vals_num[-2], vals_num[-1]
+            if pv:
+                row["YoY %"] = f"{(lv-pv)/abs(pv)*100:+.1f}%"
+
+        table_data.append(row)
+
+    if table_data:
+        df_pg = pd.DataFrame(table_data)
+        cols  = ["Indicator","Unit"] + yr_cols + ["YoY %"]
+        df_pg = df_pg.reindex(columns=[c for c in cols if c in df_pg.columns])
+        # Read approved comments for the comment column
+        _acomments = _get_approved_comments(company, rep_year)
+        if _acomments:
+            df_pg["Comments"] = df_pg["Indicator"].map(
+                lambda label: _acomments.get(label.strip(), ""))
+            df_pg["Comments"] = df_pg["Comments"].apply(
+                lambda v: f"🔴 {v}" if v else "")
+
+        st.dataframe(
+            df_pg, use_container_width=True, hide_index=True,
+            column_config={
+                "Indicator": st.column_config.TextColumn("Indicator", width=260),
+                "Unit":      st.column_config.TextColumn("Unit",      width=70),
+                "YoY %":     st.column_config.TextColumn("YoY %",     width=80),
+            },
+            height=min(38 + len(table_data) * 35, 740),
+        )
+    else:
+        st.info("No People & Governance data available. Submit data via Sections 7–9 in Submit Data.")
+
+
 def page_my_records():
     """
     My Records — view and save all historical KPI data.
@@ -2051,16 +2408,18 @@ def page_my_records():
         st.rerun()   # force re-render so table shows updated values
 
     # ── All 5 template sheets as tabs ─────────────────────────────────────────
-    tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
+    tab_main, tab_elec, tab_waste, tab_people_tpl, tab_qual, tab_conv = st.tabs([
         "Main Data Input",
         "Electricity by Country",
         "Waste",
+        "People & Governance",
         "Qualitative Data",
         "Conversion Tables",
     ])
     with tab_main: render_template_table()
     with tab_elec: render_electricity_tab()
     with tab_waste: render_waste_tab()
+    with tab_people_tpl: _render_people_governance_tab()
     with tab_qual: render_qualitative_tab()
     with tab_conv: render_conversion_tab()
 
@@ -2122,6 +2481,8 @@ def render_template_table():
         ("input","Production","metric t","production",None),
         ("section","Water",None,None,None),
         ("input","Water withdrawals","m³","water_withdrawals",None),
+        ("supp","Stress water withdrawal","m³","stress_water_withdrawal",None),
+        ("supp","Non-stress water withdrawal","m³","non_stress_water_withdrawal",None),
         ("calc","Water intensity KPI","m³/t",None,lambda i,o:f"{o.water_kpi:.2f}"),
         ("section","Energy",None,None,None),
         ("calc","Total Electricity","GJ",None,lambda i,o:f"{o.total_electricity:,.0f}"),
@@ -2133,6 +2494,9 @@ def render_template_table():
         ("input","Sold Steam","GJ","sold_steam",None),
         ("input","Natural Gas","GJ LHV","nat_gas",None),
         ("input","Coal (all types)","GJ LHV","coal_sub",None),
+        ("supp","— Sub-bituminous coal","GJ LHV","coal_sub_bituminous",None),
+        ("supp","— Brown coal briquettes","GJ LHV","coal_brown_briquettes",None),
+        ("supp","— Other bituminous coal","GJ LHV","coal_other_bituminous",None),
         ("input","Propane","GJ LHV","propane",None),
         ("input","Fuel Oil","GJ LHV","fuel_oil_heavy_a",None),
         ("input","Diesel","GJ LHV","diesel",None),
@@ -2164,6 +2528,8 @@ def render_template_table():
         ("calc","Waste intensity KPI","kg/T",None,lambda i,o:f"{i.waste_total/i.production*1000:.1f}" if i.production else "—"),
     ]
 
+    _all_cmts = _get_all_active_comments(company, rep_year)
+
     data = []
     for rdef in ROWS:
         rtype, label, unit, key, fn = rdef
@@ -2171,13 +2537,46 @@ def render_template_table():
             row = {"Indicator": f"▸ {label}", "Unit": ""}
             for yr, hi, ho in hist: row[str(yr)] = ""
             row["YoY %"] = ""
-            data.append({"_type": "section", "_row": row})
+            row["Comments"] = ""
+            data.append({"_type": "section", "_row": row, "_key": "", "_label": label})
             continue
 
         row = {"Indicator": label, "Unit": unit or ""}
         prev_num = None
         for yr, hi, ho in hist:
-            v = getattr(hi, key, None) if key else None
+            # supp rows read from master CSV supplementary columns
+            if rtype == "supp" and key:
+                yr_supp = _load_supplementary(company, yr)
+                v = yr_supp.get(key, None)
+                # also check master CSV columns (after migration)
+                if v is None:
+                    _mrow = _CONSOLIDATED_DF[
+                        (_CONSOLIDATED_DF.get("Company","") == company) &
+                        (_CONSOLIDATED_DF.get("Year","") == yr)
+                    ] if not _CONSOLIDATED_DF.empty and "Company" in _CONSOLIDATED_DF.columns else None
+                    if _mrow is not None and not _mrow.empty:
+                        _col_map = {
+                            "stress_water_withdrawal":   "Stress Water Withdrawal",
+                            "non_stress_water_withdrawal":"Non-Stress Water Withdrawal",
+                            "coal_sub_bituminous":       "Coal Sub-Bituminous",
+                            "coal_brown_briquettes":     "Coal Brown Briquettes",
+                            "coal_other_bituminous":     "Coal Other Bituminous",
+                            "hs_external_audit":         "HS External Audit Sites",
+                            "hs_internal_audit":         "HS Internal Audit Sites",
+                            "total_employees":           "Total Employees",
+                            "female_employees":          "Female Employees",
+                            "board_total":               "Board Total",
+                            "female_board":              "Female Board",
+                            "sbt_total":                 "SBT Total",
+                            "sbt_validated":             "SBT Validated",
+                            "sbt_committed":             "SBT Committed",
+                            "sbt_non_committed":         "SBT Non-Committed",
+                        }
+                        mc = _col_map.get(key)
+                        if mc and mc in _mrow.columns:
+                            v = _mrow[mc].values[0]
+            else:
+                v = getattr(hi, key, None) if key else None
             if v is None and fn:
                 v = fn(hi, ho)
             try:
@@ -2215,19 +2614,32 @@ def render_template_table():
         except:
             row["YoY %"] = "—"
 
-        data.append({"_type": rtype, "_row": row, "_key": key, "_label": label})
+        fk = key or label
+        _cmt_entry = _all_cmts.get(fk)
+        row["Comments"] = _cmt_entry[1] if _cmt_entry else ""
 
-    all_rows  = [d["_row"]  for d in data]
-    all_types = [d["_type"] for d in data]
-    df_tbl    = pd.DataFrame(all_rows)
-    curr_col  = str(rep_year)
+        data.append({"_type": rtype, "_row": row, "_key": key or "", "_label": label})
+
+    all_rows       = [d["_row"]  for d in data]
+    all_types      = [d["_type"] for d in data]
+    _all_keys_list = [d["_key"]  for d in data]
+    df_tbl         = pd.DataFrame(all_rows)
+    curr_col       = str(rep_year)
 
     def style_row(row, idx):
-        rt = all_types[idx]
+        rt  = all_types[idx]
+        cmt = str(row.get("Comments", ""))
         return [
             ("background-color:#E8F5F0;color:#065F46;font-weight:800;font-size:13px;"
              "border-top:2px solid #6EE7B7;padding-top:8px;padding-bottom:8px;"
              "letter-spacing:.3px;text-transform:uppercase") if rt == "section"
+            else ("color:#B91C1C;font-weight:800;font-size:11px;background:#FEF2F2"
+                   if cmt and not cmt.startswith("⏳") and not cmt.startswith("⚠")
+                   else "color:#92400E;font-weight:600;font-size:11px;background:#FFFBEB"
+                   if cmt.startswith("⏳")
+                   else "color:#C2410C;font-weight:600;font-size:11px;background:#FFF7ED"
+                   if cmt.startswith("⚠")
+                   else "color:#9CA3AF;font-size:11px") if col == "Comments"
             else "background-color:#DBEAFE;color:#1E40AF;font-weight:700" if (col == curr_col and rt == "input")
             else "background-color:#EFF6FF;color:#1D4ED8;font-style:italic" if (col == curr_col and rt == "calc")
             else "background-color:#F8FAFC;color:#6B7280;font-style:italic" if rt == "calc"
@@ -2237,12 +2649,45 @@ def render_template_table():
 
     styled     = df_tbl.style.apply(lambda row: style_row(row, row.name), axis=1)
     tbl_height = min(900, max(400, len(all_rows)*36+60))
-    st.dataframe(styled, hide_index=True, height=tbl_height, use_container_width=True)
+    _cmt_ver   = len(_all_cmts)
+
+    edited_df = st.data_editor(
+        styled, hide_index=True, height=tbl_height, use_container_width=True,
+        column_config={
+            "Indicator": st.column_config.TextColumn(disabled=True),
+            "Unit":      st.column_config.TextColumn(disabled=True),
+            "YoY %":     st.column_config.TextColumn(disabled=True),
+            "Comments":  st.column_config.TextColumn(
+                "Comments ✏", width="medium",
+                help="Type reason and press Enter → saved as Pending. "
+                     "Clear cell and press Enter → deletes comment.",
+            ),
+        },
+        key=f"tbl_editor_{company}_{rep_year}_v{_cmt_ver}",
+    )
+
+    if edited_df is not None and "Comments" in edited_df.columns:
+        actor = st.session_state.get("username", "Client")
+        for idx_r, row_e in edited_df.iterrows():
+            new_cmt = str(row_e.get("Comments", "")).strip()
+            fk_r    = _all_keys_list[idx_r] if idx_r < len(_all_keys_list) else ""
+            lbl_r   = str(row_e.get("Indicator", "unknown"))
+            old_raw = (all_rows[idx_r].get("Comments", "") or "")
+            for _pfx in ("⏳ ", "⚠ "): old_raw = old_raw.replace(_pfx, "")
+            old_raw = old_raw.strip()
+            if new_cmt == "" and old_raw:
+                _delete_comment(company, rep_year, fk_r)
+                _save_comment_version(company, rep_year, fk_r, old_raw, "Deleted", actor)
+            elif new_cmt and new_cmt != old_raw:
+                _save_change_comment(company, rep_year, fk_r, lbl_r,
+                                     old_val="", new_val="", reason=new_cmt)
+
     st.markdown(f"""<div class="tbl-legend">
       <div class="tl"><div class="tl-sw" style="background:#F0F9FF;border-color:#BAE6FD"></div>Company input (historical)</div>
       <div class="tl"><div class="tl-sw" style="background:#DBEAFE;border-color:#93C5FD"></div>Company input ({rep_year})</div>
       <div class="tl"><div class="tl-sw" style="background:#EFF6FF;border-color:#A5B4FC"></div>Auto-calculated ({rep_year})</div>
       <div class="tl"><div class="tl-sw" style="background:#F8FAFC;border-color:#E5E7EB"></div>Auto-calculated (historical)</div>
+      <div class="tl"><div class="tl-sw" style="background:#FEF2F2;border-color:#FCA5A5"></div>Change comment (pending/seen/rejected)</div>
     </div>""", unsafe_allow_html=True)
 
 
@@ -3773,36 +4218,79 @@ def page_analysis():
             f_wr.update_layout(**lay_wr)
             st.plotly_chart(f_wr, use_container_width=True, key=_ck("wst04"))
 
-    # ── People & Governance Tab ──────────────────────────────────────────────────
+    # ── People & Governance Tab (Analysis) — sector aggregate charts ──────────
     with tab_people:
-        st.markdown("##### People — H&S audit coverage & workforce diversity")
-        st.caption("Health & Safety audited sites · Women's representation in workforce and on boards")
+        st.markdown("#### People & Governance")
+        st.caption("Sector aggregate or selected company trend · read from live master data")
 
-        if _social_available:
-            c1, c2 = st.columns(2)
-            with c1:
+        # ── Read live columns from master CSV (promoted from supplementary) ──
+        def _pg_live(col):
+            """Sector mean or company series for a master CSV column."""
+            if _CONSOLIDATED_DF.empty or col not in _CONSOLIDATED_DF.columns:
+                return [None] * len(yrs_int)
+            out_vals = []
+            for y in yrs_int:
+                sub = _CONSOLIDATED_DF[_CONSOLIDATED_DF["Year"] == y]
+                if overlay_company and overlay_company != "All Companies":
+                    sub = sub[sub["Company"] == overlay_company]
+                if sub.empty or sub[col].isna().all():
+                    out_vals.append(None)
+                else:
+                    out_vals.append(round(float(sub[col].mean()), 2))
+            return out_vals
+
+        _hs_ext_live = _pg_live("HS External Audit %")
+        _hs_int_live = _pg_live("HS Internal Audit %")
+        _wb_live     = _pg_live("Female Board %")
+        _wt_live     = _pg_live("Female Employees %")
+        _sbt_val_v   = _pg_live("SBT Validated")
+        _sbt_com_v   = _pg_live("SBT Committed")
+        _sbt_tot_v   = _pg_live("SBT Total")
+
+        _has_hs  = any(v and v > 0 for v in _hs_ext_live)
+        _has_div = any(v and v > 0 for v in _wb_live)
+        _has_sbt = any(v and v > 0 for v in _sbt_tot_v)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if _has_hs:
                 st.plotly_chart(_dline(
-                    yrs, _hs_ext, "Externally audited H&S (%)", TC["line_dark"],
-                    _hs_int,      "Internally audited H&S (%)", TC["line_light"],
-                    title="H&S system audit coverage (%)",
-                    yt="Audited sites (%)", h=320, s1f=".1f", s2f=".1f",
+                    yrs, _hs_ext_live, "External H&S audit (%)", TC["line_dark"],
+                    _hs_int_live,      "Internal H&S audit (%)", TC["line_light"],
+                    title="H&S system audit coverage (%)", yt="Sites audited (%)",
+                    h=430, s1f=".1f", s2f=".1f",
                 ), use_container_width=True, key=_ck("pp01"))
-            with c2:
+            else:
+                st.info("H&S data not yet submitted (Submit Data → Section 7).", icon="📊")
+
+        with c2:
+            if _has_div:
                 st.plotly_chart(_dline(
-                    yrs, _wb, "Women on Board of Directors (%)", TC["line_dark"],
-                    _wt,      "Women in total employees (%)",    TC["line_light"],
-                    title="Women's representation (%)",
-                    yt="Women's representation (%)", h=320, s1f=".1f", s2f=".1f",
+                    yrs, _wb_live, "Women on Board (%)", TC["line_dark"],
+                    _wt_live,      "Women in workforce (%)", TC["line_light"],
+                    title="Women's representation (%)", yt="Women (%)",
+                    h=430, s1f=".1f", s2f=".1f",
                 ), use_container_width=True, key=_ck("pp02"))
+            else:
+                st.info("Diversity data not yet submitted (Submit Data → Section 8).", icon="📊")
+
+        if _has_sbt:
+            st.markdown("---")
+            _sbt_v_c = [v or 0 for v in _sbt_val_v]
+            _sbt_c_c = [v or 0 for v in _sbt_com_v]
+            st.plotly_chart(_stack100(
+                yrs,
+                [(_sbt_v_c, "Validated",  TC["bar_green"]),
+                 (_sbt_c_c, "Committed",  TC["bar_blue"])],
+                title="Science-Based Targets — Validated vs Committed",
+            ), use_container_width=True, key=_ck("pp03"))
         else:
-            st.info(
-                "H&S audit coverage and women's representation data are tracked in the "
-                "TIP annual report under Impact Pathway 4 (Operations: Employees) but "
-                "are not yet in the KPI submission form. "
-                "Add fields HS_External_Audit_%, HS_Internal_Audit_%, "
-                "Women_Board_%, Women_Total_% to the entry form to enable these charts.",
-                icon="📊",
-            )
+            st.markdown("---")
+            st.info("Science-Based Target data not yet submitted (Submit Data → Section 9).", icon="📊")
+
+    # dummy placeholder to avoid the incorrectly-injected table below being executed
+    if False:
+        pass   # end of page_analysis
 
 
 # ─────────────────────────────────────────────────────────
@@ -5228,19 +5716,37 @@ def page_verification():
                     **Reason given:** {cmt['Reason']}
                     """)
                 with cc2:
-                    approve_key = f"approve_cmt_{idx_c}"
-                    reject_key  = f"reject_cmt_{idx_c}"
-                    if st.button("✅ Approve", key=approve_key, use_container_width=True, type="primary"):
+                    _analyst = st.session_state.get("username", "DSS Analyst")
+                    _ba, _bs, _br = st.columns(3)
+                    if _ba.button("✅ Accept", key=f"accept_cmt_{idx_c}",
+                                  use_container_width=True, type="primary",
+                                  help="Comment disappears from both templates"):
                         _update_comment_status(cmt['Company'], int(cmt['Year']),
-                                               cmt['FieldKey'], "Approved",
-                                               approved_by=st.session_state.get("username","DSS Analyst"))
-                        st.success(f"Approved — comment will now appear in {cmt['Company']} {cmt['Year']} template.")
+                                               cmt['FieldKey'], "Accepted", approved_by=_analyst)
+                        for _ck in list(st.session_state.keys()):
+                            if _ck.startswith(f"tbl_editor_{cmt['Company']}_{cmt['Year']}"):
+                                del st.session_state[_ck]
+                        st.success("✅ Accepted — removed from Company Data and My Records.")
                         st.rerun()
-                    if st.button("❌ Reject", key=reject_key, use_container_width=True):
+                    if _bs.button("⏳ Seen", key=f"seen_cmt_{idx_c}",
+                                  use_container_width=True,
+                                  help="Comment stays with ⏳ symbol"):
                         _update_comment_status(cmt['Company'], int(cmt['Year']),
-                                               cmt['FieldKey'], "Rejected",
-                                               approved_by=st.session_state.get("username","DSS Analyst"))
-                        st.info("Rejected.")
+                                               cmt['FieldKey'], "Seen", approved_by=_analyst)
+                        for _ck in list(st.session_state.keys()):
+                            if _ck.startswith(f"tbl_editor_{cmt['Company']}_{cmt['Year']}"):
+                                del st.session_state[_ck]
+                        st.info("⏳ Marked Seen — comment stays visible with timer symbol.")
+                        st.rerun()
+                    if _br.button("⚠ Reject", key=f"reject_cmt_{idx_c}",
+                                  use_container_width=True,
+                                  help="Comment stays with ⚠ danger symbol"):
+                        _update_comment_status(cmt['Company'], int(cmt['Year']),
+                                               cmt['FieldKey'], "Rejected", approved_by=_analyst)
+                        for _ck in list(st.session_state.keys()):
+                            if _ck.startswith(f"tbl_editor_{cmt['Company']}_{cmt['Year']}"):
+                                del st.session_state[_ck]
+                        st.warning("⚠ Rejected — comment stays visible with danger symbol.")
                         st.rerun()
         st.divider()
 
@@ -6348,10 +6854,11 @@ def page_company_data():
     st.session_state["step"]                = 6
 
     # ── Render all template sheets as tabs ────────────────────────────────────
-    tab_main, tab_elec, tab_waste, tab_qual, tab_conv = st.tabs([
+    tab_main, tab_elec, tab_waste, tab_people_tpl, tab_qual, tab_conv = st.tabs([
         "Main Data Input",
         "Electricity by Country",
         "Waste",
+        "People & Governance",
         "Qualitative Data",
         "Conversion Tables",
     ])
@@ -6361,6 +6868,8 @@ def page_company_data():
         render_electricity_tab()
     with tab_waste:
         render_waste_tab()
+    with tab_people_tpl:
+        _render_people_governance_tab()
     with tab_qual:
         render_qualitative_tab()
     with tab_conv:
@@ -7132,6 +7641,15 @@ if not st.session_state.authenticated:
 else:
     show_sidebar()
     page = st.session_state.page
+
+    # ── One-time migration: supplementary → master CSV ───────────────────────
+    if not st.session_state.get("_supp_migrated"):
+        try:
+            if Path("data_storage/master/ESG_SUPPLEMENTARY.csv").exists():
+                _migrate_supplementary_to_master()
+        except Exception:
+            pass
+        st.session_state["_supp_migrated"] = True
 
     # ── Client pages ──────────────────────────────────────
     if   page == "home":            page_home()

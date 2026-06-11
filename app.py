@@ -148,7 +148,7 @@ _COMMENT_COLS  = ["Company","Year","FieldKey","FieldLabel","OldValue",
 
 def _save_change_comment(company, year, field_key, field_label,
                           old_val, new_val, reason) -> None:
-    """Save Pending comment to CSV + master file + version parquet immediately."""
+    """Save Pending comment to CSV + master + version parquet immediately."""
     from pathlib import Path as _P
     import csv
     from datetime import datetime
@@ -158,7 +158,6 @@ def _save_change_comment(company, year, field_key, field_label,
     if p.exists():
         with open(p, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
-    # Replace any existing entry for same co+yr+field
     rows = [r for r in rows if not (
         r["Company"]==company and str(r["Year"])==str(year)
         and r["FieldKey"]==field_key)]
@@ -188,10 +187,8 @@ def _load_comments(company: str = None, status: str = None) -> list:
     return rows
 
 def _update_comment_status(company, year, field_key, status, approved_by="") -> None:
-    """Update comment status: Accepted|Seen|Rejected.
-    Accepted → removes record + clears master CSV cell.
-    Seen     → ⏳ prefix in master CSV.
-    Rejected → ⚠ prefix in master CSV."""
+    """Accepted → removes + clears master. Seen → ⏳ prefix. Rejected → ⚠ prefix.
+    Both templates (My Records + Company Data) reflect the change immediately."""
     from pathlib import Path as _P
     import csv
     from datetime import datetime as _dt
@@ -215,13 +212,11 @@ def _update_comment_status(company, year, field_key, status, approved_by="") -> 
                 r["Status"]     = status
                 r["ApprovedBy"] = approved_by
                 r["ApprovedAt"] = _dt.now().strftime("%Y-%m-%d %H:%M")
-        _update_master_comment_cell(company, year, field_key,
-                                     prefix + reason_text)
+        _update_master_comment_cell(company, year, field_key, prefix + reason_text)
     with open(p, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=_COMMENT_COLS)
         w.writeheader(); w.writerows(rows)
-    _save_comment_version(company, year, field_key,
-                           reason_text, status, approved_by)
+    _save_comment_version(company, year, field_key, reason_text, status, approved_by)
 
 def _get_approved_comments(company: str, year: int) -> dict:
     """Return {field_key: reason} for all approved comments for company+year."""
@@ -231,7 +226,9 @@ def _get_approved_comments(company: str, year: int) -> dict:
 
 
 def _get_all_active_comments(company: str, year: int) -> dict:
-    """{field_key: (status, display_text)} for every non-Accepted comment."""
+    """{field_key: (status, display_text)} for every non-Accepted comment.
+    Both client (My Records) and DSS (Company Data) call this so both sides
+    always see identical comment state — no filtering by role."""
     result = {}
     for r in _load_comments(company=company):
         if str(r["Year"]) != str(year): continue
@@ -247,7 +244,7 @@ def _get_all_active_comments(company: str, year: int) -> dict:
 
 def _update_master_comment_cell(company: str, year, field_key: str,
                                  value: str) -> None:
-    """Write value into change_comment column of master CSV for company+year row.
+    """Write value into change_comment column in master CSV.
     Empty string clears the entry for this field_key."""
     try:
         import pandas as _pd
@@ -273,7 +270,7 @@ def _update_master_comment_cell(company: str, year, field_key: str,
 
 
 def _delete_comment(company: str, year, field_key: str) -> None:
-    """Remove a comment from CSV + master file (when client clears cell)."""
+    """Remove comment from CSV + master when client clears the cell."""
     from pathlib import Path as _P
     import csv
     p = _P("data_storage/field_comments.csv")
@@ -2615,9 +2612,8 @@ def render_template_table():
             row["YoY %"] = "—"
 
         fk = key or label
-        _cmt_entry = _all_cmts.get(fk)
-        row["Comments"] = _cmt_entry[1] if _cmt_entry else ""
-
+        _e = _all_cmts.get(fk)
+        row["Comments"] = _e[1] if _e else ""
         data.append({"_type": rtype, "_row": row, "_key": key or "", "_label": label})
 
     all_rows       = [d["_row"]  for d in data]
@@ -2659,7 +2655,7 @@ def render_template_table():
             "YoY %":     st.column_config.TextColumn(disabled=True),
             "Comments":  st.column_config.TextColumn(
                 "Comments ✏", width="medium",
-                help="Type reason and press Enter → saved as Pending. "
+                help="Type reason and press Enter → Pending. "
                      "Clear cell and press Enter → deletes comment.",
             ),
         },
@@ -2687,7 +2683,7 @@ def render_template_table():
       <div class="tl"><div class="tl-sw" style="background:#DBEAFE;border-color:#93C5FD"></div>Company input ({rep_year})</div>
       <div class="tl"><div class="tl-sw" style="background:#EFF6FF;border-color:#A5B4FC"></div>Auto-calculated ({rep_year})</div>
       <div class="tl"><div class="tl-sw" style="background:#F8FAFC;border-color:#E5E7EB"></div>Auto-calculated (historical)</div>
-      <div class="tl"><div class="tl-sw" style="background:#FEF2F2;border-color:#FCA5A5"></div>Change comment (pending/seen/rejected)</div>
+      <div class="tl"><div class="tl-sw" style="background:#FEF2F2;border-color:#FCA5A5"></div>Change comment (Pending/⏳Seen/⚠Rejected)</div>
     </div>""", unsafe_allow_html=True)
 
 
@@ -5718,7 +5714,7 @@ def page_verification():
                 with cc2:
                     _analyst = st.session_state.get("username", "DSS Analyst")
                     _ba, _bs, _br = st.columns(3)
-                    if _ba.button("✅ Accept", key=f"accept_cmt_{idx_c}",
+                    if _ba.button("✅ Accept", key=f"accept_{idx_c}",
                                   use_container_width=True, type="primary",
                                   help="Comment disappears from both templates"):
                         _update_comment_status(cmt['Company'], int(cmt['Year']),
@@ -5726,27 +5722,27 @@ def page_verification():
                         for _ck in list(st.session_state.keys()):
                             if _ck.startswith(f"tbl_editor_{cmt['Company']}_{cmt['Year']}"):
                                 del st.session_state[_ck]
-                        st.success("✅ Accepted — removed from Company Data and My Records.")
+                        st.success("✅ Accepted — comment removed from both templates.")
                         st.rerun()
-                    if _bs.button("⏳ Seen", key=f"seen_cmt_{idx_c}",
+                    if _bs.button("⏳ Seen", key=f"seen_{idx_c}",
                                   use_container_width=True,
-                                  help="Comment stays with ⏳ symbol"):
+                                  help="⏳ stays on both templates"):
                         _update_comment_status(cmt['Company'], int(cmt['Year']),
                                                cmt['FieldKey'], "Seen", approved_by=_analyst)
                         for _ck in list(st.session_state.keys()):
                             if _ck.startswith(f"tbl_editor_{cmt['Company']}_{cmt['Year']}"):
                                 del st.session_state[_ck]
-                        st.info("⏳ Marked Seen — comment stays visible with timer symbol.")
+                        st.info("⏳ Seen — ⏳ symbol now visible on both templates.")
                         st.rerun()
-                    if _br.button("⚠ Reject", key=f"reject_cmt_{idx_c}",
+                    if _br.button("⚠ Reject", key=f"reject_{idx_c}",
                                   use_container_width=True,
-                                  help="Comment stays with ⚠ danger symbol"):
+                                  help="⚠ stays on both templates"):
                         _update_comment_status(cmt['Company'], int(cmt['Year']),
                                                cmt['FieldKey'], "Rejected", approved_by=_analyst)
                         for _ck in list(st.session_state.keys()):
                             if _ck.startswith(f"tbl_editor_{cmt['Company']}_{cmt['Year']}"):
                                 del st.session_state[_ck]
-                        st.warning("⚠ Rejected — comment stays visible with danger symbol.")
+                        st.warning("⚠ Rejected — ⚠ symbol now visible on both templates.")
                         st.rerun()
         st.divider()
 
@@ -6868,8 +6864,6 @@ def page_company_data():
         render_electricity_tab()
     with tab_waste:
         render_waste_tab()
-    with tab_people_tpl:
-        _render_people_governance_tab()
     with tab_qual:
         render_qualitative_tab()
     with tab_conv:
